@@ -177,6 +177,72 @@ inline std::map<std::string, std::vector<std::string>> names_load(
   return rows;
 }
 
+/**
+ * One row of `verdicts.tsv`: what each reference would *do* with a name.
+ *
+ * The only part of the corpus that records a decision rather than a reading, and
+ * the only outside opinion ::garc_name_check() has to be measured against. See
+ * verdicts() in the generator for what the columns mean and why there are three.
+ */
+struct VerdictRow {
+  std::string archive;
+  size_t index = 0;
+  std::string name;
+  /** `tarfile.data_filter`: "same", "rewrite", or an exception's name. */
+  std::string python_data;
+  /** `tarfile.tar_filter`, the permissive policy, as the control. */
+  std::string python_tar;
+  /** "refused" or "extracted", from `bsdtar -x` actually running. */
+  std::string libarchive;
+
+  /** Whether Python's data filter would not leave this name alone. */
+  bool python_acts() const {
+    return python_data != "same";
+  }
+  /** Whether libarchive refused the member outright. */
+  bool libarchive_refused() const {
+    return libarchive == "refused";
+  }
+};
+
+/**
+ * Every verdict row, in file order.
+ *
+ * A flat vector rather than a map by archive: the cross-check walks all of them
+ * and the archive is a column, so grouping would only have to be undone.
+ */
+inline std::vector<VerdictRow> verdicts_load(const std::string & path) {
+  std::vector<VerdictRow> rows;
+  std::ifstream input(path);
+  if (!input) {
+    return rows;
+  }
+  std::string line;
+  while (std::getline(input, line)) {
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    std::vector<std::string> fields;
+    std::string field;
+    std::istringstream split(line);
+    while (std::getline(split, field, '\t')) {
+      fields.push_back(field);
+    }
+    if (fields.size() < 6) {
+      fields.resize(6);
+    }
+    VerdictRow row;
+    row.archive = fields[0];
+    row.index = std::strtoul(fields[1].c_str(), nullptr, 10);
+    row.name = manifest_unescape(fields[2]);
+    row.python_data = fields[3];
+    row.python_tar = fields[4];
+    row.libarchive = fields[5];
+    rows.push_back(row);
+  }
+  return rows;
+}
+
 /** Read a whole fixture into memory. Empty on failure. */
 inline std::vector<uint8_t> read_fixture(const std::string & path) {
   std::ifstream input(path, std::ios::binary);

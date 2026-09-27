@@ -272,6 +272,209 @@ PAX_GLOBAL_OPTIONS = [
 PAX_OPTIONS = ["--pax-option=delete=atime,delete=ctime"]
 
 
+# The malicious corpus, and why every one of these is written by GNU tar rather
+# than assembled here.
+#
+# **A safety predicate tested only against names its author invented measures the
+# author's imagination.** That is the argument phase A used to defer this until
+# there was an oracle, and it is met by making the *writer* a real tool: every
+# name below goes through `tar --transform` with `-P`, so what lands in the header
+# is what GNU tar puts there for a caller who asks for that name. `-P` is the flag
+# that stops it helpfully stripping a leading `/` or a leading `../`, which is
+# itself worth knowing - the default behaviour of the reference is to sanitise,
+# and a corpus generated without `-P` would quietly contain nothing hostile at
+# all.
+#
+# Each entry is (source file, stored name, what it is for). The source files are
+# n01, n02 ... rather than descriptive, because `--sort=name` orders by the source
+# name and a fixed order is what makes the fixture reproducible.
+#
+# The absolute names point at /tmp rather than /etc: these fixtures are extracted
+# inside the container to record what libarchive does with them, and an absolute
+# name that *succeeds* writes a file. Where it lands changes nothing about the
+# classification and a great deal about what else in the container still works.
+MALICIOUS_NAMES = [
+    ("n01", "../../../tmp/ghoti-escaped",
+        "the classic traversal: leading parent components"),
+    ("n02", "/tmp/ghoti-escaped",
+        "absolute, which ignores the extraction root rather than climbing out of "
+        "it - and which both references *rewrite* rather than refuse"),
+    ("n03", "a/../../b",
+        "a traversal that starts inside, so a check that only looks at the first "
+        "component misses it"),
+    ("n04", "a/..",
+        "**the discriminating case.** It has a parent component and it resolves "
+        "*inside* the root, and the two references disagree about it: Python "
+        "accepts it unchanged and libarchive refuses it for containing '..'. A "
+        "single safe/unsafe bit would have to pick one of them"),
+    ("n05", "./x",
+        "a current-directory component, which both references accept - so a "
+        "checker that treats any non-ordinary component as an escape is wrong "
+        "here"),
+    ("n06", "a//b",
+        "an empty component, which both references accept"),
+    ("n07", "C:\\Windows\\ghoti",
+        "a drive letter, which Python accepts unchanged and libarchive strips - "
+        "so this one *does* have a reference, and they disagree"),
+    ("n08", "\\\\server\\share\\ghoti",
+        "a UNC path, which neither reference objects to on a POSIX host"),
+    ("n09", "..",
+        "the whole name is a parent component"),
+    ("n10", "CON",
+        "reserved on Windows, ordinary everywhere else. No reference here can "
+        "answer it: both run on POSIX"),
+    ("n11", "aux.txt",
+        "reserved on Windows *with* an extension, which is the form that gets "
+        "missed"),
+    ("n12", "COM1",
+        "the numbered device family"),
+    ("n13", "trailing.",
+        "Windows strips a trailing dot, so this collides with `trailing`"),
+    ("n14", "trailing ",
+        "and a trailing space, likewise"),
+    ("n15", "esc\x1b[31mred",
+        "an ANSI escape in a name, which rewrites a terminal that prints a "
+        "listing unescaped"),
+    # **These two carry raw bytes, spelled as surrogates.** Written as ordinary
+    # `str` they were not hostile at all: `"\x80"` is U+0080, which subprocess
+    # encodes to the *well-formed* pair C2 80 on its way to tar, and the fixture
+    # then tested a valid name. The surrogate spelling is what Python's
+    # `surrogateescape` maps back to a single raw byte, and the assertion in
+    # generate_malicious() is what stops the same mistake being made again.
+    ("n16", "bad\udc80utf",
+        "a byte that no well-formed UTF-8 sequence starts with"),
+    ("n17", "over\udcc0\udcaflong",
+        "an overlong encoding of '/'. The bytes are not well-formed UTF-8, and a "
+        "decoder that accepts them anyway turns this into a separator"),
+    ("n18", "a/b/../../../c",
+        "descends twice and climbs three times, so the arithmetic has to be a "
+        "running depth rather than a count of components"),
+]
+
+# Symlink and hardlink targets, which are the half of the problem no per-member
+# name check can answer. A symlink to `/` is not an escape by itself; it becomes
+# one when a *later* member's path goes through it, and neither member is
+# suspicious alone. They are here because phase F needs them, and because the
+# check has to be applicable to a *target* as well as to a name.
+MALICIOUS_LINKS = [
+    ("abs-target", "/tmp/ghoti-escaped", "an absolute link target"),
+    ("up-target", "../../..", "a target that climbs out of any root"),
+    ("dot-target", "./sibling", "a target that does not escape, as the control"),
+]
+
+
+def generate_malicious(destination, scratch):
+    """Write the hostile-name fixtures, all of them through GNU tar."""
+    mal = os.path.join(scratch, ".mal")
+    if os.path.exists(mal):
+        shutil.rmtree(mal)
+    os.makedirs(mal)
+
+    # One source file per stored name, and one --transform expression per source.
+    transforms = []
+    for source, stored, _why in MALICIOUS_NAMES:
+        with open(os.path.join(mal, source), "wb") as handle:
+            handle.write(b"hostile\n")
+        # The replacement goes through sed's s/// so a '&' or a '\' in it would be
+        # read as a backreference. Nothing here has one, and this asserts that
+        # rather than trusting it - a name that silently arrived mangled would
+        # make the fixture test something other than what this table says.
+        assert "&" not in stored, stored
+        # A name meant to hold bytes that are not well-formed UTF-8 has to be
+        # spelled with surrogates, because anything else is encoded on the way to
+        # tar and arrives valid. This catches the inverse mistake too: a lone
+        # high byte written as a normal character.
+        encoded = stored.encode("utf-8", "surrogateescape")
+        surrogates = any(0xDC80 <= ord(c) <= 0xDCFF for c in stored)
+        assert surrogates or encoded.decode("utf-8", "strict") == stored, (
+            "%r encodes to %r, which is not what the table says" % (stored, encoded))
+        transforms.append("--transform=s|^%s$|%s|" % (source, stored))
+
+    argv = ["tar", "-P", "--create",
+        "--file", os.path.join(destination, "mal-paths.tar"),
+        "--format", "ustar"]
+    argv += tar_common() + transforms
+    argv += ["--directory", mal] + [s for s, _n, _w in MALICIOUS_NAMES]
+    finished = subprocess.run(argv, capture_output=True, text=True)
+    if finished.returncode != 0:
+        raise SystemExit("tar failed for mal-paths.tar:\n%s"
+            % finished.stderr.strip())
+
+    # Links, whose targets are the hostile part. Written as real symlinks so that
+    # what lands in the linkname field is what GNU tar writes for one.
+    links = os.path.join(scratch, ".mallinks")
+    if os.path.exists(links):
+        shutil.rmtree(links)
+    os.makedirs(links)
+    with open(os.path.join(links, "sibling"), "wb") as handle:
+        handle.write(b"target\n")
+    names = ["sibling"]
+    for name, target, _why in MALICIOUS_LINKS:
+        os.symlink(target, os.path.join(links, name))
+        names.append(name)
+    # And a hard link, whose target has no string a reader can inspect on the
+    # member itself - it names an earlier member of the archive.
+    os.link(os.path.join(links, "sibling"), os.path.join(links, "hard"))
+    names.append("hard")
+    argv = ["tar", "-P", "--create",
+        "--file", os.path.join(destination, "mal-links.tar"),
+        "--format", "ustar"]
+    argv += tar_common() + ["--directory", links] + sorted(names)
+    finished = subprocess.run(argv, capture_output=True, text=True)
+    if finished.returncode != 0:
+        raise SystemExit("tar failed for mal-links.tar:\n%s"
+            % finished.stderr.strip())
+
+    # Collisions: two names that differ only in case, and two that differ only in
+    # Unicode normalisation. **Neither is detectable from one name**, which is the
+    # point - they are here so that phase F has them and so that this library's
+    # own tests can say out loud that the check does not claim to find them.
+    # Case folding and normalisation need tables this library deliberately does
+    # not carry; they are `unicode`'s.
+    collide = os.path.join(scratch, ".malcollide")
+    if os.path.exists(collide):
+        shutil.rmtree(collide)
+    os.makedirs(collide)
+    for name in ("A.txt", "a.txt",
+            b"caf\xc3\xa9".decode("utf-8"), b"cafe\xcc\x81".decode("utf-8")):
+        with open(os.path.join(collide, name), "wb") as handle:
+            handle.write(b"collide\n")
+    argv = ["tar", "-P", "--create",
+        "--file", os.path.join(destination, "mal-collisions.tar"),
+        "--format", "ustar"]
+    argv += tar_common() + ["--directory", collide]
+    argv += sorted(os.listdir(collide))
+    finished = subprocess.run(argv, capture_output=True, text=True)
+    if finished.returncode != 0:
+        raise SystemExit("tar failed for mal-collisions.tar:\n%s"
+            % finished.stderr.strip())
+
+    # A hostile name too long for the ustar fields, in each format that has a way
+    # to carry one. The check must see the name the *carrier* delivered, not the
+    # truncated copy in the header behind it - which is the one place a reader
+    # that got the carriers wrong would hand a safety check something harmless.
+    long_hostile = "../../../" + "/".join(["e" * 80] * 3) + "/tmp/ghoti-escaped"
+    with open(os.path.join(mal, "long"), "wb") as handle:
+        handle.write(b"hostile\n")
+    for fmt, out in (("gnu", "mal-gnu-longpath.tar"),
+            ("pax", "mal-pax-longpath.tar")):
+        argv = ["tar", "-P", "--create",
+            "--file", os.path.join(destination, out), "--format", fmt]
+        argv += tar_common()
+        if fmt == "pax":
+            argv += PAX_OPTIONS
+        argv += ["--transform=s|^long$|%s|" % long_hostile]
+        argv += ["--directory", mal, "long"]
+        finished = subprocess.run(argv, capture_output=True, text=True)
+        if finished.returncode != 0:
+            raise SystemExit("tar failed for %s:\n%s"
+                % (out, finished.stderr.strip()))
+
+    shutil.rmtree(mal)
+    shutil.rmtree(links)
+    shutil.rmtree(collide)
+
+
 def generate(destination):
     """Write every archive into `destination`, and return the tree used."""
     scratch = os.path.join(destination, ".tree")
@@ -329,6 +532,8 @@ def generate(destination):
     if finished.returncode != 0:
         raise SystemExit("tar failed for the empty archive:\n%s"
             % finished.stderr.strip())
+
+    generate_malicious(destination, scratch)
 
     shutil.rmtree(scratch)
 
@@ -530,11 +735,163 @@ def manifest(destination):
         handle.write("\n".join(lines) + "\n")
 
 
+def verdicts(destination):
+    """What each reference would *do* with every member's name.
+
+    **This is the only part of the corpus that records a decision rather than a
+    reading**, and it is what turns garc_name_check() from a set of assertions
+    about itself into a cross-check. A classifier whose expectations were written
+    by the same session that wrote the classifier measures nothing.
+
+    Three columns, because there are three answers and they are not the same
+    question:
+
+      - `python_data` is `tarfile.data_filter`, PEP 706's "extract untrusted
+        data" policy. Its verdict is **three-valued**: it accepts a name, or
+        rewrites it, or raises. That is a finding in itself - an absolute member
+        name is *rewritten* rather than refused, so a reader expecting a boolean
+        from it would score every absolute path as safe.
+      - `python_tar` is `tarfile.tar_filter`, the permissive policy, which is here
+        as the control: where the two Python columns differ, the difference is
+        policy rather than danger.
+      - `libarchive` is whether `bsdtar -x` actually refused the member. It is the
+        second opinion on the one case that matters most, because **the two
+        references disagree there**: `a/..` has a parent component and resolves
+        inside the root, and Python accepts it while libarchive refuses it.
+
+    A per-archive comment records libarchive's *archive-level* messages, the
+    "Removing leading '/'" and "Removing leading drive letter" ones. Those are not
+    attributable to a member, so they are not a column - but they are the only
+    evidence that libarchive treats a drive letter as a hazard at all, which
+    Python does not, so they are not dropped either.
+
+    The destination path handed to the Python filters is a fixed literal. The
+    verdict for a relative name does not depend on it, and writing it down is
+    cheaper than asserting that.
+    """
+    comments, rows = verdict_rows(destination)
+    lines = [
+        "# What each reference would DO with each member's name, as opposed to",
+        "# what it reads there. Generated by tools/oracle/make_corpus.py inside",
+        "# the pinned container; do not edit.",
+        "#",
+        "# python_data is tarfile.data_filter (PEP 706), whose verdict is three-",
+        "# valued: same, rewrite, or a refusal named after its exception.",
+        "# python_tar is tarfile.tar_filter, the permissive policy, as the control.",
+        "# libarchive is whether `bsdtar -x` refused the member.",
+        "#",
+        "# These are the REFERENCES' decisions, not this library's. A row this",
+        "# library disagrees with is a finding either way round.",
+        "#",
+        "# archive\tindex\tname\tpython_data\tpython_tar\tlibarchive",
+    ]
+    lines += comments
+    lines += ["\t".join(row) for row in rows]
+
+    with open(os.path.join(destination, "verdicts.tsv"), "w",
+            encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def verdict_rows(destination):
+    """Ask both references what they would do, and return (comments, rows).
+
+    Separate from verdicts() so that `check-oracle` can ask the same question of
+    the committed bytes without a second copy of how it is asked. A checker that
+    re-implemented the question would be checking two implementations of it
+    against each other rather than the references against the corpus.
+    """
+    import tarfile
+
+    dest = "/ghoti-dest"
+    comments = []
+    rows = []
+
+    for name in sorted(os.listdir(destination)):
+        if not name.endswith(".tar"):
+            continue
+        path = os.path.join(destination, name)
+
+        # libarchive first, so its notes land above the rows they describe.
+        room = os.path.join("/tmp", "ghoti-extract", name)
+        if os.path.exists(room):
+            shutil.rmtree(room)
+        os.makedirs(room)
+        finished = subprocess.run(["bsdtar", "-xf", path], cwd=room,
+            capture_output=True)
+        refused = set()
+        notes = []
+        for raw in finished.stderr.split(b"\n"):
+            if not raw:
+                continue
+            if raw.startswith(b"bsdtar: "):
+                # An archive-level message, or the delayed-error summary.
+                text = raw[len(b"bsdtar: "):]
+                if not text.startswith(b"Error exit delayed"):
+                    notes.append(escape(text))
+                continue
+            # A per-member refusal, which libarchive prints as "<name>: <reason>".
+            head, _, _tail = raw.partition(b": ")
+            refused.add(head)
+        if notes:
+            comments.append("# %s: libarchive also said: %s"
+                % (name, "; ".join(notes)))
+        # **What it created, not only what it said.** libarchive prints at most one
+        # archive-level "Removing leading ..." message per archive, so in a fixture
+        # that has both an absolute name and a drive letter the second rewrite is
+        # invisible in stderr - and the drive letter is the only hazard for which
+        # libarchive is the *only* reference, because Python accepts it unchanged.
+        # The tree it wrote is where that fact lives.
+        created = []
+        for here, directories, files in os.walk(room):
+            relative = os.path.relpath(here, room)
+            for entry in sorted(files) + sorted(directories):
+                joined = entry if relative == "." else os.path.join(relative, entry)
+                created.append(escape(joined.encode("utf-8", "surrogateescape")))
+        if created:
+            comments.append("# %s: libarchive created: %s"
+                % (name, " ".join(sorted(created))))
+
+        with tarfile.open(path, "r:") as archive:
+            members = list(archive)
+
+        # The attribution above is by name prefix, so it is checked rather than
+        # trusted: every refusal line has to belong to a member of this archive.
+        # A line this loop could not place would otherwise vanish, and a vanished
+        # refusal reads as libarchive having accepted the member.
+        known = {info.name.encode("utf-8", "surrogateescape")
+            for info in members}
+        stray = refused - known
+        if stray:
+            raise SystemExit("%s: libarchive refused names that are not members "
+                "of it: %r" % (name, sorted(stray)))
+
+        for index, info in enumerate(members):
+            try:
+                out = tarfile.data_filter(info, dest)
+                data = "same" if out.name == info.name else "rewrite"
+            except Exception as problem:
+                data = type(problem).__name__
+            try:
+                out = tarfile.tar_filter(info, dest)
+                tar = "same" if out.name == info.name else "rewrite"
+            except Exception as problem:
+                tar = type(problem).__name__
+            raw = info.name.encode("utf-8", "surrogateescape")
+            rows.append((name, str(index), escape(raw), data, tar,
+                "refused" if raw in refused else "extracted"))
+
+        shutil.rmtree(room, ignore_errors=True)
+
+    return comments, rows
+
+
 def hashes(destination):
     """sha256 of every archive, so a moved fixture fails rather than passes."""
     rows = []
     for name in sorted(os.listdir(destination)):
-        if not (name.endswith(".tar") or name in ("manifest.tsv", "names.tsv")):
+        if not (name.endswith(".tar")
+            or name in ("manifest.tsv", "names.tsv", "verdicts.tsv")):
             continue
         with open(os.path.join(destination, name), "rb") as handle:
             digest = hashlib.sha256(handle.read()).hexdigest()
@@ -559,6 +916,7 @@ def main(argv):
         generate(destination)
         manifest(destination)
         names(destination)
+        verdicts(destination)
         return 0
 
     sys.path.insert(0, HERE)

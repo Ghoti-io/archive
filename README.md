@@ -9,9 +9,15 @@ That is not squeamishness. Every well-known archive vulnerability is a *path*
 vulnerability — a member named `../../etc/cron.d/x`, a symlink whose target
 escapes the extraction root, a hardlink doing the same with no target string to
 inspect — and a library that hands you a name and a byte range cannot commit
-one. It also makes a corpus of several hundred malicious archives something
-that runs on every commit rather than something a fuzzer has to find its way
-to.
+one. It also makes a corpus of malicious archives something that runs on every
+commit rather than something a fuzzer has to find its way to.
+
+What this library *does* offer is a vocabulary for saying what is wrong with a
+name, checked against what two pinned extractors actually do with it. What it
+does not offer is a verdict on whether extracting one is safe, because that
+cannot be answered from a name: a member called `docs/readme` has nothing wrong
+with it and escapes any root you like if an earlier member made `docs` a symlink
+to `/`.
 
 Codecs are [Ghoti.io Compress](https://github.com/Ghoti-io/compress)'s job: a
 zip member stored with method 8 *is* RFC 1951, and `tar.zst` is a tar stream
@@ -30,11 +36,17 @@ expectations come from Python 3.13.5's `tarfile` and libarchive 3.7.4's bsdtar,
 so a passing test is three implementations agreeing rather than this library
 agreeing with itself.
 
-Build clean under GCC 14 with `-Werror`; 195 tests; 99.6% line coverage, the
+**Names are classified, not cleaned.** `garc_name_check()` reports what is
+dangerous about a member name or a link target - traversal, absolute, drive
+letter, a NUL, a Windows device name, malformed UTF-8 - one finding at a time,
+and the reader hands over the bytes the archive actually holds. It is a
+classifier and not a permission: see `examples/name_findings.c`, which prints why.
+
+Build clean under GCC 14 with `-Werror`; 221 tests; 99.7% line coverage, the
 four remaining lines being a defensive arm no input can reach and two guards that
 are live only where `size_t` is 32 bits; clean under Valgrind and under
-ASan+UBSan; `check-symbols`, `check-aliasing` and `check-corpus-hashes` green;
-two fuzz harnesses.
+ASan+UBSan; `check-symbols`, `check-aliasing`, `check-corpus-hashes` and
+`check-fixtures` green; three fuzz harnesses.
 
 ## A minimal complete program
 
@@ -102,7 +114,11 @@ int main(void) {
 escaped - which a listing tool has to do, because a name is attacker-controlled
 bytes and an ANSI escape in one makes the output say whatever the archive wants.
 `examples/stream_from_file.c` is the stream on its own, with `seek` and `size`
-filled in as a zip reader will need.
+filled in as a zip reader will need. `examples/name_findings.c` judges an archive
+without reading a byte of member data: it classifies every name and every link
+target, prints what is wrong with each, and exits non-zero if anything names a
+place outside a root — which works on a pipe, since that is when you most want to
+refuse.
 
 ## Building
 
@@ -189,6 +205,29 @@ a stream of no bytes and a stream of unknown length are different facts.
 Offsets and sizes are `uint64_t` throughout. A zip64 archive can exceed 4 GiB
 and `size_t` is 32 bits on a 32-bit host, so `size_t` would make exactly those
 archives unreadable on exactly the platforms where it matters.
+
+**Names.** `garc_name_check()` takes bytes and a length — a member's name, or a
+symlink's target, since they are equally dangerous and it is the same question —
+and returns a bitmask of `GARC_Name_Finding`: traversal, absolute, drive letter,
+UNC, a parent or empty component, a NUL or control byte, a Windows device name, a
+trailing dot, malformed UTF-8. A bitmask because a name has as many problems as it
+has; `../../CON.` has four.
+
+Two masks group them. `GARC_NAME_ESCAPES` is "this names somewhere a root does not
+contain"; `GARC_NAME_PORTABILITY` is "this matters where it is used, not where it
+points". Which to refuse on is yours: a POSIX extractor may ignore every finding in
+the second, and one writing to a Windows filesystem may not.
+
+**Two findings look redundant and are not.** `GARC_NAME_TRAVERSAL` means resolving
+the components leaves the root; `GARC_NAME_PARENT_COMPONENT` means there is a `..`
+in it. `a/..` has the second and not the first, and that is exactly where the two
+reference extractors disagree — Python's `tarfile.data_filter` resolves it and
+accepts, libarchive's `bsdtar` refuses any `..` at all. One bit would have to pick
+a side.
+
+**A clean answer is not permission to extract.** No function taking one name can
+see a symlink an earlier member created, or a collision between two names, and this
+one does not pretend to. Resolve as you create.
 
 **Allocation.** Everything goes through a `GARC_Allocator`, which is cutil's
 vtable under a local name. `NULL` means `garc_allocator_default()`. The

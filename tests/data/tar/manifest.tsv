@@ -20,6 +20,35 @@ gnu-longname.tar	1	dddddddddddddddddddddddd/dddddddddddddddddddddddd	directory	0
 gnu-longname.tar	2	dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd	directory	0	1000000000	0	0755	1234	5678			
 gnu-longname.tar	3	dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd	directory	0	1000000000	0	0755	1234	5678			
 gnu-longname.tar	4	dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/leaf.txt	file	5	1000000000	0	0644	1234	5678			
+mal-collisions.tar	0	A.txt	file	8	1000000000	0	0644	1234	5678			
+mal-collisions.tar	1	a.txt	file	8	1000000000	0	0644	1234	5678			
+mal-collisions.tar	2	cafe\xCC\x81	file	8	1000000000	0	0644	1234	5678			
+mal-collisions.tar	3	caf\xC3\xA9	file	8	1000000000	0	0644	1234	5678			
+mal-gnu-longpath.tar	0	../../../eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/tmp/ghoti-escaped	file	8	1000000000	0	0644	1234	5678			
+mal-links.tar	0	abs-target	symlink	0	1000000000	0	0777	1234	5678			/tmp/ghoti-escaped
+mal-links.tar	1	dot-target	symlink	0	1000000000	0	0777	1234	5678			./sibling
+mal-links.tar	2	hard	file	7	1000000000	0	0644	1234	5678			
+mal-links.tar	3	sibling	hardlink	0	1000000000	0	0644	1234	5678			hard
+mal-links.tar	4	up-target	symlink	0	1000000000	0	0777	1234	5678			../../..
+mal-paths.tar	0	../../../tmp/ghoti-escaped	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	1	/tmp/ghoti-escaped	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	2	a/../../b	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	3	a/..	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	4	./x	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	5	a//b	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	6	C:\\Windows\\ghoti	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	7	\\server\\share\\ghoti	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	8	..	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	9	CON	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	10	aux.txt	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	11	COM1	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	12	trailing.	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	13	trailing 	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	14	esc\x1B[31mred	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	15	bad\x80utf	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	16	over\xC0\xAFlong	file	8	1000000000	0	0644	1234	5678			
+mal-paths.tar	17	a/b/../../../c	file	8	1000000000	0	0644	1234	5678			
+mal-pax-longpath.tar	0	../../../eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/tmp/ghoti-escaped	file	8	1000000000	0	0644	1234	5678			
 pax-basic.tar	0	hello.txt	file	15	1000000000	0	0644	1234	5678			
 pax-basic.tar	1	sizes	directory	0	1000000000	0	0755	1234	5678			
 pax-basic.tar	2	sizes/block	file	512	1000000000	0	0644	1234	5678			

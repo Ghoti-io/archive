@@ -361,7 +361,7 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols check-aliasing check-corpus-hashes
+TEST_GATES ?= check-symbols check-aliasing check-corpus-hashes check-fixtures
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
 #
@@ -1151,9 +1151,10 @@ endef
 
 $(eval $(call fuzz-rule,fuzz_stream,stream))
 $(eval $(call fuzz-rule,fuzz_tar,tar))
+$(eval $(call fuzz-rule,fuzz_name,name))
 
 fuzz: ## Build and run every fuzzer for $(FUZZ_TIME) seconds each
-fuzz: fuzz-run-stream fuzz-run-tar
+fuzz: fuzz-run-stream fuzz-run-tar fuzz-run-name
 
 fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 	-@rm -rf $(FUZZ_DIR)
@@ -1197,6 +1198,12 @@ oracle-version: ## Print which references would answer, and fail if none would
 
 check-corpus-hashes: ## Fail if a committed fixture is not what CORPUS names
 	@python3 tools/check_corpus.py
+
+check-fixtures: ## Fail if a test input is excluded from the repository
+# Needs git and nothing else, so it is in TEST_GATES beside the hash check rather
+# than behind the container. The failure it catches leaves `git status` clean and
+# only shows up in somebody else's clone - see tools/check_fixtures.py.
+	@python3 tools/check_fixtures.py
 
 corpus: ## Regenerate tests/data/tar/ and containers/CORPUS in the container
 	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- \

@@ -113,6 +113,20 @@ def inner():
                         info.linkname.encode("utf-8", "surrogateescape")),
                 ))
 
+    # What the references would *do*, which is the only column garc_name_check()
+    # has an outside opinion to be checked against. The archive-level comment
+    # lines are not compared here: they are part of the file `check-corpus`
+    # regenerates and hashes, so a change in what libarchive creates already fails
+    # that gate, and re-deriving them here would be the same question twice.
+    got_verdicts = [tuple(row) for row in make_corpus.verdict_rows(CORPUS)[1]]
+    want_verdicts = read_expected(os.path.join(CORPUS, "verdicts.tsv"), 6)
+    if got_verdicts != want_verdicts:
+        failures.append("verdicts.tsv: the references now decide %d rows against "
+            "%d committed" % (len(got_verdicts), len(want_verdicts)))
+        for row in sorted(set(want_verdicts) ^ set(got_verdicts)):
+            side = "committed" if row in want_verdicts else "references"
+            failures.append("  %s only: %s" % (side, "\t".join(row)))
+
     want_meta = read_expected(os.path.join(CORPUS, "manifest.tsv"), 13)
     if got_meta != want_meta:
         failures.append("manifest.tsv: tarfile now reads %d rows against %d "
@@ -134,8 +148,8 @@ def inner():
             "written down.\n")
         return 1
 
-    print("check-oracle: %d names and %d metadata rows still agree"
-        % (len(got_names), len(got_meta)))
+    print("check-oracle: %d names, %d metadata rows and %d verdicts still agree"
+        % (len(got_names), len(got_meta), len(got_verdicts)))
     return 0
 
 

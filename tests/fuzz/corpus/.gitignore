@@ -2,5 +2,14 @@
 *
 !.gitignore
 !*.seed
-!stream/
-!tar/
+# A directory per harness, admitted by pattern rather than by name.
+#
+# This used to read `!stream/` and `!tar/`, and adding the `name` harness showed
+# why that rots: **an excluded directory blocks every negation inside it**, so a
+# third directory's seeds were silently un-addable. `git status` stays clean, the
+# seeds work in the tree where they were written, and they are absent from every
+# clone - which is the same failure `.gitignore` at the top of this repository
+# already carries a paragraph about for `tests/data/**`.
+#
+# `make check-fixtures` is the gate; this comment is why it exists.
+!*/

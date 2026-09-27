@@ -58,6 +58,32 @@ std::string member_name(const GARC_Member * member) {
 }
 
 /**
+ * Whether `bsdtar -tf` would print these bytes unchanged.
+ *
+ * **It does not always, and finding that out cost a test run.** bsdtar is a
+ * *listing* tool, so it escapes: a control byte comes out as `\033`, a high byte
+ * as `\200`, and a backslash is doubled. That is the right thing for a program
+ * writing attacker-controlled bytes to a terminal - it is what this library's own
+ * example does - and it means bsdtar's listing is a **rendering rather than the
+ * bytes**, so it cannot be the byte-level expectation for a hostile name.
+ *
+ * It is still the only reference that keeps a directory's trailing slash, which is
+ * why it is not simply dropped. See expect_matches_manifest() for how the two
+ * references are combined now: the bytes come from tarfile, the slash rule is
+ * reconstructed, and bsdtar checks the reconstruction on every name it *can*
+ * render verbatim - which is most of them.
+ */
+bool renders_verbatim(const std::string & name) {
+  for (char byte : name) {
+    const unsigned char value = static_cast<unsigned char>(byte);
+    if (value < 0x20u || value > 0x7Eu || value == static_cast<unsigned char>('\\')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Walk one fixture and compare every member against the manifest.
  *
  * `shape` chooses the stream: a memory stream, or a callback stream that cannot
@@ -65,6 +91,16 @@ std::string member_name(const GARC_Member * member) {
  * the assertion that makes "tar can be read from a pipe" true rather than
  * claimed - and it is checked on every fixture rather than on one.
  */
+/**
+ * How many names the bsdtar cross-check covered, and how many it could not.
+ *
+ * A clause that quietly stops applying is a gate that vanishes from a green
+ * suite, so the two counts are totalled across every fixture and asserted once
+ * at the end - see TarCorpus::TheNameReferencesAreBothStillBeingAsked.
+ */
+size_t g_rendered_verbatim = 0;
+size_t g_rendered_escaped = 0;
+
 void expect_matches_manifest(const std::string & fixture, bool as_pipe) {
   const auto & rows = manifest();
   ASSERT_FALSE(rows.empty())
@@ -107,10 +143,32 @@ void expect_matches_manifest(const std::string & fixture, bool as_pipe) {
         << fixture << ": more members than the reference found";
     const ManifestRow & want = found->second[index];
 
-    // The name from bsdtar, which keeps a directory's trailing slash as the
-    // header does. The rest from tarfile.
-    EXPECT_EQ(member_name(member), found_names->second[index])
+    // **The name, from both references, each used for what it can express.**
+    //
+    // tarfile's `.name` is the bytes - it round-trips any byte through
+    // surrogateescape - and is wrong about exactly one thing: it strips a
+    // directory member's trailing slash. bsdtar keeps the slash and is wrong
+    // about any byte it has to escape, because its listing is a rendering.
+    //
+    // So the expectation is tarfile's bytes with the slash put back, and bsdtar
+    // checks *that rule* wherever it renders verbatim - which is every name in the
+    // ordinary corpus and most of the hostile ones. The rule is therefore not
+    // assumed; it is asserted against a second reference 85-odd times.
+    std::string want_name = want.name;
+    if (want.type == "directory") {
+      want_name += '/';
+    }
+    EXPECT_EQ(member_name(member), want_name)
         << fixture << " member " << index;
+    if (renders_verbatim(want_name)) {
+      ++g_rendered_verbatim;
+      EXPECT_EQ(found_names->second[index], want_name)
+          << fixture << " member " << index
+          << ": the two references disagree about a name neither of them has to "
+             "escape, so the slash rule above is wrong";
+    } else {
+      ++g_rendered_escaped;
+    }
     EXPECT_STREQ(garc_member_type_string(member->type), want.type.c_str())
         << fixture << " member " << index << " " << want.name;
     // uname and gname are bytes plus a length, and absent rather than empty when
@@ -182,6 +240,17 @@ const char * const readable[] = {
   "gnu-longname.tar",
   "gnu-longname-blocks.tar",
   "gnu-longlink.tar",
+  // The hostile-name fixtures are read like any others, and they are here for
+  // that reason rather than despite it: **this library must not sanitise.** A
+  // reader that quietly cleaned `../../../tmp/x` into `tmp/x` would hand a caller
+  // a name the archive does not contain, and the caller could then never find out
+  // that the archive lied. The names in the manifest are the bytes GNU tar wrote,
+  // so comparing against it is what says nothing was cleaned.
+  "mal-paths.tar",
+  "mal-links.tar",
+  "mal-collisions.tar",
+  "mal-gnu-longpath.tar",
+  "mal-pax-longpath.tar",
 };
 
 } // namespace
@@ -206,6 +275,24 @@ TEST(TarCorpus, EveryFixtureMatchesTheReferenceFromAPipe) {
     SCOPED_TRACE(fixture);
     expect_matches_manifest(fixture, true);
   }
+}
+
+TEST(TarCorpus, TheNameReferencesAreBothStillBeingAsked) {
+  // The guard on the split above. If `renders_verbatim` ever returned false for
+  // everything - a stricter predicate, a corpus of binary names - the bsdtar
+  // cross-check would stop running and nothing would say so, because a clause
+  // that never fires and a clause that always passes look identical in a green
+  // suite. And if it returned true for everything, the escaped names would be
+  // being compared against a rendering.
+  //
+  // This runs after the two walks above, which is why it reads globals rather
+  // than measuring anything itself: gtest runs tests in declaration order within
+  // a suite, and these three are in one.
+  EXPECT_GT(g_rendered_verbatim, 100u)
+      << "the bsdtar cross-check covered almost nothing";
+  EXPECT_GT(g_rendered_escaped, 5u)
+      << "no name needed escaping, so the hostile fixtures are no longer hostile "
+         "or the predicate has stopped distinguishing";
 }
 
 TEST(TarCorpus, TheManifestIsNotEmpty) {
@@ -414,6 +501,184 @@ TEST(TarVariant, AGnuLongLinkTargetIsNotTruncated) {
   EXPECT_EQ(from_the_field, 1u)
       << "no target came from the header field, so a reader that read every "
          "target from a carrier would pass this";
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+//-----------------------------------------------------------------------------
+// Hostile names, which are read rather than cleaned
+//-----------------------------------------------------------------------------
+
+TEST(TarCorpus, EveryOrdinaryNameTheReaderReportsIsClean) {
+  // The control over the bytes the *reader* hands out, which is not the same set
+  // as the names in verdicts.tsv: those come from tarfile, which strips a
+  // directory member's trailing slash. So this is the only place `sizes/` and
+  // `emptydir/` are classified at all, and a checker that read a trailing
+  // separator as an empty component would put a finding on a large fraction of
+  // every real archive.
+  size_t checked = 0;
+  size_t directories = 0;
+  for (const char * fixture : readable) {
+    if (std::string(fixture).compare(0, 4, "mal-") == 0) {
+      continue;
+    }
+    SCOPED_TRACE(fixture);
+    std::vector<uint8_t> bytes = read_fixture(data_path(fixture));
+    ASSERT_FALSE(bytes.empty());
+
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+        GARC_OK);
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+    const GARC_Member * member = nullptr;
+    GARC_Result result;
+    while ((result = garc_next(archive, &member)) == GARC_OK) {
+      SCOPED_TRACE(member_name(member));
+      ++checked;
+      if (member->type == GARC_MEMBER_DIRECTORY) {
+        ++directories;
+        // The reader keeps the slash, which is the byte this test exists for.
+        ASSERT_EQ(member->name[member->name_length - 1u], '/');
+      }
+      EXPECT_EQ(garc_name_check(member->name, member->name_length), 0u)
+          << "an ordinary name reported findings";
+      if (member->link_target) {
+        EXPECT_EQ(garc_name_check(
+                      member->link_target, member->link_target_length),
+            0u)
+            << "an ordinary link target reported findings";
+      }
+    }
+    EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
+  EXPECT_GT(checked, 50u) << "too few names to be a control";
+  EXPECT_GT(directories, 5u)
+      << "no directory member was classified, so the trailing-slash case is not "
+         "covered here either";
+}
+
+TEST(TarHostileNames, TheReaderReportsThemVerbatimAndSaysWhatIsWrong) {
+  // Two claims in one walk, because they are the two halves of the same decision:
+  // the *reader* hands over exactly what the header said, and the *classifier* is
+  // what says it is dangerous. A library that did the first without offering the
+  // second would be handing out hazards with no vocabulary to describe them; one
+  // that did the second by rewriting the name would be lying about the archive.
+  std::vector<uint8_t> bytes = read_fixture(data_path("mal-paths.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  size_t escaping = 0;
+  size_t flagged = 0;
+  size_t members = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    ++members;
+    const std::string name = member_name(member);
+    SCOPED_TRACE(name);
+    const uint32_t findings = garc_name_check(member->name, member->name_length);
+    if (findings) {
+      ++flagged;
+    }
+    if (findings & GARC_NAME_ESCAPES) {
+      ++escaping;
+      // Nothing was stripped on the way through: a name this library calls an
+      // escape still *looks* like one to the caller.
+      EXPECT_TRUE(name.find("..") != std::string::npos || name[0] == '/'
+          || name.find(':') != std::string::npos
+          || name.compare(0, 2, "\\\\") == 0)
+          << "a name reported as an escape has none of the syntax that makes it "
+             "one, so something cleaned it";
+    }
+  }
+  EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+  EXPECT_EQ(members, 18u) << "the hostile-name fixture changed size";
+  EXPECT_EQ(flagged, members)
+      << "a name in the hostile fixture came back with no findings";
+  EXPECT_GT(escaping, 4u) << "too few escapes to be asserting anything";
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarHostileNames, AHostileTargetSurvivesTheCarriersToo) {
+  // A long hostile name arrives through a GNU `L` carrier in one fixture and a pax
+  // `path=` record in the other, and the check has to see *that* name rather than
+  // the truncated copy in the header behind it. This is the one place a reader
+  // that got the carriers wrong would hand a safety check something harmless and
+  // get a clean answer.
+  for (const char * fixture : {"mal-gnu-longpath.tar", "mal-pax-longpath.tar"}) {
+    SCOPED_TRACE(fixture);
+    std::vector<uint8_t> bytes = read_fixture(data_path(fixture));
+    ASSERT_FALSE(bytes.empty());
+
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+        GARC_OK);
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(garc_next(archive, &member), GARC_OK);
+    // Longer than the header field, so it can only have come from the carrier.
+    EXPECT_GT(member->name_length, 100u);
+    const uint32_t findings = garc_name_check(member->name, member->name_length);
+    EXPECT_TRUE(findings & GARC_NAME_TRAVERSAL)
+        << "the long hostile name lost its traversal on the way through";
+
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
+}
+
+TEST(TarHostileNames, ALinkTargetIsHostileWhereTheNameIsNot) {
+  // The half of the problem a name check cannot reach from the name. Every member
+  // here has an ordinary name and two of them point somewhere they should not -
+  // which is why garc_name_check() takes bytes, so the same function answers about
+  // a target.
+  std::vector<uint8_t> bytes = read_fixture(data_path("mal-links.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  size_t hostile_targets = 0;
+  size_t members = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    ++members;
+    SCOPED_TRACE(member_name(member));
+    // Every name in this fixture is ordinary, which is the point.
+    EXPECT_EQ(garc_name_check(member->name, member->name_length), 0u);
+    if (!member->link_target) {
+      continue;
+    }
+    const uint32_t findings
+        = garc_name_check(member->link_target, member->link_target_length);
+    if (findings & GARC_NAME_ESCAPES) {
+      ++hostile_targets;
+    }
+  }
+  EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+  EXPECT_EQ(members, 5u);
+  EXPECT_EQ(hostile_targets, 2u)
+      << "the fixture should hold one absolute target and one that climbs out, "
+         "beside a target that does neither";
 
   garc_close(archive);
   garc_stream_destroy(stream);

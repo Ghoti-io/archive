@@ -54,6 +54,84 @@ Extraction to a directory, and creation from one, arrive later as a separate
 opt-in layer, with the corpus already written. That layer then has exactly one
 job, done once, in one place.
 
+### Naming the danger without deciding about it
+
+`garc_name_check()` classifies a name - or a link target, which is the same
+question about different bytes - into a bitmask of `GARC_Name_Finding`. A bitmask
+because a name has as many problems as it has: `../../CON.` is a traversal *and* a
+Windows device *and* a name Windows will strip a dot from, and a function
+returning the first of those makes the other two unreportable.
+
+**It is a classifier, not a permission, and that distinction is the whole design.**
+Two things cannot be answered from one name, ever:
+
+- A member called `docs/readme` has no findings and escapes any root you like if
+  an earlier member made `docs` a symlink to `/`. Neither member is suspicious
+  alone, which is why extraction has to check the **resolved** path as it
+  resolves, against the links it has actually created. A check on the declared
+  name is the bug, not the fix.
+- A collision is a property of a *pair*: `A.txt` and `a.txt`, or `café` composed
+  and decomposed. No function taking one name can see it, and deciding it needs
+  case-folding and normalisation tables this library deliberately does not carry.
+
+So the corpus contains both shapes and the tests say out loud that the check does
+not claim them. `mal-links.tar` holds an absolute link target and one that climbs
+out of any root, and every *name* in it is ordinary. `mal-collisions.tar` holds
+both collision pairs, and every name in it is individually clean - asserted, so
+that if someone ever teaches the checker to fold case the claim gets moved rather
+than the test relaxed.
+
+What it is for: refusing an archive early and cheaply, before any of it is read;
+telling a person *why* a listing looks wrong; and giving the filesystem layer a
+vocabulary to report in. `examples/name_findings.c` is the refuse-early shape, and
+it prints the "no findings is not permission" sentence because that is the thing a
+reader of it is most likely to get wrong.
+
+#### Two references, and the disagreement that shaped the API
+
+Every finding is either checked against an outside reference or marked as having
+none, because a safety predicate whose expectations were written by whoever wrote
+the predicate measures the author twice. `tests/data/tar/verdicts.tsv` records
+what each pinned reference *does* with all 91 names in the corpus - which is a
+decision rather than a reading, and the only part of the corpus that is.
+
+They do not agree with each other:
+
+| name | `tarfile.data_filter` | `bsdtar -x` |
+| --- | --- | --- |
+| `../../../tmp/x` | refuses | refuses |
+| `/tmp/x` | **rewrites** to `tmp/x` | **rewrites** |
+| `a/..` | **accepts** | **refuses** |
+| `C:\Windows\x` | **accepts** | **rewrites**, dropping `C:` |
+| `./x`, `a//b` | accepts | accepts |
+
+`a/..` has a parent component and resolves *inside* the root. Python resolves and
+accepts; libarchive refuses any `..` at all. **A single safe/unsafe bit would have
+to pick one of them**, so `GARC_NAME_TRAVERSAL` (resolving leaves the root) and
+`GARC_NAME_PARENT_COMPONENT` (there is a `..`) are separate bits, and a caller can
+hold either policy. The depth is a running count for the same reason: `a/..` ends
+where it started, and `a/b/../../../c` climbs one further than it descended.
+
+Each reference then gets the mask it actually answers for, and the two masks
+differ - which is what makes the cross-check a relation rather than a restatement.
+The relation is two-sided in both cases, because one direction alone is satisfied
+by a checker that reports nothing and the other by one that reports everything.
+
+Two limits of the references are written down rather than worked around:
+
+- **Both run on POSIX**, so neither can answer about a Windows reserved name, a
+  trailing dot, or a backslash as a separator. Those findings are justified from
+  documented platform behaviour, not from a tool's verdict, and
+  `GARC_NAME_WINDOWS_TRAVERSAL` is deliberately **not** in `GARC_NAME_ESCAPES`:
+  including it would make this library stricter than both references about names
+  they are right to accept on the host they run on.
+- **The verdict is about a member and the check is about bytes.** Python raises
+  `AbsoluteLinkError` for a member whose *name* is perfectly ordinary and whose
+  *target* is not. The relation has to be restricted at both ends, so the test maps
+  each of `tarfile`'s exception names onto the field it is about - which is reading
+  the reference's own vocabulary rather than inventing an expectation. Getting
+  that wrong was the first failure of the cross-check.
+
 ## 3. What this library refuses to know
 
 Two refusals keep the dependency list at `cutil` and `compress`. Both will be
@@ -448,13 +526,44 @@ Comparing names against the one that normalises would have needed either a wrong
 expectation or a tolerance wide enough to hide a real truncation. Naming the
 reference per question is the answer instead.
 
-### Three gates, and what each cannot see
+### The malicious corpus, and where its names come from
+
+Every hostile name in `tests/data/tar/mal-*.tar` is written by **GNU tar**, through
+`--transform` with `-P`. That is the point rather than a convenience: a corpus of
+hostile names invented by whoever wrote the checker measures that person's
+imagination, which is the argument that kept this out of phase A until there was an
+oracle to build it against.
+
+`-P` is what makes it work and is worth knowing about on its own: GNU tar's
+*default* is to sanitise, stripping a leading `/` or `../` with a warning. A corpus
+generated without it would contain nothing hostile at all and every test over it
+would pass.
+
+Three of these fixtures cost a regeneration each to get right, and each failure is
+the same shape - a fixture that looked hostile and was not:
+
+- **Two names meant to hold raw bytes arrived well-formed.** `"\x80"` in a Python
+  `str` is U+0080, which `subprocess` encodes to the valid pair `C2 80` on the way
+  to `tar`. The surrogate spelling `"\udc80"` is what `surrogateescape` maps back to
+  a single raw byte, and the generator now asserts that a name's encoding is what
+  its table entry says.
+- **A global pax header's own mtime is a wall-clock reading**, because `--mtime`
+  sets the *members'* times and a global header is not a member.
+- **GNU tar's sparse members embed its pid** in the member name
+  (`./GNUSparseFile.6/...`), which cannot be pinned at all - so the sparse refusal
+  is tested hand-built and there is no sparse fixture.
+
+The complement is hand-built, as everywhere else in this library: an empty name and
+a NUL inside one cannot be produced by any writer, because no filesystem can hold
+them.
+
+### Four gates, and what each cannot see
 
 | gate | needs a container | catches |
 | --- | --- | --- |
 | `check-corpus-hashes` | no, and so it is in `TEST_GATES` | a fixture edited, truncated, or half-committed |
 | `check-corpus` | yes | the references no longer *writing* these bytes |
-| `check-oracle` | yes | the references no longer *reading* them the same way |
+| `check-oracle` | yes | the references no longer *reading* them the same way, or no longer *deciding* the same way about them |
 
 The split matters in both directions. Hashing needs only sha256, so it runs on
 every machine; regenerating needs the image, so it fails closed rather than
@@ -464,6 +573,17 @@ are not the same question: a tar release can change how a field is parsed withou
 changing any output, and a suite that only regenerated would call that a pass.
 `check-oracle` is also the only thing that catches a manifest edited *and*
 rehashed to make a failing test pass.
+
+The fourth question is `verdicts.tsv`, which `check-oracle` re-derives along with
+the other two. It is the only file in the corpus recording a **decision** rather
+than a reading - what `tarfile.data_filter` and `bsdtar -x` would *do* with each
+name - and it is what `garc_name_check()` is measured against. Its archive-level
+comment lines, which record the tree libarchive actually created, are not
+re-derived there on purpose: they are part of the file `check-corpus` regenerates
+and hashes, so a change in them already fails that gate, and asking twice would be
+the same question twice. Those lines are the only evidence that libarchive strips a
+drive letter, because it reports at most one archive-level rewrite per archive and
+an absolute name in the same fixture uses up the message.
 
 `make check-corpus` earned its keep on its first run, by finding that GNU tar's
 pax output is not reproducible: it writes `atime` and `ctime` records that are
