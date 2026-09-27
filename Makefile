@@ -308,14 +308,26 @@ else
 endif
 
 # The standard include directories for the project.
-INCLUDE := -I include/ -I $(GEN_DIR)/
+#
+# `-I src/` so that a cross-module internal header is included by the same path
+# its include guard is named after - `#include "reader/reader_internal.h"`
+# against GHOTI_IO_GARC_SRC_READER_READER_INTERNAL_H. The siblings use relative
+# paths (`"../core/number_internal.h"`), which say the same thing in a spelling
+# that changes when a file moves and cannot be grepped for.
+INCLUDE := -I include/ -I src/ -I $(GEN_DIR)/
 
 # Goals that compile and link nothing.  A missing sibling library must not stop
 # them: `make docs` needs doxygen and the tracked sources, not cutil, and it
 # was failing at parse time - before doxygen was ever reached - on any machine
 # where the suite is not installed.  Every other goal still gets the hard
 # error below, which is the point of having no fallback.
-DEPLESS_GOALS := docs docs-pdf clean fuzz-clean cloc help
+# The oracle and corpus goals are here too: they compile and link nothing, and a
+# machine that can regenerate the corpus is not necessarily one with the suite
+# installed. `make check-corpus` failing at parse time on a missing cutil - before
+# it reached a container - was the reason this list grew.
+DEPLESS_GOALS := docs docs-pdf clean fuzz-clean cloc help \
+	corpus check-corpus check-corpus-hashes check-oracle \
+	oracle-build oracle-version
 ifeq ($(filter-out $(DEPLESS_GOALS),$(or $(MAKECMDGOALS),all)),)
 SKIP_DEP_CHECK := 1
 endif
@@ -349,7 +361,7 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols check-aliasing
+TEST_GATES ?= check-symbols check-aliasing check-corpus-hashes
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
 #
@@ -550,6 +562,8 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 
 # General commands
 .PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-aliasing
+.PHONY: check-corpus-hashes check-corpus corpus oracle-build oracle-version
+.PHONY: check-oracle
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1114,12 +1128,65 @@ fuzz-run-$2: $$(FUZZ_APP_DIR)/$1
 endef
 
 $(eval $(call fuzz-rule,fuzz_stream,stream))
+$(eval $(call fuzz-rule,fuzz_tar,tar))
 
 fuzz: ## Build and run every fuzzer for $(FUZZ_TIME) seconds each
-fuzz: fuzz-run-stream
+fuzz: fuzz-run-stream fuzz-run-tar
 
 fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 	-@rm -rf $(FUZZ_DIR)
+
+####################################################################
+# Oracles and the corpus
+####################################################################
+#
+# **Two gates, and the split is the point.** Hashing the committed fixtures needs
+# nothing but sha256, so `check-corpus-hashes` is in TEST_GATES and runs on every
+# machine. Regenerating them needs the pinned image, so `check-corpus` is
+# separate and fails closed without it - its only caller is somebody who typed
+# the target. A gate that skipped when the image was absent would make a machine
+# with no engine look exactly like one where the references still agree.
+#
+# What each can and cannot see:
+#
+#   check-corpus-hashes  a fixture edited, truncated, or dropped by a merge.
+#                        **Not** a fixture and its hash edited together; nothing
+#                        local can see that.
+#   check-corpus         the references no longer producing these bytes, which is
+#                        what a raised pin looks like and is a finding to triage
+#                        rather than a hash to update.
+#   check-oracle         the committed expectations no longer matching what the
+#                        live references say about the committed bytes. Distinct
+#                        from check-corpus: this one re-reads, that one re-writes,
+#                        and a reference can change its reading without changing
+#                        its writing.
+
+ORACLE := tools/oracle
+ORACLE_RUN := python3 $(ORACLE)/oracle_run.py
+ORACLE_IMAGE := localhost/ghoti-archive-oracle-tars:deb13
+
+oracle-build: ## Build the pinned tar, bsdtar and python3 image
+	docker build -t $(ORACLE_IMAGE) \
+		-f $(ORACLE)/containers/tars/Containerfile \
+		$(ORACLE)/containers/tars
+
+oracle-version: ## Print which references would answer, and fail if none would
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- true
+
+check-corpus-hashes: ## Fail if a committed fixture is not what CORPUS names
+	@python3 tools/check_corpus.py
+
+corpus: ## Regenerate tests/data/tar/ and containers/CORPUS in the container
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- \
+		python3 $(ORACLE)/make_corpus.py
+
+check-corpus: ## Fail if the pinned references no longer produce the corpus
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- \
+		python3 $(ORACLE)/make_corpus.py --check
+
+check-oracle: ## Fail if the live references disagree with the committed manifest
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- \
+		python3 $(ORACLE)/check_manifest.py
 
 ####################################################################
 # Install / uninstall

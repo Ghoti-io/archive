@@ -1,0 +1,6 @@
+#!/bin/sh
+# The interpreter version, which is what pins tarfile: tarfile is a stdlib
+# module with no version of its own, and its behaviour has changed between
+# Python releases - 3.12 changed the default extraction filter, and 3.14 changes
+# it again. So the interpreter's version *is* the module's.
+exec python3 -c 'import sys, tarfile; print("Python %s tarfile" % sys.version.split()[0])'

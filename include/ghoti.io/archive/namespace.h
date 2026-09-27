@@ -46,14 +46,40 @@
 // undone. GCU_* names are deliberately absent: they are cutil's, and cutil
 // has already renamed them.
 #define GARC_Allocator GHOTIIO_ARCHIVE(GARC_Allocator)
+#define GARC_Archive GHOTIIO_ARCHIVE(GARC_Archive)
+#define GARC_Format GHOTIIO_ARCHIVE(GARC_Format)
 #define GARC_Limits GHOTIIO_ARCHIVE(GARC_Limits)
+#define GARC_Member GHOTIIO_ARCHIVE(GARC_Member)
+#define GARC_Member_Type GHOTIIO_ARCHIVE(GARC_Member_Type)
+#define GARC_Name_Encoding GHOTIIO_ARCHIVE(GARC_Name_Encoding)
 #define GARC_Result GHOTIIO_ARCHIVE(GARC_Result)
 #define GARC_Stream GHOTIIO_ARCHIVE(GARC_Stream)
 #define GARC_Stream_Callbacks GHOTIIO_ARCHIVE(GARC_Stream_Callbacks)
+#define GARC_Tar_Variant GHOTIIO_ARCHIVE(GARC_Tar_Variant)
+#define GARC_Time_Source GHOTIIO_ARCHIVE(GARC_Time_Source)
 
 // Public functions.
 #define garc_allocator_default GHOTIIO_ARCHIVE(garc_allocator_default)
+#define garc_archive_dump GHOTIIO_ARCHIVE(garc_archive_dump)
+#define garc_close GHOTIIO_ARCHIVE(garc_close)
+#define garc_format GHOTIIO_ARCHIVE(garc_format)
+#define garc_format_string GHOTIIO_ARCHIVE(garc_format_string)
 #define garc_limits_default GHOTIIO_ARCHIVE(garc_limits_default)
+#define garc_member_count GHOTIIO_ARCHIVE(garc_member_count)
+#define garc_member_dump GHOTIIO_ARCHIVE(garc_member_dump)
+#define garc_member_type_string GHOTIIO_ARCHIVE(garc_member_type_string)
+#define garc_name_encoding_string GHOTIIO_ARCHIVE(garc_name_encoding_string)
+#define garc_next GHOTIIO_ARCHIVE(garc_next)
+#define garc_open GHOTIIO_ARCHIVE(garc_open)
+#define garc_open_with_allocator GHOTIIO_ARCHIVE(garc_open_with_allocator)
+#define garc_read_member GHOTIIO_ARCHIVE(garc_read_member)
+#define garc_skip_member GHOTIIO_ARCHIVE(garc_skip_member)
+#define garc_tar_member_checksum_was_signed                                    \
+  GHOTIIO_ARCHIVE(garc_tar_member_checksum_was_signed)
+#define garc_tar_member_variant GHOTIIO_ARCHIVE(garc_tar_member_variant)
+#define garc_tar_variant_string GHOTIIO_ARCHIVE(garc_tar_variant_string)
+#define garc_time_source_string GHOTIIO_ARCHIVE(garc_time_source_string)
+#define garc_total_declared_bytes GHOTIIO_ARCHIVE(garc_total_declared_bytes)
 #define garc_result_is_error GHOTIIO_ARCHIVE(garc_result_is_error)
 #define garc_result_is_limit GHOTIIO_ARCHIVE(garc_result_is_limit)
 #define garc_result_string GHOTIIO_ARCHIVE(garc_result_string)
@@ -73,6 +99,15 @@
 #define garc_stream_tell GHOTIIO_ARCHIVE(garc_stream_tell)
 #define garc_version_number GHOTIIO_ARCHIVE(garc_version_number)
 #define garc_version_string GHOTIIO_ARCHIVE(garc_version_string)
+
+// Internal names. Hidden by -fvisibility=hidden and so unable to collide, but
+// renamed anyway so that there is one rule rather than two.
+#define garc_reader_account GHOTIIO_ARCHIVE(garc_reader_account)
+#define garc_tar_block_is_header GHOTIIO_ARCHIVE(garc_tar_block_is_header)
+#define garc_tar_identify GHOTIIO_ARCHIVE(garc_tar_identify)
+#define garc_tar_next GHOTIIO_ARCHIVE(garc_tar_next)
+#define garc_tar_parse_int GHOTIIO_ARCHIVE(garc_tar_parse_int)
+#define garc_tar_parse_uint GHOTIIO_ARCHIVE(garc_tar_parse_uint)
 
 /// @endcond
 

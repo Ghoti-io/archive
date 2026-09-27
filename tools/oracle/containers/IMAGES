@@ -1,0 +1,45 @@
+# The oracle references, pinned.
+#
+# One line per reference, tab-separated: <name> <image> <version> <what it
+# answers>.
+#
+# **Every line names the same image**, which is not tidiness. These are not
+# three tools each answering about its own format; they are three
+# implementations asked the same question about the same four tar formats, and
+# the whole value is in where they disagree. In three images with three base
+# states, a disagreement would first have to be shown not to be the images'
+# fault. One image makes "the reference set" one fact.
+#
+# The image is built here, so the tag is not a digest of the finished image: two
+# builds of one Containerfile are not two copies of one image. What is pinned
+# instead is everything the build reads - the base by digest, the packages by
+# full apt version, resolved against a dated snapshot of the Debian archive so
+# the pins do not expire - and the run-time version check is the real guarantee.
+# oracle_env.check_pin() therefore runs in *both* modes; there is no stock image
+# named here, so relaxing it in host mode would leave nothing checking anything.
+#
+# The version field is what the reference must say when asked. For bsdtar it is
+# the **libarchive** version as well as bsdtar's own, because libarchive is what
+# decides an answer and the two are not always the same number. For python3 it
+# is the interpreter version, because `tarfile` is a stdlib module with no
+# version of its own and its behaviour has changed between releases - 3.12 moved
+# the default extraction filter and 3.14 moves it again - so the interpreter's
+# version is the module's.
+#
+# Raising a pin is deliberate. A new reference version is new answers, and a new
+# answer that disagrees is a finding to triage rather than a regression to fix.
+#
+# Building it:
+#   make oracle-build
+
+tar	localhost/ghoti-archive-oracle-tars:deb13	tar (GNU tar) 1.35	Writes all four tar formats; the corpus is generated with its --format flag
+bsdtar	localhost/ghoti-archive-oracle-tars:deb13	libarchive 3.7.4	The second reader. A corpus written and read back by GNU tar alone measures GNU tar
+pytarfile	localhost/ghoti-archive-oracle-tars:deb13	Python 3.13.5 tarfile	A third implementation, and the scriptable one: the member metadata every fixture is checked against comes from here
+
+# Not here yet:
+#   7zip      for zip and 7z, in the phase that reads them. Absent on purpose
+#             rather than installed early: a reference nothing asks is an
+#             unpinned dependency of the image with none of the benefit.
+#   star      the fourth tar implementation. It reads formats the other three
+#             do not agree about, and Debian 13 carries it; nothing has needed a
+#             fourth opinion yet.

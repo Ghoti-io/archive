@@ -1,0 +1,4 @@
+#!/bin/sh
+# What GNU tar says it is. First line only: the rest is a copyright notice, and
+# a version check that reads the whole output scores the notice.
+exec tar --version 2>/dev/null | head -1

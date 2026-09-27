@@ -1,0 +1,5 @@
+#!/bin/sh
+# bsdtar prints "bsdtar 3.7.4 - libarchive 3.7.4 ...". The libarchive version is
+# what decides an answer, and it is not always the bsdtar version, so both are on
+# the line the pin is checked against.
+exec bsdtar --version 2>/dev/null | head -1

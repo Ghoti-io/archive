@@ -1,7 +1,8 @@
 # Design
 
-**Status:** phase A shipped; phases B onwards are design. What is below
-describes what exists unless a heading says otherwise.
+**Status:** phases A and B shipped, except GNU's and pax's extended members,
+which are refused by name. What is below describes what exists unless a heading
+says otherwise.
 
 This page records the decisions a reader of the headers would otherwise have to
 reconstruct, and — where the decision could reasonably have gone the other way
@@ -101,7 +102,100 @@ those bytes are themselves an archive is the caller's question — so a field fo
 it would be one nothing reads, which is worse than absent because it reads as a
 promise.
 
-## 5. The result vocabulary, and its two departures
+## 5. Walking an archive
+
+Three decisions in the reader loop, each of which could have gone the other way.
+
+**`garc_next()` is a cursor, not an index**, even for a format that has one. A
+cursor is the only thing tar can offer - it has no directory and can be read
+from a pipe - and one API both formats satisfy is worth more than two that fit
+each perfectly. Random access becomes an *addition* for the formats that can
+support it rather than a second mode.
+
+**Unread data is skipped for the caller.** Stepping to the next member without
+having read the current one is normal and cheap: the reader seeks when the stream
+can and discards when it cannot. A caller is never required to read bytes it does
+not want in order to reach the next member, and the two paths are asserted to
+land in the same place rather than merely each succeeding.
+
+**`garc_read_member()` fills a caller buffer.** No allocate-and-return in this
+cut. compress added `gcomp_decode_alloc()` after the bounded form existed and the
+order mattered: the bounded form is the one a caller with a size limit can use,
+and the allocating one is a convenience built on it rather than the reverse.
+
+A member is **borrowed, valid until the next `garc_next()`**, and its name is
+bytes plus a length rather than a NUL-terminated string. A hostile archive puts a
+NUL in the middle of a name precisely so that a C caller sees a shorter name than
+the library did.
+
+## 6. tar, which is four formats
+
+There is no such thing as "tar". There are four formats sharing a 512-byte
+header, and a reader that handles one and calls it done mis-reports the others
+without ever erroring:
+
+| variant | names | sizes | how it says so |
+| --- | --- | --- | --- |
+| v7 | 100 bytes | octal | nothing at all; the checksum is the only evidence |
+| ustar (POSIX.1-1988) | 100 bytes + a 155-byte prefix | octal, 11 digits, so 8 GB | `magic` is `ustar\0`, `version` `00` |
+| GNU | an `L` member carrying the next member's name | base-256 when the high bit is set | `magic` is `ustar  \0` |
+| pax (POSIX.1-2001) | an `x`/`g` member of `len key=value\n` records | a `size=` record, decimal | an `x` member before the one it describes |
+
+**v7 and ustar are read; GNU's `L`/`K` and pax's `x`/`g` are refused by name**,
+with `GARC_ERR_UNSUPPORTED`. The refusal is the point: handing a caller a member
+called `././@LongLink` reports an artefact of the format as a file, which is
+worse than saying it cannot be read yet. The members *around* one are read
+normally, so it is a refusal of one construct rather than of the archive.
+
+Note that a pax archive whose names all fit the ustar fields contains no extended
+records at all - pax's magic *is* ustar's - so `tar --format=pax` output is
+usually readable here. Refusing it for the format it was asked for would refuse
+most of what that flag writes.
+
+The variant is reported **per member, not per archive**, because it changes within
+one: GNU tar writes pax records in front of ustar headers. `garc_tar_member_variant()`
+answers for the member `garc_next()` last handed out, and it lives in `tar.h`
+rather than on `GARC_Member` because a member field whose meaning depends on which
+format filled it in is the shape that goes wrong when the second format arrives.
+
+### What a header field can do to a reader
+
+Each of these produces a plausible *wrong answer* rather than an error, which is
+why each has a test naming it:
+
+- **The checksum is computed with the checksum field read as spaces**, and
+  historically some writers summed the bytes as signed chars and some as
+  unsigned. Both are accepted, because refusing either rejects real archives, and
+  which one matched is reported - so a corpus can show it has one of each rather
+  than assuming it does. The two differ only when a header holds a byte above
+  0x7F.
+- **Identification is the checksum, not the magic.** v7 has no magic field, so a
+  reader that requires one rejects the whole variant.
+- **A numeric field's terminator may be a NUL, a space, both, or absent** when
+  the digits fill the field exactly, and leading padding may be spaces or NULs. A
+  reader that stops at the first space reads 0 from `" 0000644"`.
+- **A blank field is zero, not corrupt.** The device numbers are blank in almost
+  every archive there is.
+- **Base-256 is a two's-complement integer over the whole field**, with bit 7 of
+  the first byte as the flag and bit 6 as the *sign* - so `0x80` and `0xFF` are
+  the two commonest leading bytes and not the whole scheme. Reading it as "0x80
+  means positive and the rest is the magnitude" discards six value bits of the
+  first byte.
+- **A directory, symlink, fifo or device declares no data and its size field may
+  not be zero.** A reader that seeks by the field walks into the next header and
+  reports that header's bytes as this member's contents.
+- **v7 has no prefix field**, so those bytes are whatever the writer left there.
+  A reader that always joins the prefix turns padding into a directory component.
+- **Two zero blocks end the archive, one does not necessarily.** Writers pad the
+  end to a record boundary and some strip the padding, so an archive ending after
+  a single zero block is a trimmed tail; but GNU tar concatenates archives, which
+  leaves markers in the middle, so a reader that stops at the first truncates a
+  valid archive and reports success. An archive with no marker at all is
+  `GARC_ERR_CORRUPT`, which is what `tar cf - x | head -c 4096` produces.
+- **An unrecognised typeflag is `GARC_MEMBER_OTHER`, not a file.** Extracting an
+  unknown type as a regular file is how a reader invents data.
+
+## 7. The result vocabulary, and its two departures
 
 CONVENTIONS.md section 5 fixes the result vocabulary. This library departs
 twice, and both departures are in that document's table.
@@ -125,7 +219,7 @@ phase A can return, so every value is reachable and every row of
 `garc_result_string()` is exercised — a string table with unreachable rows is a
 table nobody can test.
 
-## 6. The stream
+## 8. The stream
 
 **Offsets and sizes are `uint64_t`, not `size_t`.** A zip64 archive may exceed
 4 GiB and declare a member that does, and `size_t` is 32 bits on a 32-bit host:
@@ -178,7 +272,7 @@ where the archive ran out. The fuzz harness found this on its first run by
 asserting one rule for both paths; two paths meant to be interchangeable have
 to say where they are not.
 
-## 7. Testing
+## 9. Testing
 
 **Four stream shapes, not one.** Seekability and known-size are two independent
 properties, so there are four combinations and a memory stream is one of them.
@@ -198,8 +292,54 @@ non-seekable paths rather than whichever one a constructor happened to pick. It
 also drives the failing allocator, so the out-of-memory arms are walked by the
 same corpus rather than by a separate campaign.
 
-Phase A has no oracle, because it has no format: there is nothing an external
-tool could be asked that this library can answer. The container-pinned oracle
-harness — `tar`, `bsdtar`, `zip`, `unzip`, Python's `tarfile` and `zipfile`,
-`7z` — lands with the first format reader, where it has something to check and
-can be seen to fail. Landing it now would mean a gate with nothing behind it.
+### The oracle, and why two references answer two questions
+
+Three implementations, pinned in one image
+(`tools/oracle/containers/tars/Containerfile`): **GNU tar 1.35** writes the
+fixtures in each of its four formats, **Python 3.13.5's `tarfile`** reads the
+metadata back, and **bsdtar / libarchive 3.7.4** reads the names. One image
+rather than three, because these are not three tools each answering about its own
+format - they are three implementations asked the same question, and in three
+images a disagreement would first have to be shown not to be the images' fault.
+
+**The fixtures are generated, not hand-built.** A corpus written by hand contains
+the shapes whoever wrote it thought of; `notes/` records a library that scored
+395/395 against its own corpus with eleven divergences outstanding. What is
+committed is what GNU tar writes. The complement - headers no current writer
+emits, which is damage, a spelling decades out of use, and fields at their limits
+- is built in `tests/tar_builder.h` and labelled as hand-built wherever it is
+used, because that is the difference between an assertion about the format and an
+assertion about what a test file constructs.
+
+**Names come from bsdtar and everything else from tarfile**, and that split is a
+finding rather than a convenience. Python's `tarfile` strips the trailing slash
+from a directory member's name: the header says `sizes/` and it reports `sizes`.
+GNU tar's `-t` and bsdtar's both print `sizes/`, which is what the archive
+contains. So two of three references agree with each other and with the bytes,
+and the third normalises - and this library reports what the container said.
+Comparing names against the one that normalises would have needed either a wrong
+expectation or a tolerance wide enough to hide a real truncation. Naming the
+reference per question is the answer instead.
+
+### Three gates, and what each cannot see
+
+| gate | needs a container | catches |
+| --- | --- | --- |
+| `check-corpus-hashes` | no, and so it is in `TEST_GATES` | a fixture edited, truncated, or half-committed |
+| `check-corpus` | yes | the references no longer *writing* these bytes |
+| `check-oracle` | yes | the references no longer *reading* them the same way |
+
+The split matters in both directions. Hashing needs only sha256, so it runs on
+every machine; regenerating needs the image, so it fails closed rather than
+skipping - a gate that skipped would make a machine with no engine look exactly
+like one where the references still agree. And `check-corpus` and `check-oracle`
+are not the same question: a tar release can change how a field is parsed without
+changing any output, and a suite that only regenerated would call that a pass.
+`check-oracle` is also the only thing that catches a manifest edited *and*
+rehashed to make a failing test pass.
+
+`make check-corpus` earned its keep on its first run, by finding that GNU tar's
+pax output is not reproducible: it writes `atime` and `ctime` records that are
+wall-clock readings. `--pax-option=delete=atime,delete=ctime` fixes it, and that
+leaves an archive with no extended records for short names - which is why there
+are two pax fixtures rather than one.

@@ -19,15 +19,20 @@ through a compress decoder. This library is the container, not the compression.
 
 ## Status
 
-**Phase A.** The skeleton: the result vocabulary, the limits, and the byte
-stream every reader will read through. **There is no format reader yet** — no
-tar, no zip — so there is nothing here that will open an archive. What is here
-is the surface every phase after it is an instance of, which is the part worth
-arguing about before two formats are built on it.
+**Reads tar.** v7 and ustar headers in full, from a file or a pipe; GNU's
+long-name members and pax's extended records are **refused by name** with
+`GARC_ERR_UNSUPPORTED` rather than misreported, and are the next commits. No zip
+yet, and no filesystem layer.
 
-Build clean under GCC 14 with `-Werror`; 48 tests; clean under Valgrind and
-under ASan+UBSan; `make check-symbols` and `make check-aliasing` green; one
-fuzz harness over the stream.
+The fixtures are written by GNU tar 1.35 in a pinned container and the
+expectations come from Python 3.13.5's `tarfile` and libarchive 3.7.4's bsdtar,
+so a passing test is three implementations agreeing rather than this library
+agreeing with itself.
+
+Build clean under GCC 14 with `-Werror`; 133 tests; 99.7% line coverage, the
+remaining line being a defensive arm no input can reach; clean under Valgrind and
+under ASan+UBSan; `check-symbols`, `check-aliasing` and `check-corpus-hashes`
+green; two fuzz harnesses.
 
 ## A minimal complete program
 
@@ -52,7 +57,8 @@ int main(void) {
     return 1;
   }
 
-  // The fopen is yours. The library sees three function pointers.
+  // The fopen is yours. The library sees one function pointer; seek and size are
+  // optional, and tar does not need them.
   GARC_Stream_Callbacks callbacks = {.read = read_cb, .ctx = file};
   GARC_Stream * stream = NULL;
   if (garc_stream_create_callback(&callbacks, &stream) != GARC_OK) {
@@ -60,18 +66,41 @@ int main(void) {
     return 1;
   }
 
-  unsigned char header[512];
-  GARC_Result result = garc_stream_read_exact(stream, header, sizeof(header));
-  printf("%s\n", garc_result_string(result));
+  GARC_Archive * archive = NULL;
+  // NULL limits means garc_limits_default(), which is bounded on every field.
+  if (garc_open(stream, NULL, &archive) != GARC_OK) {
+    garc_stream_destroy(stream);
+    fclose(file);
+    return 1;
+  }
 
+  const GARC_Member * member = NULL;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    // A name is bytes and a length, not a string: a hostile archive puts a NUL
+    // in the middle of one so that a C caller sees a shorter name than this did.
+    printf("%-9s %8llu %.*s\n", garc_member_type_string(member->type),
+        (unsigned long long)member->size, (int)member->name_length,
+        member->name);
+  }
+  // GARC_END is the end of a well-formed archive and is not a failure, which is
+  // why this asks the predicate rather than comparing against GARC_OK.
+  if (garc_result_is_error(result)) {
+    fprintf(stderr, "%s\n", garc_result_string(result));
+  }
+
+  garc_close(archive);
   garc_stream_destroy(stream);
   fclose(file);
   return 0;
 }
 ```
 
-`examples/stream_from_file.c` is that program with `seek` and `size` filled in
-as well, which is what a zip reader will need.
+`examples/tar_list.c` is that with the member data read as well, and the names
+escaped - which a listing tool has to do, because a name is attacker-controlled
+bytes and an ANSI escape in one makes the output say whatever the archive wants.
+`examples/stream_from_file.c` is the stream on its own, with `seek` and `size`
+filled in as a zip reader will need.
 
 ## Building
 
@@ -92,6 +121,26 @@ make test PREFIX=/path/to/prefix
 ```
 
 ## The API
+
+**Walking an archive.** `garc_open()` identifies the container, `garc_next()`
+steps through the members, `garc_read_member()` reads the bytes of one into your
+buffer. Three things about that loop:
+
+- **`garc_next()` is a cursor, not an index.** A cursor is the only thing tar can
+  offer, and one API both formats satisfy is worth more than two that fit each
+  perfectly. Random access will be an *addition* for zip, not a second mode.
+- **Unread data is skipped for you.** Stepping past a member you do not want is
+  normal and cheap - seeking when the stream can, discarding when it cannot.
+- **A member is borrowed**, valid until the next `garc_next()`, and its name is
+  bytes plus a length rather than a NUL-terminated string.
+
+Every field of a member is **what the container declared**, not what this library
+believes. A member's `size` is the size the header gave; whether that many bytes
+were there is a separate answer, reported when the data is read. That distinction
+is what lets a reader say *the archive lied* rather than quietly agreeing.
+
+The stream is **borrowed** too: `garc_close()` does not destroy it, because this
+library never frees what it did not allocate.
 
 **Results.** Every call that can fail returns a `GARC_Result`. `GARC_OK` is
 zero. Two things about the vocabulary are worth knowing before you write a

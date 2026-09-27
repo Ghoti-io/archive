@@ -1,0 +1,409 @@
+/**
+ * @file
+ *
+ * Reading tar, against what a third implementation says the fixtures contain.
+ *
+ * The fixtures are written by GNU tar 1.35 in the pinned container and the
+ * expectations are Python 3.13.5's `tarfile` reading them back - so a passing
+ * row here is two independent implementations agreeing, not this library
+ * agreeing with itself. `tools/oracle/make_corpus.py` generates both and
+ * `make check-corpus` proves the committed bytes are what it generates.
+ *
+ * **A missing corpus fails these tests rather than skipping them.** The fixtures
+ * are committed, so their absence is a broken checkout; a skip would make a
+ * clone with no `tests/data/` look exactly like a clone that passes.
+ *
+ * Copyright 2026 by Corey Pennycuff
+ */
+
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "tar_manifest.h"
+#include "test_helpers.h"
+
+using garctest::BufferSource;
+using garctest::ManifestRow;
+using garctest::manifest_load;
+using garctest::names_load;
+using garctest::read_fixture;
+
+namespace {
+
+std::string data_path(const std::string & name) {
+  return std::string(GARC_TEST_DATA) + "/tar/" + name;
+}
+
+/** The metadata manifest, from Python's tarfile, loaded once. */
+const std::map<std::string, std::vector<ManifestRow>> & manifest() {
+  static const std::map<std::string, std::vector<ManifestRow>> rows
+      = manifest_load(data_path("manifest.tsv"));
+  return rows;
+}
+
+/** The names, from bsdtar. See names_load() for why they are a second file. */
+const std::map<std::string, std::vector<std::string>> & names() {
+  static const std::map<std::string, std::vector<std::string>> rows
+      = names_load(data_path("names.tsv"));
+  return rows;
+}
+
+/** A member's name as a std::string, using the length rather than a NUL. */
+std::string member_name(const GARC_Member * member) {
+  return std::string(member->name, member->name_length);
+}
+
+/**
+ * Walk one fixture and compare every member against the manifest.
+ *
+ * `shape` chooses the stream: a memory stream, or a callback stream that cannot
+ * seek and does not know its length. Both must give the same answers, which is
+ * the assertion that makes "tar can be read from a pipe" true rather than
+ * claimed - and it is checked on every fixture rather than on one.
+ */
+void expect_matches_manifest(const std::string & fixture, bool as_pipe) {
+  const auto & rows = manifest();
+  ASSERT_FALSE(rows.empty())
+      << "tests/data/tar/manifest.tsv is missing or empty. The corpus is "
+         "committed; run `make corpus` only if you mean to regenerate it.";
+  const auto found = rows.find(fixture);
+  ASSERT_NE(found, rows.end()) << "no manifest rows for " << fixture;
+
+  const auto & name_rows = names();
+  const auto found_names = name_rows.find(fixture);
+  ASSERT_NE(found_names, name_rows.end()) << "no name rows for " << fixture;
+  // The two references must agree about how many members there are, even where
+  // they disagree about what one is called. A mismatch means bsdtar's
+  // one-name-per-line listing broke - a name containing a newline would do it -
+  // and every comparison below would then be against a shifted row.
+  ASSERT_EQ(found->second.size(), found_names->second.size())
+      << fixture << ": tarfile and bsdtar disagree about the member count";
+
+  std::vector<uint8_t> bytes = read_fixture(data_path(fixture));
+  ASSERT_FALSE(bytes.empty()) << "cannot read " << fixture;
+
+  GARC_Stream * stream = nullptr;
+  BufferSource source(bytes.data(), bytes.size(), false, false);
+  if (as_pipe) {
+    ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+  } else {
+    ASSERT_EQ(
+        garc_stream_create_memory(bytes.data(), bytes.size(), &stream), GARC_OK);
+  }
+
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK) << fixture;
+  EXPECT_EQ(garc_format(archive), GARC_FORMAT_TAR);
+
+  size_t index = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    ASSERT_LT(index, found->second.size())
+        << fixture << ": more members than the reference found";
+    const ManifestRow & want = found->second[index];
+
+    // The name from bsdtar, which keeps a directory's trailing slash as the
+    // header does. The rest from tarfile.
+    EXPECT_EQ(member_name(member), found_names->second[index])
+        << fixture << " member " << index;
+    EXPECT_STREQ(garc_member_type_string(member->type), want.type.c_str())
+        << fixture << " member " << index << " " << want.name;
+    // uname and gname are bytes plus a length, and absent rather than empty when
+    // the archive carried none - so the comparison is against what the reference
+    // read, empty string included.
+    const std::string uname = member->uname
+        ? std::string(member->uname, member->uname_length)
+        : std::string();
+    const std::string gname = member->gname
+        ? std::string(member->gname, member->gname_length)
+        : std::string();
+    EXPECT_EQ(uname, want.uname) << fixture << " member " << index;
+    EXPECT_EQ(gname, want.gname) << fixture << " member " << index;
+    EXPECT_EQ(member->size, want.size)
+        << fixture << " member " << index << " " << want.name;
+    EXPECT_EQ(member->mtime_seconds, want.mtime)
+        << fixture << " member " << index << " " << want.name;
+    EXPECT_EQ(member->mode, want.mode)
+        << fixture << " member " << index << " " << want.name;
+    EXPECT_EQ(member->uid, want.uid) << fixture << " member " << index;
+    EXPECT_EQ(member->gid, want.gid) << fixture << " member " << index;
+
+    const std::string link = member->link_target
+        ? std::string(member->link_target, member->link_target_length)
+        : std::string();
+    EXPECT_EQ(link, want.link) << fixture << " member " << index;
+
+    ++index;
+  }
+
+  EXPECT_EQ(result, GARC_END)
+      << fixture << ": " << garc_result_string(result) << " after " << index
+      << " members";
+  EXPECT_EQ(index, found->second.size())
+      << fixture << ": fewer members than the reference found";
+  EXPECT_EQ(garc_member_count(archive), index);
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+/** The fixtures this reader is expected to read in full. */
+const char * const readable[] = {
+  "v7-basic.tar",
+  "ustar-basic.tar",
+  "ustar-sizes.tar",
+  "ustar-modes.tar",
+  "ustar-owners.tar",
+  "ustar-prefix.tar",
+  "ustar-nonascii.tar",
+  // pax uses ustar's magic, so a pax archive whose names all fit the ustar
+  // fields carries no extended records and reads as ustar - which it should,
+  // rather than being refused for the format it declares.
+  "pax-basic.tar",
+};
+
+} // namespace
+
+//-----------------------------------------------------------------------------
+// The reference comparison
+//-----------------------------------------------------------------------------
+
+TEST(TarCorpus, EveryFixtureMatchesTheReferenceFromMemory) {
+  for (const char * fixture : readable) {
+    SCOPED_TRACE(fixture);
+    expect_matches_manifest(fixture, false);
+  }
+}
+
+TEST(TarCorpus, EveryFixtureMatchesTheReferenceFromAPipe) {
+  // The same answers from a stream that cannot seek and does not know its
+  // length. tar is a cursor over a stream and this is what says so; a reader
+  // that quietly needed to seek would pass every test above and fail on the
+  // first real pipe.
+  for (const char * fixture : readable) {
+    SCOPED_TRACE(fixture);
+    expect_matches_manifest(fixture, true);
+  }
+}
+
+TEST(TarCorpus, TheManifestIsNotEmpty) {
+  // A guard on the instrument rather than on the subject. Every comparison above
+  // loops over manifest rows, so an empty manifest would pass all of them by
+  // checking nothing - which is the shape that reads as a green suite.
+  const auto & rows = manifest();
+  ASSERT_FALSE(rows.empty()) << "tests/data/tar/manifest.tsv is missing";
+  size_t total = 0;
+  for (const auto & entry : rows) {
+    total += entry.second.size();
+  }
+  EXPECT_GT(total, 30u) << "the manifest has suspiciously few rows";
+  for (const char * fixture : readable) {
+    EXPECT_NE(rows.find(fixture), rows.end())
+        << fixture << " has no manifest rows, so its test asserts nothing";
+    EXPECT_NE(names().find(fixture), names().end())
+        << fixture << " has no name rows, so its names assert nothing";
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Variants
+//-----------------------------------------------------------------------------
+
+TEST(TarVariant, V7IsRecognisedWithNoMagicAtAll) {
+  // v7 has no magic field, so the checksum is the only evidence the block is a
+  // header. A reader that requires magic rejects the whole variant.
+  std::vector<uint8_t> bytes = read_fixture(data_path("v7-basic.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(archive, &member), GARC_OK);
+  EXPECT_EQ(garc_tar_member_variant(archive), GARC_TAR_V7);
+  // v7 carries no owner names. Reporting an empty string rather than absent
+  // would make a caller print "" where the archive said nothing.
+  EXPECT_EQ(member->uname, nullptr);
+  EXPECT_EQ(member->gname, nullptr);
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, UstarIsRecognisedFromItsMagic) {
+  std::vector<uint8_t> bytes = read_fixture(data_path("ustar-owners.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(archive, &member), GARC_OK);
+  EXPECT_EQ(garc_tar_member_variant(archive), GARC_TAR_USTAR);
+  // ustar carries owner names, and this is the one fixture written without
+  // --numeric-owner so that they are not empty. Every other fixture here has
+  // them blank, which is why a test asserting "ustar has a uname" against any of
+  // those would have been asserting the writer's flags rather than the format.
+  ASSERT_NE(member->uname, nullptr);
+  EXPECT_EQ(std::string(member->uname, member->uname_length), "ghoti");
+  ASSERT_NE(member->gname, nullptr);
+  EXPECT_EQ(std::string(member->gname, member->gname_length), "ghotigroup");
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, APrefixedNameIsJoinedWithASlash) {
+  // The one shape that exercises ustar's 155-byte prefix. A reader that ignores
+  // the prefix reports the tail of the path as the whole name, which is a
+  // plausible answer rather than an error - so this asserts the *length* as well,
+  // since a truncated name is still a name.
+  std::vector<uint8_t> bytes = read_fixture(data_path("ustar-prefix.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  bool saw_long = false;
+  const GARC_Member * member = nullptr;
+  while (garc_next(archive, &member) == GARC_OK) {
+    if (member->name_length > 100u) {
+      saw_long = true;
+      EXPECT_NE(member_name(member).find('/'), std::string::npos);
+    }
+  }
+  EXPECT_TRUE(saw_long)
+      << "no member longer than ustar's 100-byte name field, so the prefix "
+         "join was never exercised";
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, GnuLongNameMembersAreRefusedByName) {
+  // Not yet read, and the refusal is the point: handing a caller a member called
+  // "././@LongLink" would report an artefact of the format as a file. The
+  // members before it are read normally, which is what makes this a refusal of
+  // one construct rather than of the archive.
+  std::vector<uint8_t> bytes = read_fixture(data_path("gnu-longname.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  size_t read_before_refusal = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    ++read_before_refusal;
+  }
+  EXPECT_EQ(result, GARC_ERR_UNSUPPORTED);
+  EXPECT_GT(read_before_refusal, 0u)
+      << "the refusal came before any member, so it is not a refusal of the "
+         "'L' member specifically";
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, APaxArchiveWithNoExtendedRecordsReadsAsUstar) {
+  // pax's magic *is* ustar's, so an archive in pax format whose names all fit
+  // the ustar fields has no extended records in it at all and is a ustar archive
+  // in every way a reader can see. Refusing it for the format GNU tar was asked
+  // for would refuse most of what `tar --format=pax` writes.
+  std::vector<uint8_t> bytes = read_fixture(data_path("pax-basic.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(archive, &member), GARC_OK);
+  EXPECT_EQ(garc_tar_member_variant(archive), GARC_TAR_USTAR);
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, PaxExtendedHeadersAreRefusedByName) {
+  // A pax `x` member carrying a path= record, forced by a name too long for the
+  // ustar fields. Refused rather than read, and the members before it are read
+  // normally - which is what makes it a refusal of one construct rather than of
+  // the archive.
+  //
+  // The comment here first said the refusal would come on the *first* call,
+  // because pax puts its `x` member before the one it describes. That is true of
+  // the member it describes and not of the archive: the four short-named
+  // directories ahead of it need no extended record, so they are read first and
+  // the refusal lands fifth. Asserting the count is what caught that.
+  std::vector<uint8_t> bytes = read_fixture(data_path("pax-longname.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  size_t read_before_refusal = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    ++read_before_refusal;
+  }
+  EXPECT_EQ(result, GARC_ERR_UNSUPPORTED);
+  EXPECT_EQ(read_before_refusal, 4u)
+      << "the refusal did not land on the 'x' member: the four directories "
+         "before it carry no extended record and should be read";
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, AnEmptyArchiveIsAnArchive) {
+  // Two zero blocks and nothing else. It identifies as a tar even though no
+  // header in it validates, and the first garc_next() is the end - not an error,
+  // and not a member.
+  std::vector<uint8_t> bytes = read_fixture(data_path("ustar-empty.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+  EXPECT_EQ(garc_format(archive), GARC_FORMAT_TAR);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(archive, &member), GARC_END);
+  EXPECT_FALSE(garc_result_is_error(GARC_END));
+  EXPECT_EQ(garc_member_count(archive), 0u);
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+int main(int argc, char ** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

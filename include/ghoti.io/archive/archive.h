@@ -30,7 +30,10 @@
 #include <ghoti.io/archive/allocator.h>
 #include <ghoti.io/archive/core.h>
 #include <ghoti.io/archive/macros.h>
+#include <ghoti.io/archive/member.h>
+#include <ghoti.io/archive/reader.h>
 #include <ghoti.io/archive/stream.h>
+#include <ghoti.io/archive/tar.h>
 #include <ghoti.io/archive/version.h>
 
 #endif // GHOTI_IO_GARC_ARCHIVE_H
