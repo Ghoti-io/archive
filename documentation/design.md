@@ -477,7 +477,59 @@ where the archive ran out. The fuzz harness found this on its first run by
 asserting one rule for both paths; two paths meant to be interchangeable have
 to say where they are not.
 
-## 9. Testing
+## 9. The sink, which is not the stream with a `write` added
+
+Bytes leave through `GARC_Sink`, a separate type. The alternative - one
+`GARC_Stream` with a `write` callback beside `read` - was refused for a reason
+worth writing down, because it is the obvious economy: four of the stream's five
+operations mean nothing on the way out. There is nothing to read, nothing to
+skip, and a sink's length is what it has been given rather than something to ask
+about. One struct would have been one required callback and four optional ones
+whose absence meant four different things, and `GARC_Stream.read` - required
+today, which is what makes every stream usable without a capability check -
+would have had to stop being required.
+
+Three differences from the read side, each of them the format's answer rather
+than a preference:
+
+- **A short write is a failure, where a short read is not.** Reading fewer bytes
+  than asked for is the end of the stream, which is ordinary and is reported as a
+  count. There is no corresponding end of a sink: a callback that can take only
+  some of the bytes has failed. So `write` is all-or-nothing and reports no
+  count, which also keeps the retry loop out of every call site - one of them
+  would have got it wrong.
+- **A memory sink owns its buffer, where a memory stream borrows one.** The bytes
+  a reader reads already exist. The bytes a writer writes do not, and their
+  number is not known until the archive is finished, because a name decides
+  whether a pax record joins the header that carries it. `garc_sink_data()` lends
+  the result back, valid until the next write, and answers
+  `GARC_ERR_UNSUPPORTED` for a callback sink - which is the same refusal
+  `garc_stream_size()` makes about an unknown length, for the same reason: a sink
+  holding no bytes and a sink that never holds any are different facts.
+- **There is no `seek`, and that is this cut rather than the design.** tar is
+  append-only: every byte is written once, in order, and nothing is patched
+  afterwards. zip is not - a streamed local header carries zeros where the sizes
+  go, and the writer either follows the data with a descriptor or seeks back to
+  fill them in - so a `seek` callback and a `garc_sink_is_seekable()` arrive with
+  the writer that reads them. This is the same discipline the manifest line gets:
+  three edits rather than one, each true when it is made.
+
+**Growth is geometric with an exact-size retry**, and the retry is not only a
+guard against a doubling that would overflow. An overflow-only fallback needs a
+host holding `SIZE_MAX` bytes, so it is a line no test can put in a position to
+fail; asking for the exact size when the geometric request is refused is
+reachable from the failing allocator, *and* it is what lets a sink finish an
+archive on a host that cannot spare twice the room it already holds. cutil's
+growable array does the same thing for the same reason, which is why
+`FailingAllocator`'s `run = 2` exists - one logical append costs two requests, so
+refusing one request cannot fail it.
+
+**A failed write does not move `garc_sink_tell()`.** That offset is what a writer
+computes padding from, so counting a refused write would pad the next member to
+the wrong boundary - and every reader would then report the damage at a header
+some distance after the cause.
+
+## 10. Testing
 
 **Four stream shapes, not one.** Seekability and known-size are two independent
 properties, so there are four combinations and a memory stream is one of them.

@@ -147,6 +147,61 @@ private:
 };
 
 /**
+ * A callback sink that collects what it is given, and can refuse.
+ *
+ * The mirror of BufferSource, and it needs no shape parameters because a sink
+ * has only one operation - which is the argument sink.h makes for it being a
+ * type of its own rather than a stream with a `write` added.
+ */
+class BufferDrain {
+public:
+  BufferDrain() {
+    callbacks_.ctx = this;
+    callbacks_.write = &BufferDrain::write_cb;
+  }
+
+  BufferDrain(const BufferDrain &) = delete;
+  BufferDrain & operator=(const BufferDrain &) = delete;
+
+  const GARC_Sink_Callbacks * callbacks() const { return &callbacks_; }
+
+  /** Everything accepted so far, in order. */
+  const std::vector<uint8_t> & bytes() const { return bytes_; }
+
+  /**
+   * Calls served, refused ones included.
+   *
+   * A writer that pads a block one byte at a time and one that pads it in a
+   * single call produce identical bytes, so the count is the only way to assert
+   * which happened - and the difference is 511 calls per member on a socket.
+   */
+  size_t writes() const { return writes_; }
+
+  /** Make the next @p count writes report ::GARC_ERR_IO. */
+  void fail_writes(size_t count) { failing_writes_ = count; }
+
+private:
+  static GARC_Result write_cb(void * ctx, const void * buffer, size_t size) {
+    BufferDrain * self = static_cast<BufferDrain *>(ctx);
+    self->writes_++;
+    if (self->failing_writes_) {
+      self->failing_writes_--;
+      // All or nothing: a refused write keeps none of the bytes, which is what
+      // lets a test assert that a failed write left the sink's count alone.
+      return GARC_ERR_IO;
+    }
+    const uint8_t * in = static_cast<const uint8_t *>(buffer);
+    self->bytes_.insert(self->bytes_.end(), in, in + size);
+    return GARC_OK;
+  }
+
+  GARC_Sink_Callbacks callbacks_{};
+  std::vector<uint8_t> bytes_;
+  size_t writes_ = 0;
+  size_t failing_writes_ = 0;
+};
+
+/**
  * A read callback that lies about how much it read, claiming more than it was
  * asked for.
  *

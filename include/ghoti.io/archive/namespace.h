@@ -54,6 +54,8 @@
 #define GARC_Name_Encoding GHOTIIO_ARCHIVE(GARC_Name_Encoding)
 #define GARC_Name_Finding GHOTIIO_ARCHIVE(GARC_Name_Finding)
 #define GARC_Result GHOTIIO_ARCHIVE(GARC_Result)
+#define GARC_Sink GHOTIIO_ARCHIVE(GARC_Sink)
+#define GARC_Sink_Callbacks GHOTIIO_ARCHIVE(GARC_Sink_Callbacks)
 #define GARC_Stream GHOTIIO_ARCHIVE(GARC_Stream)
 #define GARC_Stream_Callbacks GHOTIIO_ARCHIVE(GARC_Stream_Callbacks)
 #define GARC_Tar_Variant GHOTIIO_ARCHIVE(GARC_Tar_Variant)
@@ -87,6 +89,17 @@
 #define garc_result_is_error GHOTIIO_ARCHIVE(garc_result_is_error)
 #define garc_result_is_limit GHOTIIO_ARCHIVE(garc_result_is_limit)
 #define garc_result_string GHOTIIO_ARCHIVE(garc_result_string)
+#define garc_sink_create_callback GHOTIIO_ARCHIVE(garc_sink_create_callback)
+#define garc_sink_create_callback_with_allocator                               \
+  GHOTIIO_ARCHIVE(garc_sink_create_callback_with_allocator)
+#define garc_sink_create_memory GHOTIIO_ARCHIVE(garc_sink_create_memory)
+#define garc_sink_create_memory_with_allocator                                 \
+  GHOTIIO_ARCHIVE(garc_sink_create_memory_with_allocator)
+#define garc_sink_data GHOTIIO_ARCHIVE(garc_sink_data)
+#define garc_sink_destroy GHOTIIO_ARCHIVE(garc_sink_destroy)
+#define garc_sink_fill GHOTIIO_ARCHIVE(garc_sink_fill)
+#define garc_sink_tell GHOTIIO_ARCHIVE(garc_sink_tell)
+#define garc_sink_write GHOTIIO_ARCHIVE(garc_sink_write)
 #define garc_stream_create_callback GHOTIIO_ARCHIVE(garc_stream_create_callback)
 #define garc_stream_create_callback_with_allocator                             \
   GHOTIIO_ARCHIVE(garc_stream_create_callback_with_allocator)

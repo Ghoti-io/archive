@@ -33,6 +33,7 @@
 #include <ghoti.io/archive/member.h>
 #include <ghoti.io/archive/name.h>
 #include <ghoti.io/archive/reader.h>
+#include <ghoti.io/archive/sink.h>
 #include <ghoti.io/archive/stream.h>
 #include <ghoti.io/archive/tar.h>
 #include <ghoti.io/archive/version.h>

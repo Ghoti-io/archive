@@ -42,9 +42,15 @@ letter, a NUL, a Windows device name, malformed UTF-8 - one finding at a time,
 and the reader hands over the bytes the archive actually holds. It is a
 classifier and not a permission: see `examples/name_findings.c`, which prints why.
 
-Build clean under GCC 14 with `-Werror`; 221 tests; 99.7% line coverage, the
-four remaining lines being a defensive arm no input can reach and two guards that
-are live only where `size_t` is 32 bits; clean under Valgrind and under
+**Nothing is written yet.** `GARC_Sink` is here - the byte sink a writer will
+write through - and the writer that fills it is not. A header with no consumer is
+usually a promise nobody keeps, so it is worth saying which this is: the sink is
+the half of tar-write that needs no format, committed on its own for the same
+reason the stream was committed before any reader.
+
+Build clean under GCC 14 with `-Werror`; 253 tests; 99.6% line coverage, the
+five remaining lines being a defensive arm no input can reach and three guards
+that are live only where `size_t` is 32 bits; clean under Valgrind and under
 ASan+UBSan; `check-symbols`, `check-aliasing`, `check-corpus-hashes` and
 `check-fixtures` green; three fuzz harnesses.
 
@@ -205,6 +211,21 @@ a stream of no bytes and a stream of unknown length are different facts.
 Offsets and sizes are `uint64_t` throughout. A zip64 archive can exceed 4 GiB
 and `size_t` is 32 bits on a 32-bit host, so `size_t` would make exactly those
 archives unreadable on exactly the platforms where it matters.
+
+**The sink.** `GARC_Sink` is how bytes get out, and it is a separate type rather
+than `GARC_Stream` with a `write` added — four of that type's five operations
+mean nothing on the way out, and its `read` is *required*, so one struct would
+have had to stop requiring it. Either a buffer the sink owns and grows
+(`garc_sink_data()` lends it back) or a `write` callback, which is how an archive
+reaches a file, a socket, or a compressor.
+
+Three asymmetries with the read side, each of them the format's answer rather
+than a preference. **A short write is a failure**, where a short read is just the
+end of the stream — so `write` is all-or-nothing and reports no count. **A memory
+sink owns its buffer**, where a memory stream borrows one, because the bytes a
+writer produces do not exist yet and their number is not known until the archive
+is finished. And **there is no `seek` yet**: tar is append-only, zip is not, so
+that callback arrives with the writer that reads it.
 
 **Names.** `garc_name_check()` takes bytes and a length — a member's name, or a
 symlink's target, since they are equally dangerous and it is the same question —
