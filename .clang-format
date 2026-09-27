@@ -1,0 +1,29 @@
+---
+BasedOnStyle: LLVM
+IndentWidth: 2
+ContinuationIndentWidth: 4
+AlignAfterOpenBracket: DontAlign
+TabWidth: 2
+UseTab: Never
+DerivePointerAlignment: false
+PointerAlignment: Middle
+AllowShortFunctionsOnASingleLine: None
+ColumnLimit: 80
+SortIncludes: true
+SpacesBeforeTrailingComments: 1
+ReflowComments: true
+MaxEmptyLinesToKeep: 2
+AlignOperands: false
+BraceWrapping:
+  AfterClass:      false
+  AfterControlStatement: false
+  AfterEnum:       false
+  AfterFunction:   false
+  AfterNamespace:  false
+  AfterObjCDeclaration: false
+  AfterStruct:     false
+  AfterUnion:      false
+  BeforeCatch:     false
+  BeforeElse:      true
+  IndentBraces:    false
+BreakBeforeBraces: Custom

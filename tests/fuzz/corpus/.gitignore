@@ -1,0 +1,5 @@
+# The corpus grows as the fuzzer runs; only the checked-in seeds are tracked.
+*
+!.gitignore
+!*.seed
+!stream/

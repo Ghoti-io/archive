@@ -1,0 +1,7 @@
+Name: Ghoti.io Archive(BRANCH)
+Description: Archive containers - tar and zip - read and written without touching the filesystem
+Version: (VERSION)
+URL: https://github.com/Ghoti-io/archive
+Libs: -L(PC_LIB_DIR) -l(SUITE)-(PROJECT)(BRANCH)
+CFlags: -I(PC_INCLUDE_DIR)
+Requires: (REQUIRES)

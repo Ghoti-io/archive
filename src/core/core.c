@@ -1,0 +1,102 @@
+/*
+ * SPDX-License-Identifier: LGPL-3.0-only
+ *
+ * Copyright (C) 2026 Corey Pennycuff
+ *
+ * This file is part of Ghoti.io Archive.
+ *
+ * Ghoti.io Archive is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * Ghoti.io Archive is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/**
+ * @file
+ *
+ * Result strings, the two result predicates, and the default limits.
+ */
+
+#include <ghoti.io/archive/macros.h>
+
+#include <ghoti.io/archive/core.h>
+
+const char * garc_result_string(GARC_Result result) {
+  switch (result) {
+    case GARC_OK:
+      return "No error";
+    case GARC_END:
+      return "End of archive";
+    case GARC_ERR_IO:
+      return "I/O error";
+    case GARC_ERR_FORMAT:
+      return "Not an archive format this library reads";
+    case GARC_ERR_UNSUPPORTED:
+      return "Unsupported feature";
+    case GARC_ERR_CORRUPT:
+      return "Corrupt archive";
+    case GARC_ERR_OOM:
+      return "Out of memory";
+    case GARC_ERR_INVALID:
+      return "Invalid argument";
+    case GARC_ERR_INTERNAL:
+      return "Internal error";
+    // Each cap says which cap. A shared string would undo half of what five
+    // separate constants buy, since a message is what a caller prints.
+    case GARC_ERR_LIMIT_MEMBERS:
+      return "Limit exceeded: too many members";
+    case GARC_ERR_LIMIT_MEMBER_BYTES:
+      return "Limit exceeded: member too large";
+    case GARC_ERR_LIMIT_TOTAL_BYTES:
+      return "Limit exceeded: members total too large";
+    case GARC_ERR_LIMIT_NAME_BYTES:
+      return "Limit exceeded: member name too long";
+    case GARC_ERR_LIMIT_EXTRA_BYTES:
+      return "Limit exceeded: member extra fields too large";
+    case GARC_RESULT_COUNT:
+    default:
+      return "Unknown error";
+  }
+}
+
+int garc_result_is_error(GARC_Result result) {
+  return !(result == GARC_OK || result == GARC_END);
+}
+
+int garc_result_is_limit(GARC_Result result) {
+  switch (result) {
+    case GARC_ERR_LIMIT_MEMBERS:
+    case GARC_ERR_LIMIT_MEMBER_BYTES:
+    case GARC_ERR_LIMIT_TOTAL_BYTES:
+    case GARC_ERR_LIMIT_NAME_BYTES:
+    case GARC_ERR_LIMIT_EXTRA_BYTES:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+void garc_limits_default(GARC_Limits * limits) {
+  if (!limits) {
+    return;
+  }
+
+  // Every field gets a value, unlike model's and image's mostly-open caps.
+  // See the header: a member's size is read from the container before any of
+  // its bytes are, so the size of the input bounds nothing here, and "no
+  // limit" would mean a hostile archive's first act is a petabyte request.
+  *limits = (GARC_Limits) {
+    .max_members = GARC_DEFAULT_MAX_MEMBERS,
+    .max_member_bytes = GARC_DEFAULT_MAX_MEMBER_BYTES,
+    .max_total_bytes = GARC_DEFAULT_MAX_TOTAL_BYTES,
+    .max_name_bytes = GARC_DEFAULT_MAX_NAME_BYTES,
+    .max_extra_bytes = GARC_DEFAULT_MAX_EXTRA_BYTES,
+  };
+}
