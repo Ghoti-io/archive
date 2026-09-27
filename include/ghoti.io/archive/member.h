@@ -39,6 +39,12 @@
  * including that it claimed nothing. Transcoding is the caller's, and doing it
  * here would mean depending on `unicode` to read a tarball.
  *
+ * And a claim is about the *field the name came from*, not about the archive: in
+ * one pax file a name from a `path=` record is ::GARC_NAME_UTF8, because POSIX
+ * says those records are UTF-8, while a name from the header's own field beside
+ * it is ::GARC_NAME_UNDECLARED, because nothing has ever said anything about
+ * those bytes.
+ *
  * **Times are epoch seconds plus provenance, never normalised.** ZIP's MS-DOS
  * field has two-second resolution; extra fields carry better ones; tar's is
  * octal seconds and pax's is decimal with a fraction. So a time is seconds,

@@ -1100,9 +1100,31 @@ FUZZ_CORPUS := tests/fuzz/corpus
 # A smoke-test length by default; for a real campaign: make fuzz FUZZ_TIME=3600
 FUZZ_TIME ?= 60
 
+# The fuzz tree needs header dependencies as much as the release and ASan trees
+# do, and it went without them until a run found out. The failure is worse here
+# than a stale answer: a fuzz object built against one revision of a struct,
+# linked with one built against the next, is a **binary with two layouts for the
+# same object**. What that produced was an ASan heap-buffer-overflow eight bytes
+# past the archive, in code that was correct - reader.c's object still had the
+# struct from before a field was added, so it allocated the old size, and the
+# writer of the new field ran off the end of it.
+#
+# That is the most expensive shape a gate can have: a finding that is real, is
+# reported against a line that is not wrong, and cannot be reproduced from a
+# clean tree. `make clean` does not touch this directory either (fuzz-clean
+# does), so the staleness survives the check that would otherwise have shown it.
+#
+# As in the ASan tree, FUZZ_DEPFILES sits after FUZZ_OBJECTS: `:=` expands
+# immediately, so above that line the list is empty and the -include is a no-op
+# that looks exactly like a working fix. The way to tell them apart is to touch
+# a header and count what rebuilds.
 $(FUZZ_OBJ_DIR)/%.o: src/%.c $(FUZZ_FLAGS_STAMP)
 	@mkdir -p $(@D)
-	@$(FUZZ_CC) $(FUZZ_LIB_FLAGS) -std=c17 -w $(INCLUDE) -c $< -o $@
+	@$(FUZZ_CC) $(FUZZ_LIB_FLAGS) -std=c17 -w $(INCLUDE) -c $< \
+		-MMD -MP -MF $(@:.o=.d) -o $@
+
+FUZZ_DEPFILES := $(FUZZ_OBJECTS:.o=.d)
+-include $(FUZZ_DEPFILES)
 
 # $1 = harness basename (fuzz_stream), $2 = target suffix (stream)
 define fuzz-rule
@@ -1403,7 +1425,23 @@ $(ASAN_FLAGS_STAMP): force-flags
 	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(TEST_DATA) $(ASAN_ARCHIVELIBRARY) $(CUTIL_LIBS) $(TESTFLAGS)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
+# `-MMD -MP` is in this string literally, and it is the one flag here that is not
+# a variable. Two reasons, and the second is why it is worth the oddity:
+#
+#   - The rule above the stamps says every flag a guarded recipe passes belongs in
+#     its stamp, and these are flags the recipe passes.
+#   - Without it, adding the depfile flags to the recipe moves nothing in this
+#     string, so no existing tree rebuilds - and a fuzz object compiled before the
+#     change still has no `.d`, so it goes on ignoring header edits forever. The
+#     fix would be armed only for someone who happened to run `make fuzz-clean`.
+#     Putting the flags here makes the stamp differ exactly once, which rebuilds
+#     the tree that needs it and then stays quiet.
+#
+# The release and ASan stamps have the same omission and it costs nothing there,
+# because those trees have carried depfiles since they were written. Adding the
+# flags to their strings would force a full rebuild to record a fact that is
+# already true, so they are left alone.
 $(FUZZ_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_SAN) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(INCLUDE) $(CUTIL_LIBS)' > $@.new
+	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_SAN) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(INCLUDE) $(CUTIL_LIBS) -MMD -MP' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@

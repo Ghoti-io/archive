@@ -207,6 +207,52 @@ ARCHIVES = [
     ("pax-longname.tar", "pax", ["dddddddddddddddddddddddd"], False,
         "pax: an 'x' member carrying a path= record, which a name too long for "
         "ustar's fields forces"),
+    ("pax-longlink.tar", "pax", ["link-to-hello", "link-to-deep"], False,
+        "pax: an 'x' member carrying a linkpath= record, beside a symlink whose "
+        "target fits the header field - the same pair as gnu-longlink.tar, so "
+        "the two mechanisms are compared on one shape"),
+]
+
+# pax, continued: the two fixtures that need flags of their own, so they are not
+# in the table above.
+#
+# ("pax-times.tar") A fractional mtime, which is the only way GNU tar emits an
+# `mtime=` record at all: with a whole second the header's octal field says the
+# same thing and it writes no record. So this is what makes GARC_TIME_PAX_DECIMAL
+# and a non-zero nanoseconds field reachable from a real writer rather than only
+# from a hand-built header.
+PAX_FRACTIONAL_MTIME = "%d.123456789" % MTIME
+
+# ("pax-global.tar") A `g` member, which is the hard one to get a writer to
+# produce. `--pax-option=globexthdr.name=` alone does not: GNU tar writes a
+# global header only when it has something global to say, and `hdrcharset` is the
+# one thing this corpus can give it. What comes out is worth more than the `g`
+# alone:
+#
+#   - a global header whose one record is `hdrcharset=BINARY`, which every member
+#     after it inherits;
+#   - an `x` member with a `path=` record for the non-ASCII name - written only
+#     *because* hdrcharset says the bytes are not UTF-8, so the pair of fixtures
+#     (this and pax-longname.tar, which has no hdrcharset) is what separates
+#     GARC_NAME_UTF8 from GARC_NAME_UNDECLARED for a name that came from a
+#     record;
+#   - an `x` member with a `linkpath=` record.
+#
+# Two things about a global header are not a function of the tree, and
+# `make check-corpus` found the second of them:
+#
+#   - **Its name.** GNU tar's default is `$TMPDIR/GlobalHead.%p.%n`, and `%p` is
+#     the process id, so without pinning it the fixture's bytes depend on what pid
+#     tar happened to get.
+#   - **Its mtime.** `--mtime` sets the *members'* times and a global header is not
+#     a member, so it gets a wall-clock reading. Two runs seconds apart produced
+#     two different fixtures - the third non-reproducible pax construct this gate
+#     has caught, after the atime/ctime records above and GNU tar's sparse member
+#     names, which embed a pid the same way and are why sparse is not here.
+PAX_GLOBAL_OPTIONS = [
+    "--pax-option=globexthdr.name=GlobalHead",
+    "--pax-option=globexthdr.mtime=%d" % MTIME,
+    "--pax-option=hdrcharset=BINARY",
 ]
 
 # **GNU tar's pax output is not reproducible without this, and finding that out
@@ -246,6 +292,30 @@ def generate(destination):
         if finished.returncode != 0:
             raise SystemExit("tar failed for %s:\n%s"
                 % (name, finished.stderr.strip()))
+
+    # pax with a fractional mtime. Separate from the table because it needs a
+    # --mtime of its own, which tar_common() fixes for every other fixture.
+    out = os.path.join(destination, "pax-times.tar")
+    argv = ["tar", "--create", "--file", out, "--format", "pax",
+        "--owner=%d" % UID, "--group=%d" % GID, "--numeric-owner",
+        "--mtime=@%s" % PAX_FRACTIONAL_MTIME,
+        "--sort=name", "--no-acls", "--no-selinux", "--no-xattrs"]
+    argv += PAX_OPTIONS + ["--directory", scratch, "hello.txt", "sizes"]
+    finished = subprocess.run(argv, capture_output=True, text=True)
+    if finished.returncode != 0:
+        raise SystemExit("tar failed for pax-times.tar:\n%s"
+            % finished.stderr.strip())
+
+    # pax with a global header. See PAX_GLOBAL_OPTIONS for what forces one and
+    # why its name has to be pinned.
+    out = os.path.join(destination, "pax-global.tar")
+    argv = ["tar", "--create", "--file", out, "--format", "pax"]
+    argv += tar_common() + PAX_OPTIONS + PAX_GLOBAL_OPTIONS
+    argv += ["--directory", scratch, "na\xefve.txt", "link-to-deep"]
+    finished = subprocess.run(argv, capture_output=True, text=True)
+    if finished.returncode != 0:
+        raise SystemExit("tar failed for pax-global.tar:\n%s"
+            % finished.stderr.strip())
 
     # An empty archive, which GNU tar will not write from an empty file list
     # without being told the list is deliberately empty. It is two zero blocks
@@ -374,6 +444,38 @@ def names(destination):
         handle.write("\n".join(rows) + "\n")
 
 
+def member_time(info):
+    """Seconds and nanoseconds of a member's mtime, as the reference read it.
+
+    **The float is not good enough and the record is.** `info.mtime` is a float,
+    which cannot hold a nanosecond: tarfile reads `mtime=1000000000.123456789`
+    and reports 1000000000.1234568. The record is in `info.pax_headers['mtime']`
+    exactly as the writer spelled it, so that is what this parses, and the float
+    is used only where there is no record at all - where the time came from the
+    header's octal field and is a whole second by construction.
+
+    Floor rather than truncation toward zero, so that a time before the epoch with
+    a fraction has a non-negative nanoseconds part. That is the only reading under
+    which seconds + nanoseconds/1e9 equals the value, and it is what this library
+    reports - `GARC_Member` has a signed seconds field and an unsigned
+    nanoseconds one, so the two have to agree about which way a negative rounds.
+    """
+    raw = info.pax_headers.get("mtime")
+    if raw is None:
+        return int(info.mtime), 0
+    negative = raw.startswith("-")
+    digits = raw.lstrip("+-")
+    whole, _, fraction = digits.partition(".")
+    seconds = int(whole or "0")
+    nanoseconds = int((fraction + "000000000")[:9])
+    if negative:
+        seconds = -seconds
+        if nanoseconds:
+            seconds -= 1
+            nanoseconds = 1000000000 - nanoseconds
+    return seconds, nanoseconds
+
+
 def manifest(destination):
     """One line per member, as Python's tarfile reads it.
 
@@ -390,7 +492,12 @@ def manifest(destination):
         "# These are the REFERENCE's readings, not this library's. A row this",
         "# library disagrees with is a finding either way round.",
         "#",
-        "# archive\tindex\tname\ttype\tsize\tmtime\tmode\tuid\tgid\tuname\tgname\tlink",
+        "# mtime is whole seconds and mtime_ns the sub-second part, because a pax",
+        "# `mtime=` record carries nanoseconds and tarfile's own mtime is a float",
+        "# that cannot hold one. See member_time() in the generator.",
+        "#",
+        "# archive\tindex\tname\ttype\tsize\tmtime\tmtime_ns\tmode\tuid\tgid"
+        "\tuname\tgname\tlink",
     ]
 
     for name in sorted(os.listdir(destination)):
@@ -400,13 +507,15 @@ def manifest(destination):
         with tarfile.open(path, "r:") as archive:
             index = 0
             for info in archive:
+                seconds, nanoseconds = member_time(info)
                 lines.append("\t".join([
                     name,
                     str(index),
                     escape(info.name.encode("utf-8", "surrogateescape")),
                     member_type(info),
                     str(info.size),
-                    str(info.mtime),
+                    str(seconds),
+                    str(nanoseconds),
                     "0%o" % info.mode,
                     str(info.uid),
                     str(info.gid),

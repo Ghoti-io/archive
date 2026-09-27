@@ -100,7 +100,8 @@ def inner():
                         info.name.encode("utf-8", "surrogateescape")),
                     make_corpus.member_type(info),
                     str(info.size),
-                    str(info.mtime),
+                    str(make_corpus.member_time(info)[0]),
+                    str(make_corpus.member_time(info)[1]),
                     "0%o" % info.mode,
                     str(info.uid),
                     str(info.gid),
@@ -112,7 +113,7 @@ def inner():
                         info.linkname.encode("utf-8", "surrogateescape")),
                 ))
 
-    want_meta = read_expected(os.path.join(CORPUS, "manifest.tsv"), 12)
+    want_meta = read_expected(os.path.join(CORPUS, "manifest.tsv"), 13)
     if got_meta != want_meta:
         failures.append("manifest.tsv: tarfile now reads %d rows against %d "
             "committed" % (len(got_meta), len(want_meta)))

@@ -171,6 +171,10 @@ static GARC_Member_Type tar_type_from_flag(uint8_t flag) {
   }
 }
 
+int garc_tar_type_carries_data(GARC_Member_Type type) {
+  return type == GARC_MEMBER_FILE || type == GARC_MEMBER_OTHER;
+}
+
 /** Which variant a header block's magic and version declare. */
 static GARC_Tar_Variant tar_variant_from_magic(const uint8_t * block) {
   const uint8_t * magic = block + GARC_TAR_OFF_MAGIC;
@@ -246,9 +250,7 @@ static GARC_Result tar_read_header(GARC_Archive * archive,
   // it as a data length walks the cursor into the next header, which is a
   // plausible wrong answer rather than an error: the reader then reports the
   // next header's bytes as this member's contents.
-  const int carries_data
-      = (member->type == GARC_MEMBER_FILE || member->type == GARC_MEMBER_OTHER);
-  member->size = carries_data ? size : 0u;
+  member->size = garc_tar_type_carries_data(member->type) ? size : 0u;
 
   uint64_t mode = 0;
   result = garc_tar_parse_uint(
@@ -412,12 +414,24 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
   // header a caller reached next.
   archive->have_long_name = 0;
   archive->have_long_link = 0;
+  // An `x` header's records are the next member's and nobody else's. The global
+  // set is deliberately not reset: POSIX keeps those in force until a later
+  // record replaces them.
+  garc_tar_pax_reset(&archive->pax_next);
 
-  // Where the member's first block is, which is the carrier's when there is one.
-  // A caller re-reading a member from this offset has to get the same member,
-  // and starting at the header behind a carrier would lose the long name.
+  // Where the member's first block is, which is a carrier's when there is one. A
+  // caller re-reading a member from this offset has to get the same member, and
+  // starting at the header behind a carrier would lose the long name.
   uint64_t group_offset = 0;
   int in_group = 0;
+  // Whether a block has been read that *describes a member*, which is a different
+  // question. Every metadata block joins the group, because the group is a run of
+  // blocks and re-reading has to start at the front of it; only some of them leave
+  // a member owed. A `g` header describes every member after it, and "none" is a
+  // number of members - `tar --concatenate` leaves globals at the end of what it
+  // joined - so a `g` with nothing behind it is a clean archive where an `x` with
+  // nothing behind it is damage.
+  int member_owed = 0;
 
   // A loop rather than recursion on the zero-block case. A stream of nothing but
   // zero blocks is a 40-byte gzip file that expands to any size you like, so
@@ -431,11 +445,11 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
       return result;
     }
 
-    if (in_group && (got < GARC_TAR_BLOCK || tar_block_is_zero(block))) {
-      // A carrier with nothing behind it. The name it carried describes a member
-      // that is not in the archive, and treating the end of the stream as a clean
-      // end here would report a complete archive whose last member's name was
-      // silently dropped.
+    if (member_owed && (got < GARC_TAR_BLOCK || tar_block_is_zero(block))) {
+      // Metadata with nothing behind it. What it said describes a member that is
+      // not in the archive, and treating the end of the stream as a clean end here
+      // would report a complete archive whose last member's name was silently
+      // dropped.
       return GARC_ERR_CORRUPT;
     }
 
@@ -515,6 +529,7 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
         return result;
       }
       *have = 1;
+      member_owed = 1;
       if (!in_group) {
         group_offset = header_offset;
         in_group = 1;
@@ -522,9 +537,45 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
       continue;
     }
 
-    // pax's 'x' and 'g' records are the other half of this phase and are still
-    // refused by name, for the reason above.
+    // pax carries the same things, and more, as `len key=value\n` records: an `x`
+    // member's apply to the member behind it and a `g` member's until a later
+    // record replaces them. Read here for the same reason as GNU's carriers, and
+    // with the same consequence - neither is a member.
     if (typeflag == 'x' || typeflag == 'g') {
+      uint64_t declared = 0;
+      result = garc_tar_parse_uint(
+          block + GARC_TAR_OFF_SIZE, GARC_TAR_LEN_SIZE, &declared);
+      if (result != GARC_OK) {
+        return result;
+      }
+      const int global = (typeflag == 'g');
+      result = garc_tar_read_pax_records(archive, declared, global);
+      if (result != GARC_OK) {
+        return result;
+      }
+      // A `g` joins the group and owes no member. It joins because header_offset
+      // promises an offset the member can be re-read from, and for the member
+      // immediately behind a global that is true only if the global is inside the
+      // run - re-reading from the `x` alone loses the `hdrcharset` and gives a
+      // member whose name carries a different declaration. For a member further on
+      // the promise cannot be kept at all: nothing in a pax archive lets one
+      // member's offset carry a global a thousand blocks behind it, and that is a
+      // property of the format rather than of this field.
+      if (!global) {
+        member_owed = 1;
+      }
+      if (!in_group) {
+        group_offset = header_offset;
+        in_group = 1;
+      }
+      continue;
+    }
+
+    // GNU's old sparse typeflag, which pax spells with `GNU.sparse.*` records.
+    // Refused for the same reason those are: the member's data is a map of holes
+    // and extents, and this typeflag would otherwise fall through to
+    // GARC_MEMBER_OTHER and be reported as a file whose contents are the map.
+    if (typeflag == 'S') {
       return GARC_ERR_UNSUPPORTED;
     }
 
@@ -546,6 +597,17 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
       archive->member.link_target = archive->long_link.bytes;
       archive->member.link_target_length = archive->long_link.length;
       archive->tar_variant = GARC_TAR_GNU;
+    }
+
+    // pax last, so that a record beats a GNU carrier where an archive somehow has
+    // both. No writer produces one: `--format=gnu` writes carriers and
+    // `--format=pax` writes records. The order is defined rather than refused
+    // because pax *has* an override rule and this is an instance of it, which is
+    // the opposite of two GNU carriers of the same kind - there the format defines
+    // no order, which is why those are refused.
+    result = garc_tar_apply_pax(archive);
+    if (result != GARC_OK) {
+      return result;
     }
 
     archive->member.header_offset = in_group ? group_offset : header_offset;

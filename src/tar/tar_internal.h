@@ -186,6 +186,59 @@ GARC_Result garc_tar_read_long_field(
     GARC_Archive * archive, uint64_t declared, GARC_Tar_Buffer * buffer);
 
 /**
+ * Whether a member of this type carries data after its header.
+ *
+ * A directory, a symlink, a fifo or a device declares no data and its size field
+ * may hold anything - some writers leave a stale value there - so the size a
+ * member reports is zero for those whatever the field or a pax `size=` record
+ * said. One function rather than the predicate written twice, because the two
+ * places that need it are the header reader and the record applier and a reader
+ * that disagreed with itself would seek by one and report the other.
+ *
+ * @param type The member type.
+ * @return Non-zero when the member's declared size is a length of data.
+ */
+int garc_tar_type_carries_data(GARC_Member_Type type);
+
+/**
+ * Read an `x` or `g` member's records into the archive's record set.
+ *
+ * The payload is `len key=value\n` records, padded out to a whole block. On
+ * return the records have been parsed and the stream is positioned at the next
+ * header.
+ *
+ * @param archive The archive.
+ * @param declared The `x`/`g` member's declared size.
+ * @param global Non-zero for a `g` member, whose records persist across members.
+ * @return GARC_OK, GARC_ERR_LIMIT_EXTRA_BYTES when the cap refuses it,
+ *   GARC_ERR_UNSUPPORTED for a construct this reader will not guess at,
+ *   GARC_ERR_CORRUPT for records that are not records, or GARC_ERR_OOM.
+ */
+GARC_Result garc_tar_read_pax_records(
+    GARC_Archive * archive, uint64_t declared, int global);
+
+/**
+ * Apply whatever records are in force to the member just read.
+ *
+ * The global set first, then the `x` set over it, because a record for the next
+ * member overrides a record for every member.
+ *
+ * @param archive The archive, whose `member` is filled in from its header.
+ * @return GARC_OK, or GARC_ERR_CORRUPT for a record whose value is not what its
+ *   key requires.
+ */
+GARC_Result garc_tar_apply_pax(GARC_Archive * archive);
+
+/**
+ * Forget the records that applied to one member.
+ *
+ * The storage is kept; only the claims on it go.
+ *
+ * @param pax The record set.
+ */
+void garc_tar_pax_reset(GARC_Tar_Pax * pax);
+
+/**
  * Release whatever the tar reader allocated.
  *
  * Called from garc_close() for every archive, not only a tar one: the buffers

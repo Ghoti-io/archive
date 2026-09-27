@@ -19,20 +19,20 @@ through a compress decoder. This library is the container, not the compression.
 
 ## Status
 
-**Reads tar.** v7 and ustar headers in full, plus GNU's `L` and `K` members -
-the ones that carry a name or a link target too long for a header field - from a
-file or a pipe. pax's extended records are **refused by name** with
-`GARC_ERR_UNSUPPORTED` rather than misreported, and are the next commit. No zip
-yet, and no filesystem layer.
+**Reads tar - all four of them.** v7, ustar, GNU's `L`/`K` members and pax's
+`x`/`g` records, from a file or a pipe. What is refused, by name and with
+`GARC_ERR_UNSUPPORTED`, is a *sparse* member: there the data is a map of holes and
+extents rather than the file's contents, so reading it as contents would be a
+wrong answer rather than a missing feature. No zip yet, and no filesystem layer.
 
 The fixtures are written by GNU tar 1.35 in a pinned container and the
 expectations come from Python 3.13.5's `tarfile` and libarchive 3.7.4's bsdtar,
 so a passing test is three implementations agreeing rather than this library
 agreeing with itself.
 
-Build clean under GCC 14 with `-Werror`; 154 tests; 99.6% line coverage, the
-three remaining lines being a defensive arm no input can reach and a guard that
-is live only where `size_t` is 32 bits; clean under Valgrind and under
+Build clean under GCC 14 with `-Werror`; 195 tests; 99.6% line coverage, the
+four remaining lines being a defensive arm no input can reach and two guards that
+are live only where `size_t` is 32 bits; clean under Valgrind and under
 ASan+UBSan; `check-symbols`, `check-aliasing` and `check-corpus-hashes` green;
 two fuzz harnesses.
 
@@ -135,10 +135,11 @@ buffer. Three things about that loop:
   normal and cheap - seeking when the stream can, discarding when it cannot.
 - **A member is borrowed**, valid until the next `garc_next()`, and its name is
   bytes plus a length rather than a NUL-terminated string.
-- **Some members are not members.** tar puts a name too long for its header
-  fields in a block of its own in front of the real one. Those never reach you:
-  a listing that showed a file called `././@LongLink` would be reporting an
-  artefact of the format, and the member behind it under a truncated name.
+- **Some members are not members.** tar puts anything that will not fit a header -
+  a long name, a long link target, a sub-second time - in a block of its own in
+  front of the real one. Those never reach you: a listing that showed a file called
+  `././@LongLink` or `./PaxHeaders/x` would be reporting an artefact of the format,
+  and the member behind it under a truncated name.
 
 Every field of a member is **what the container declared**, not what this library
 believes. A member's `size` is the size the header gave; whether that many bytes
@@ -165,7 +166,8 @@ loop:
 string names which limit.
 
 **Limits.** `GARC_Limits` caps the members walked, one member's declared size,
-their sum, a name's length, and a member's extra fields.
+their sum, a name's length, and the extra fields held for one member - in tar,
+pax's extended records, which are unbounded in the format.
 `garc_limits_default()` fills it in, and unlike its siblings elsewhere in the
 suite **every default is non-zero**: a member's size is declared in the
 container and read before a single byte of its contents is, so "no limit" would

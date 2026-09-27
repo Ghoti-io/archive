@@ -75,6 +75,53 @@ typedef struct {
   size_t capacity;
 } GARC_Tar_Buffer;
 
+/**
+ * The pax record keys this reader acts on.
+ *
+ * pax is an open vocabulary - real writers emit `SCHILY.*`, `LIBARCHIVE.*` and
+ * GNU's own `GNU.*` keys - so an unknown key is *ignored* rather than refused:
+ * refusing would refuse most of what they produce. The one exception is
+ * `GNU.sparse.*`, refused by name, because there the member's data is a sparse
+ * map rather than its contents and ignoring the records hands a caller the map
+ * as the file.
+ */
+typedef enum {
+  GARC_PAX_PATH = 0,   ///< `path=`, replacing the header's name.
+  GARC_PAX_LINKPATH,   ///< `linkpath=`, replacing the link target.
+  GARC_PAX_UNAME,      ///< `uname=`.
+  GARC_PAX_GNAME,      ///< `gname=`.
+  GARC_PAX_SIZE,       ///< `size=`, decimal, for what the octal field cannot hold.
+  GARC_PAX_MTIME,      ///< `mtime=`, decimal, with a fraction.
+  GARC_PAX_UID,        ///< `uid=`, decimal.
+  GARC_PAX_GID,        ///< `gid=`, decimal.
+  GARC_PAX_HDRCHARSET, ///< `hdrcharset=`, saying what the records' bytes are.
+  GARC_PAX_KEY_COUNT
+} GARC_Pax_Key;
+
+/**
+ * One set of pax records: an `x` member's, or the accumulated `g` ones.
+ *
+ * The values stay in @ref records as the writer spelled them, and the table holds
+ * **offsets rather than pointers** so that appending a second header's records -
+ * which can move the allocation - does not invalidate what an earlier one said.
+ * That is what makes POSIX's rule for global records implementable: a later `g`
+ * overrides each key individually rather than replacing the set.
+ *
+ * `have[k]` with a @ref length of zero is not the same as `!have[k]`. A record
+ * with an empty value *deletes* the key, which is how an `x` header suppresses a
+ * global one, so the two states have to be distinguishable.
+ */
+typedef struct {
+  /** The raw record bytes, appended to and never rewound within a set. */
+  GARC_Tar_Buffer records;
+  /** Where each key's value starts in @ref records. */
+  size_t offset[GARC_PAX_KEY_COUNT];
+  /** How long each key's value is; zero means the key was deleted. */
+  size_t length[GARC_PAX_KEY_COUNT];
+  /** Whether the key appeared at all. */
+  int have[GARC_PAX_KEY_COUNT];
+} GARC_Tar_Pax;
+
 struct GARC_Archive {
   /** The stream, borrowed. The caller destroys it; garc_close() does not. */
   GARC_Stream * stream;
@@ -158,6 +205,23 @@ struct GARC_Archive {
   int have_long_name;
   /** The same for @ref long_link. */
   int have_long_link;
+
+  /**
+   * Records from an `x` member, which apply to the next member only.
+   *
+   * Reset at the start of every garc_tar_next(), for the same reason
+   * @ref have_long_name is: a set left behind by a failed step would otherwise be
+   * applied to whatever header a caller reached next.
+   */
+  GARC_Tar_Pax pax_next;
+  /**
+   * Records from `g` members, which apply until a later record replaces them.
+   *
+   * Not reset per member, and appended to rather than replaced, because POSIX
+   * overrides a global record **per key**: a second `g` naming `mtime` does not
+   * clear a first one's `path`.
+   */
+  GARC_Tar_Pax pax_global;
 };
 
 /**

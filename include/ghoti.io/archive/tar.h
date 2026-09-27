@@ -39,6 +39,14 @@
  * file contains members of two variants. ::garc_tar_member_variant() answers
  * for the member ::garc_next() last handed out.
  *
+ * **What a member is read *through* decides its variant, not what its header's
+ * magic says.** A member behind a GNU `L` member is ::GARC_TAR_GNU and one any pax
+ * record was in force for is ::GARC_TAR_PAX, in both cases even though the header
+ * itself carries ustar's magic - which is what pax's magic *is*. Read the other
+ * way round, `tar --format=pax` output of short names would report as pax when
+ * nothing in it is, and a name that arrived in a `path=` record would report as
+ * ustar when the ustar fields had nothing to do with it.
+ *
  * It is here rather than on ::GARC_Member because the member struct is the one
  * thing every format shares, and a field whose meaning depends on which format
  * filled it in is the shape that goes wrong when the second format arrives.

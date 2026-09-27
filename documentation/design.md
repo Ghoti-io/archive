@@ -141,8 +141,11 @@ without ever erroring:
 | GNU | an `L` member carrying the next member's name | base-256 when the high bit is set | `magic` is `ustar  \0` |
 | pax (POSIX.1-2001) | an `x`/`g` member of `len key=value\n` records | a `size=` record, decimal | an `x` member before the one it describes |
 
-**v7, ustar and GNU's `L`/`K` are read; pax's `x`/`g` are refused by name**, with
-`GARC_ERR_UNSUPPORTED`. The members *around* a refused one are read normally, so
+**All four are read.** What is refused, by name and with
+`GARC_ERR_UNSUPPORTED`, is a *sparse* member - GNU's `S` typeflag and pax's
+`GNU.sparse.*` records - because there the member's data is a map of holes and
+extents rather than its contents, and a reader that ignored that would hand a
+caller the map as the file. The members around a refused one are read normally, so
 it is a refusal of one construct rather than of the archive.
 
 Note that a pax archive whose names all fit the ustar fields contains no extended
@@ -156,7 +159,7 @@ answers for the member `garc_next()` last handed out, and it lives in `tar.h`
 rather than on `GARC_Member` because a member field whose meaning depends on which
 format filled it in is the shape that goes wrong when the second format arrives.
 
-### A carrier is not a member
+### Metadata in front of the header, not in it
 
 GNU cannot put a name longer than 100 bytes, or a link target longer than 100
 bytes, in a header - so it writes one of its own in front: a member with typeflag
@@ -216,6 +219,71 @@ Two consequences in the API worth knowing:
 And the variant a member read through a carrier reports is `GARC_TAR_GNU` even
 when the header's own magic says `ustar`, because the construct is GNU's and the
 member was not read as a ustar member.
+
+### pax's records, which are the same job with different rules
+
+An `x` or `g` member's data is a run of `len SP key = value LF` records, where
+`len` is the decimal length of the whole record *including itself* - the one
+self-referential field in any of these formats, and what lets a record be found
+without scanning for a delimiter a value might contain. The keys this reader acts
+on are `path`, `linkpath`, `uname`, `gname`, `size`, `mtime`, `uid`, `gid` and
+`hdrcharset`.
+
+Four rules, each of which has a wrong reading that still round-trips:
+
+- **`x` applies to the next member; `g` applies until replaced.** Backwards, this
+  mis-attributes every name in an archive and reports a complete one.
+- **A later record overrides an earlier one key by key**, so a second `g` naming
+  `mtime` does not clear the first one's `path`. This is why the global record
+  bytes are appended to rather than replaced, and why the record table holds
+  offsets into them rather than pointers.
+- **An empty value deletes the key**, which is how an `x` header suppresses a
+  global one. "The key appeared" and "the key has a value" are therefore two
+  states, and a reader that conflated them would report the very thing an archive
+  asked it to forget.
+- **An unknown key is ignored, not refused.** pax is an open vocabulary and real
+  writers use it - `SCHILY.*`, `LIBARCHIVE.*`, `GNU.*` - so refusing would refuse
+  most of what `bsdtar --format=pax` writes. `GNU.sparse.*` is the one exception,
+  and it is an exception because ignoring it changes what the member's *data* is
+  rather than what its metadata says.
+
+Three consequences worth knowing:
+
+- **`hdrcharset` is the only thing in tar that declares an encoding**, and it
+  declares it for the *records* - so it decides `name_encoding` for a name that
+  came from a `path=` record and says nothing about one read from a header field,
+  which stays `GARC_NAME_UNDECLARED` whatever the records claim. Absent is a
+  declaration too: POSIX says the records are UTF-8, so a `path=` record with no
+  `hdrcharset=` beside it is `GARC_NAME_UTF8`. `BINARY` is the opposite, and a
+  charset this library cannot vouch for reaches the same answer for a different
+  reason.
+- **`mtime` is where `GARC_TIME_PAX_DECIMAL` and a non-zero
+  `mtime_nanoseconds` come from**, and the fraction *floors* for a time before
+  the epoch: the nanoseconds a member reports are unsigned, so `-1.5` is -2
+  seconds and 500000000 nanoseconds. Truncating towards zero would put it half a
+  second after the epoch where the archive said half a second before it. Digits
+  past the ninth are dropped rather than rounded, because rounding can carry into
+  the second.
+- **`max_extra_bytes` is reachable for the first time.** No tar construct read
+  before pax had an "extra field" for it to bound, so it was a status with no path
+  to it - worth saying plainly rather than leaving the cap looking live. What it
+  bounds is what the reader is *holding* for the current member: the `x` records
+  plus the globals still in force, because either can be made into a chain and a
+  cap on one header at a time would leave a hundred of them unbounded.
+
+**`x` and `g` differ at the end of an archive**, and it is not an oversight. An
+`x` with nothing behind it describes a member the archive does not contain, so it
+is `GARC_ERR_CORRUPT`; a `g` with nothing behind it describes every member after
+it and "none" is a number of members, which is what `tar --concatenate` leaves at
+a join. So the reader tracks "this block joins the member's group" and "this block
+leaves a member owed" as two questions - a `g` answers yes to the first, because
+`header_offset` has to point at the start of the whole run of metadata blocks for
+a re-read to produce the same member, and no to the second.
+
+Where a GNU carrier and a pax record both describe one member - which no writer
+produces - **the record wins**. That is an order rather than a refusal because pax
+*has* an override rule and this is an instance of it, unlike two GNU carriers of
+the same kind, where the format defines no order and the reader refuses.
 
 ### What a header field can do to a reader
 

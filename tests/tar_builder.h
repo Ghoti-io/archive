@@ -172,6 +172,53 @@ inline TarHeader long_header(char typeflag, uint64_t declared) {
   return header;
 }
 
+/**
+ * A pax `x` or `g` carrier header for a record block of `declared` bytes.
+ *
+ * The name is what GNU tar writes - `./PaxHeaders/<member>` for an `x` and
+ * `GlobalHead` for a `g` - and a reader must report neither.
+ *
+ * @param typeflag 'x' for records that apply to the next member, 'g' for records
+ *   that apply until replaced.
+ * @param declared The size field. Taken rather than derived, because several
+ *   cases here are a declaration that disagrees with the bytes behind it.
+ */
+inline TarHeader pax_header(char typeflag, uint64_t declared) {
+  TarHeader header;
+  header.field(0, 100, typeflag == 'g' ? "GlobalHead" : "./PaxHeaders/member");
+  header.octal(100, 8, 0644u);
+  header.octal(108, 8, 0);
+  header.octal(116, 8, 0);
+  header.octal(124, 12, declared);
+  header.octal(136, 12, 0);
+  header.bytes[156] = static_cast<uint8_t>(typeflag);
+  header.ustar();
+  header.checksum();
+  return header;
+}
+
+/**
+ * One pax record: `len SP key = value LF`.
+ *
+ * `len` counts itself, which is the one self-referential field in any of these
+ * formats - so the width of the number changes the number, and this iterates to a
+ * fixed point rather than guessing. A test that hard-coded a length would be
+ * asserting against whatever it happened to compute.
+ */
+inline std::string pax_record(
+    const std::string & key, const std::string & value) {
+  const size_t body = key.size() + value.size() + 3u; // space, '=', newline
+  size_t length = body + 1u;
+  for (;;) {
+    const size_t digits = std::to_string(length).size();
+    if (body + digits == length) {
+      break;
+    }
+    length = body + digits;
+  }
+  return std::to_string(length) + " " + key + "=" + value + "\n";
+}
+
 /** An archive: headers and data blocks, with the end marker appended. */
 class TarArchive {
 public:

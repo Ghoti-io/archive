@@ -35,6 +35,7 @@ struct ManifestRow {
   std::string type;
   uint64_t size = 0;
   int64_t mtime = 0;
+  uint32_t mtime_nanoseconds = 0;
   uint32_t mode = 0;
   int64_t uid = 0;
   int64_t gid = 0;
@@ -110,7 +111,7 @@ inline std::map<std::string, std::vector<ManifestRow>> manifest_load(
     // Trailing empty fields are dropped by getline when the line ends with a
     // tab, and the last three fields are routinely empty - so a short row is
     // padded rather than rejected.
-    while (fields.size() < 12) {
+    while (fields.size() < 13) {
       fields.push_back("");
     }
 
@@ -121,13 +122,18 @@ inline std::map<std::string, std::vector<ManifestRow>> manifest_load(
     row.type = fields[3];
     row.size = std::strtoull(fields[4].c_str(), nullptr, 10);
     row.mtime = std::strtoll(fields[5].c_str(), nullptr, 10);
+    // The sub-second part, which only a pax `mtime=` record carries. It is a
+    // column of its own because the reference's own mtime is a float and cannot
+    // hold a nanosecond - see member_time() in the generator.
+    row.mtime_nanoseconds
+        = static_cast<uint32_t>(std::strtoul(fields[6].c_str(), nullptr, 10));
     // Octal, with the leading 0 the generator writes.
-    row.mode = static_cast<uint32_t>(std::strtoul(fields[6].c_str(), nullptr, 8));
-    row.uid = std::strtoll(fields[7].c_str(), nullptr, 10);
-    row.gid = std::strtoll(fields[8].c_str(), nullptr, 10);
-    row.uname = manifest_unescape(fields[9]);
-    row.gname = manifest_unescape(fields[10]);
-    row.link = manifest_unescape(fields[11]);
+    row.mode = static_cast<uint32_t>(std::strtoul(fields[7].c_str(), nullptr, 8));
+    row.uid = std::strtoll(fields[8].c_str(), nullptr, 10);
+    row.gid = std::strtoll(fields[9].c_str(), nullptr, 10);
+    row.uname = manifest_unescape(fields[10]);
+    row.gname = manifest_unescape(fields[11]);
+    row.link = manifest_unescape(fields[12]);
     rows[row.archive].push_back(row);
   }
   return rows;

@@ -128,6 +128,12 @@ void expect_matches_manifest(const std::string & fixture, bool as_pipe) {
         << fixture << " member " << index << " " << want.name;
     EXPECT_EQ(member->mtime_seconds, want.mtime)
         << fixture << " member " << index << " " << want.name;
+    // The sub-second part, which only a pax `mtime=` record carries. Compared
+    // against a column of its own because the reference's own mtime is a float
+    // and cannot hold a nanosecond - so a test comparing against that would
+    // agree with a reader that dropped the last two digits.
+    EXPECT_EQ(member->mtime_nanoseconds, want.mtime_nanoseconds)
+        << fixture << " member " << index << " " << want.name;
     EXPECT_EQ(member->mode, want.mode)
         << fixture << " member " << index << " " << want.name;
     EXPECT_EQ(member->uid, want.uid) << fixture << " member " << index;
@@ -165,6 +171,10 @@ const char * const readable[] = {
   // fields carries no extended records and reads as ustar - which it should,
   // rather than being refused for the format it declares.
   "pax-basic.tar",
+  "pax-longname.tar",
+  "pax-longlink.tar",
+  "pax-times.tar",
+  "pax-global.tar",
   // GNU's carriers. These were refused until the commit that read them, so they
   // are here as well as in the tests below: the reference comparison is what says
   // the name a carrier produced is the name the archive holds, rather than only
@@ -506,17 +516,17 @@ TEST(TarVariant, APaxArchiveWithNoExtendedRecordsReadsAsUstar) {
   garc_stream_destroy(stream);
 }
 
-TEST(TarVariant, PaxExtendedHeadersAreRefusedByName) {
-  // A pax `x` member carrying a path= record, forced by a name too long for the
-  // ustar fields. Refused rather than read, and the members before it are read
-  // normally - which is what makes it a refusal of one construct rather than of
-  // the archive.
+TEST(TarVariant, APaxPathRecordReplacesTheHeadersName) {
+  // An `x` member carrying a path= record, forced by a name too long for the
+  // ustar fields. As with GNU's carrier the two wrong answers are both names: the
+  // `x` member reported as a file called `./PaxHeaders/...`, and the real member
+  // under the truncated copy in its own header.
   //
-  // The comment here first said the refusal would come on the *first* call,
-  // because pax puts its `x` member before the one it describes. That is true of
-  // the member it describes and not of the archive: the four short-named
-  // directories ahead of it need no extended record, so they are read first and
-  // the refusal lands fifth. Asserting the count is what caught that.
+  // The four short-named directories in front of it need no record and are read
+  // from their headers, so this also pins *which* member the record applied to -
+  // an earlier version of this test asserted the refusal would come first, on the
+  // theory that pax puts its `x` before the member it describes. It does; the
+  // directories ahead of it simply have no `x` at all.
   std::vector<uint8_t> bytes = read_fixture(data_path("pax-longname.tar"));
   ASSERT_FALSE(bytes.empty());
 
@@ -526,16 +536,142 @@ TEST(TarVariant, PaxExtendedHeadersAreRefusedByName) {
   GARC_Archive * archive = nullptr;
   ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
 
-  size_t read_before_refusal = 0;
+  size_t from_a_record = 0;
+  size_t from_the_header = 0;
   const GARC_Member * member = nullptr;
   GARC_Result result;
   while ((result = garc_next(archive, &member)) == GARC_OK) {
-    ++read_before_refusal;
+    EXPECT_EQ(member_name(member).find("PaxHeaders"), std::string::npos)
+        << "the record member was reported as a member";
+    if (garc_tar_member_variant(archive) == GARC_TAR_PAX) {
+      ++from_a_record;
+      EXPECT_GT(member->name_length, 100u);
+      // **A name that came from a record carries a declaration.** POSIX says the
+      // records are UTF-8, and this archive has no hdrcharset= saying otherwise,
+      // so the container did assert an encoding for this name - unlike every name
+      // read from a header field, which asserts nothing.
+      EXPECT_EQ(member->name_encoding, GARC_NAME_UTF8);
+    } else {
+      ++from_the_header;
+      EXPECT_EQ(member->name_encoding, GARC_NAME_UNDECLARED);
+    }
   }
-  EXPECT_EQ(result, GARC_ERR_UNSUPPORTED);
-  EXPECT_EQ(read_before_refusal, 4u)
-      << "the refusal did not land on the 'x' member: the four directories "
-         "before it carry no extended record and should be read";
+  EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+  EXPECT_EQ(from_a_record, 1u);
+  EXPECT_EQ(from_the_header, 4u)
+      << "every member came through a record, so nothing here shows that one "
+         "applies to the member behind it and not to the archive";
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, APaxLinkpathRecordIsNotTruncated) {
+  // The pax half of the pair gnu-longlink.tar covers for GNU: one target that
+  // needs a record and one that fits the header field, in one archive.
+  std::vector<uint8_t> bytes = read_fixture(data_path("pax-longlink.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  size_t from_a_record = 0;
+  size_t from_the_field = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    ASSERT_NE(member->link_target, nullptr) << member_name(member);
+    if (member->link_target_length > 100u) {
+      ++from_a_record;
+      EXPECT_EQ(garc_tar_member_variant(archive), GARC_TAR_PAX);
+    } else {
+      ++from_the_field;
+    }
+  }
+  EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+  EXPECT_EQ(from_a_record, 1u);
+  EXPECT_EQ(from_the_field, 1u);
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, APaxMtimeRecordCarriesAFraction) {
+  // The only fixture with a sub-second time, and the only way to get one out of a
+  // real writer: with a whole second GNU tar writes no `mtime=` record at all,
+  // because the header's octal field already says it. So this is what makes
+  // GARC_TIME_PAX_DECIMAL and a non-zero nanoseconds field reachable from
+  // something other than a hand-built header.
+  std::vector<uint8_t> bytes = read_fixture(data_path("pax-times.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  size_t members = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    SCOPED_TRACE(member_name(member));
+    ++members;
+    EXPECT_EQ(member->mtime_seconds, 1000000000);
+    EXPECT_EQ(member->mtime_nanoseconds, 123456789u);
+    // Which field answered, not only what it said. The same time is in the
+    // header's octal field to the second, so a reader that ignored the record
+    // would report the right seconds and a zero fraction - and the source is what
+    // separates those two answers.
+    EXPECT_EQ(member->mtime_source, GARC_TIME_PAX_DECIMAL);
+    EXPECT_EQ(garc_tar_member_variant(archive), GARC_TAR_PAX);
+  }
+  EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+  EXPECT_EQ(members, 7u);
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, AGlobalHeaderAppliesToEveryMemberAfterIt) {
+  // The `g` member, which is the hard one to get a writer to produce: GNU tar
+  // writes one only when it has something global to say, and `hdrcharset` is it.
+  // What comes out is a global asserting that the record bytes are **not** UTF-8,
+  // and an `x` path= record for the non-ASCII name that only exists because of it.
+  //
+  // So this fixture and pax-longname.tar are a minimal pair on the one axis that
+  // matters: both carry a name in a path= record, and they differ only in whether
+  // a global says what its bytes are. A reader that took GARC_NAME_UTF8 from the
+  // presence of a record rather than from the declaration passes the other test
+  // and fails this one.
+  std::vector<uint8_t> bytes = read_fixture(data_path("pax-global.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  size_t members = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    SCOPED_TRACE(member_name(member));
+    ++members;
+    EXPECT_EQ(member_name(member).find("GlobalHead"), std::string::npos)
+        << "the global header was reported as a member";
+    // Every member is pax, including the one with no `x` of its own: a global in
+    // force is a statement about how this member is read.
+    EXPECT_EQ(garc_tar_member_variant(archive), GARC_TAR_PAX);
+    EXPECT_EQ(member->name_encoding, GARC_NAME_UNDECLARED)
+        << "hdrcharset=BINARY says the bytes are bytes, so nothing is declared";
+  }
+  EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+  EXPECT_EQ(members, 2u);
 
   garc_close(archive);
   garc_stream_destroy(stream);

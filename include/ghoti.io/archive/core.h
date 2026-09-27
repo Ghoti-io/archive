@@ -176,6 +176,11 @@ GARC_API int garc_result_is_limit(GARC_Result result);
  * A single zip extra field is length-prefixed with 16 bits, so 65535 is the
  * format's ceiling for one field and not for their sum - a member may carry
  * as many as fit. This caps the sum.
+ *
+ * tar reaches it through pax's extended records, which are unbounded in the
+ * format: an `x` member's records and the `g` members' still in force are both
+ * held in memory for the member being read, and both are chains a writer can make
+ * as long as it likes.
  */
 #define GARC_DEFAULT_MAX_EXTRA_BYTES ((size_t)65536u)
 
@@ -207,8 +212,14 @@ typedef struct GARC_Limits {
   uint64_t max_total_bytes;
   /** Cap on one member's name, in bytes. */
   size_t max_name_bytes;
-  /** Cap on the sum of one member's container-specific extra fields, in
-   *  bytes. */
+  /**
+   * Cap on the container-specific extra fields held for one member, in bytes.
+   *
+   * The *sum*, not one field: zip lets a member carry as many extra fields as
+   * fit, and pax lets an archive put any number of `x` and `g` members in front
+   * of one. A cap on each would leave a hundred of them unbounded, which is the
+   * same argument @ref max_total_bytes makes against @ref max_member_bytes.
+   */
   size_t max_extra_bytes;
 } GARC_Limits;
 

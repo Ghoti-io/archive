@@ -33,6 +33,8 @@ using garctest::BufferSource;
 using garctest::file_header;
 using garctest::kTarBlock;
 using garctest::long_header;
+using garctest::pax_header;
+using garctest::pax_record;
 using garctest::TarArchive;
 using garctest::TarHeader;
 
@@ -1198,6 +1200,893 @@ TEST(TarGnuCarrier, ReportsOutOfMemoryForThePayload) {
   garc_close(opened);
   garc_stream_destroy(stream);
   EXPECT_EQ(allocator.live(), 0u);
+}
+
+//-----------------------------------------------------------------------------
+// pax's records: the `x` and `g` members
+//-----------------------------------------------------------------------------
+//
+// The generated corpus has the four shapes GNU tar will produce - a path record, a
+// linkpath record, a fractional mtime, and a global hdrcharset. Everything below
+// is a record block no writer emits: a malformed one, a key at a boundary, a
+// numeric value that is not a number, and the combinations of `x` and `g` that
+// only a hand-built archive can put side by side.
+
+/** Build an archive whose first member is described by one record block. */
+std::vector<uint8_t> pax_archive(char typeflag, const std::string & records,
+    const std::string & name = "member", char member_type = '0',
+    uint64_t size = 0) {
+  TarArchive archive;
+  archive.header(pax_header(typeflag, records.size()))
+      .data(records)
+      .header(file_header(name, size, 0644u, member_type));
+  if (size) {
+    archive.data(std::string(static_cast<size_t>(size), 'd'));
+  }
+  archive.marker();
+  return archive.bytes();
+}
+
+TEST(TarPaxRecords, TheRecordMemberIsNeverReportedAsAMember) {
+  // Hand-built, with the shortest record that does anything. A reader that walks
+  // headers reports two members and the first is called `./PaxHeaders/member`.
+  const std::string records = pax_record("path", "a/real/name");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "a/real/name");
+  EXPECT_EQ(garc_tar_member_variant(opened.archive), GARC_TAR_PAX);
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_END);
+  EXPECT_EQ(garc_member_count(opened.archive), 1u);
+}
+
+TEST(TarPaxRecords, AnXRecordAppliesToTheNextMemberOnly) {
+  // The rule that is easy to get backwards, and getting it backwards
+  // mis-attributes every name in the archive while still round-tripping.
+  TarArchive archive;
+  const std::string records = pax_record("path", "only-the-first");
+  archive.header(pax_header('x', records.size()))
+      .data(records)
+      .header(file_header("first", 0))
+      .header(file_header("second", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "only-the-first");
+  EXPECT_EQ(garc_tar_member_variant(opened.archive), GARC_TAR_PAX);
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "second");
+  EXPECT_EQ(garc_tar_member_variant(opened.archive), GARC_TAR_USTAR);
+}
+
+TEST(TarPaxRecords, AGlobalRecordAppliesUntilItIsReplaced) {
+  // The other half of that rule. A `g` applies to every member after it, so a
+  // reader that treated one as an `x` would apply it once and drop it.
+  TarArchive archive;
+  const std::string first = pax_record("uname", "global-owner");
+  const std::string second = pax_record("uname", "replaced-owner");
+  archive.header(pax_header('g', first.size()))
+      .data(first)
+      .header(file_header("one", 0))
+      .header(file_header("two", 0))
+      .header(pax_header('g', second.size()))
+      .data(second)
+      .header(file_header("three", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const char * const expected[] = {
+    "global-owner", "global-owner", "replaced-owner"};
+  const GARC_Member * member = nullptr;
+  for (size_t i = 0; i < 3u; ++i) {
+    SCOPED_TRACE(i);
+    ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+    ASSERT_NE(member->uname, nullptr);
+    EXPECT_EQ(std::string(member->uname, member->uname_length), expected[i]);
+  }
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_END);
+}
+
+TEST(TarPaxRecords, ASecondGlobalOverridesOneKeyAndNotTheOthers) {
+  // POSIX overrides a global record **per key**, which is why the global set is
+  // appended to rather than replaced. A reader that replaced the set would lose
+  // the first global's uname here and report nothing for it - and would pass the
+  // test above, where both globals name the same key.
+  TarArchive archive;
+  const std::string first = pax_record("uname", "kept-owner");
+  const std::string second = pax_record("gname", "added-group");
+  archive.header(pax_header('g', first.size()))
+      .data(first)
+      .header(pax_header('g', second.size()))
+      .data(second)
+      .header(file_header("one", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  ASSERT_NE(member->uname, nullptr);
+  EXPECT_EQ(std::string(member->uname, member->uname_length), "kept-owner");
+  ASSERT_NE(member->gname, nullptr);
+  EXPECT_EQ(std::string(member->gname, member->gname_length), "added-group");
+}
+
+TEST(TarPaxRecords, AnXRecordBeatsAGlobalOne) {
+  TarArchive archive;
+  const std::string global = pax_record("uname", "global-owner");
+  const std::string local = pax_record("uname", "member-owner");
+  archive.header(pax_header('g', global.size()))
+      .data(global)
+      .header(pax_header('x', local.size()))
+      .data(local)
+      .header(file_header("one", 0))
+      .header(file_header("two", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(std::string(member->uname, member->uname_length), "member-owner");
+  // And the global is still in force for the member after, which is what makes
+  // this a precedence test rather than a replacement one.
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(std::string(member->uname, member->uname_length), "global-owner");
+}
+
+TEST(TarPaxRecords, AnEmptyValueDeletesAnInheritedGlobal) {
+  // POSIX's deletion, which is why "the key appeared" and "the key has a value"
+  // are two states rather than one. A reader that treated an empty value as
+  // absent would fall through to the global and report the very thing the
+  // archive asked it to forget.
+  TarArchive archive;
+  const std::string global = pax_record("uname", "global-owner");
+  const std::string local = pax_record("uname", "");
+  archive.header(pax_header('g', global.size()))
+      .data(global)
+      .header(pax_header('x', local.size()))
+      .data(local)
+      .header(file_header("one", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  // Absent rather than empty: the header field carried none either, and reporting
+  // an empty string would make a caller print "" where nothing was said.
+  EXPECT_EQ(member->uname, nullptr);
+  EXPECT_EQ(member->uname_length, 0u);
+}
+
+TEST(TarPaxRecords, TwoXHeadersForOneMemberAccumulate) {
+  // Two `x` members in front of one header, which is legal and which forces the
+  // record buffer to grow with the first set still in it. A buffer that reallocated
+  // without preserving would lose the path; one that kept pointers rather than
+  // offsets into it would report freed memory.
+  TarArchive archive;
+  const std::string first = pax_record("path", "from-the-first-block");
+  const std::string second = pax_record("uname", "from-the-second-block");
+  archive.header(pax_header('x', first.size()))
+      .data(first)
+      .header(pax_header('x', second.size()))
+      .data(second)
+      .header(file_header("short", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "from-the-first-block");
+  ASSERT_NE(member->uname, nullptr);
+  EXPECT_EQ(std::string(member->uname, member->uname_length),
+      "from-the-second-block");
+}
+
+TEST(TarPaxRecords, ASizeRecordCarriesWhatTheOctalFieldCannot) {
+  // 11 octal digits cap a size at 8 GB, and pax's answer is a decimal record
+  // rather than GNU's base-256. The size is the *declared* one either way: this
+  // archive does not hold 9 GB, so reading the member is where that is found out.
+  const std::string records = pax_record("size", "9000000000");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->size, 9000000000ull);
+  EXPECT_EQ(garc_total_declared_bytes(opened.archive), 9000000000ull);
+  // The archive lied, and the read is what says so rather than the header.
+  std::string data;
+  EXPECT_EQ(read_all(opened.archive, &data), GARC_ERR_CORRUPT);
+}
+
+TEST(TarPaxRecords, ASizeRecordOnAMemberWithNoDataIsIgnored) {
+  // The same rule the header's own size field gets: a directory declares no data
+  // whatever the field says, because seeking by it walks into the next header.
+  // A record is a second way to say the same wrong thing, and it has to meet the
+  // same guard - which is why the predicate is one function and not two.
+  const std::string records = pax_record("size", "4096");
+
+  TarArchive archive;
+  archive.header(pax_header('x', records.size()))
+      .data(records)
+      .header(file_header("adir/", 0, 0755u, '5'))
+      .header(file_header("after", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->type, GARC_MEMBER_DIRECTORY);
+  EXPECT_EQ(member->size, 0u);
+  // And the member after it is still found, which is the assertion that says the
+  // cursor did not move by 4096.
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "after");
+}
+
+TEST(TarPaxRecords, AFractionIsTakenToNanosecondsAndNoFurther) {
+  // pax's mtime is an arbitrary-precision decimal and this library reports
+  // nanoseconds, so the digits past the ninth go. Dropped rather than rounded:
+  // rounding up can carry into the second, and a time this library rounded is not
+  // the time the container said.
+  const std::string records = pax_record("mtime", "1000000000.1234567891");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->mtime_seconds, 1000000000);
+  EXPECT_EQ(member->mtime_nanoseconds, 123456789u);
+  EXPECT_EQ(member->mtime_source, GARC_TIME_PAX_DECIMAL);
+}
+
+TEST(TarPaxRecords, AFractionShorterThanNineDigitsIsScaled) {
+  // `.5` is half a second, not five nanoseconds. A reader that parsed the
+  // fraction as an integer would report 5 and be wrong by a factor of 2×10^8,
+  // which is still a plausible-looking time.
+  const std::string records = pax_record("mtime", "12.5");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->mtime_seconds, 12);
+  EXPECT_EQ(member->mtime_nanoseconds, 500000000u);
+}
+
+TEST(TarPaxRecords, ANegativeTimeWithAFractionRoundsDown) {
+  // The nanoseconds a member reports are unsigned, so -1.5 has to be -2 seconds
+  // and 500000000 nanoseconds. Truncating towards zero would give -1 and
+  // 500000000, which reads as half a second *after* the epoch where the archive
+  // said half a second before it - a wrong answer of exactly one second.
+  const std::string records = pax_record("mtime", "-1.5");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->mtime_seconds, -2);
+  EXPECT_EQ(member->mtime_nanoseconds, 500000000u);
+}
+
+TEST(TarPaxRecords, ANegativeWholeTimeIsNotShifted) {
+  // The control for the test above: with no fraction there is nothing to borrow,
+  // so -1 is -1. A floor written without the "if there is a fraction" guard makes
+  // this -2.
+  const std::string records = pax_record("mtime", "-1");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->mtime_seconds, -1);
+  EXPECT_EQ(member->mtime_nanoseconds, 0u);
+}
+
+TEST(TarPaxRecords, PositiveIdsAreRead) {
+  // The ordinary case, and the control for the negative one below: a signed parser
+  // whose positive half was never exercised would be a parser tested only on the
+  // path with the sign handling in it.
+  const std::string records
+      = pax_record("uid", "1000") + pax_record("gid", "2000");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->uid, 1000);
+  EXPECT_EQ(member->gid, 2000);
+  EXPECT_TRUE(member->ids_valid);
+}
+
+TEST(TarPaxRecords, TheMostNegativeIdIsRead) {
+  // The boundary the "too large" row above sits one side of. Its magnitude does
+  // not fit an int64_t, so `-(int64_t)magnitude` is a conversion out of range -
+  // which produces the right number in a release build and is what UBSan saw in
+  // the base-256 parser. Spelled as a subtraction from the span instead.
+  const std::string records = pax_record("uid", "-9223372036854775808");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->uid, INT64_MIN);
+}
+
+TEST(TarPaxRecords, NegativeIdsAreRead) {
+  // nobody is -2 on some systems, which is a real uid in a real archive.
+  const std::string records
+      = pax_record("uid", "-2") + pax_record("gid", "-2");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->uid, -2);
+  EXPECT_EQ(member->gid, -2);
+  EXPECT_TRUE(member->ids_valid);
+}
+
+TEST(TarPaxRecords, AMalformedRecordBlockIsRefused) {
+  // Every way a record can fail to be one. Each is its own row because each is a
+  // different branch, and a reader that scanned forward for the next newline
+  // instead of trusting the length would accept most of them - reporting whatever
+  // happened to contain a '=' as a member's name.
+  struct Row {
+    const char * what;
+    std::string records;
+  };
+  const std::vector<Row> rows = {
+    {"no length at all", "path=x\n"},
+    {"a length with no space after it", "12path=x\n"},
+    {"a length longer than the block", "9999 path=x\n"},
+    {"a length shorter than the record needs", "3 path=x\n"},
+    {"a length that does not end at a newline", "11 path=xxx"},
+    // Twelve bytes, correctly declared, and no '=' anywhere in them - so this is
+    // refused for the missing separator and not for its length, which the row
+    // above already covers.
+    {"no '=' in the record", "12 pathxxzy\n"},
+    {"an empty key", "5 =x\n"},
+    {"a length that is not a number", "+12 path=x\n"},
+    {"a length with more digits than a number can hold",
+        "99999999999999999999999999 path=x\n"},
+  };
+
+  for (const Row & row : rows) {
+    SCOPED_TRACE(row.what);
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, pax_archive('x', row.records)), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+  }
+}
+
+TEST(TarPaxRecords, ARecordWhoseValueIsNotWhatItsKeyNeedsIsRefused) {
+  // A key this reader acts on, with a value it cannot be. Refused rather than
+  // ignored: a `size=` this library could not read is a member whose length it
+  // does not know, and ignoring the record leaves the octal field's answer
+  // standing as if the record had agreed with it.
+  const std::vector<std::pair<std::string, std::string>> rows = {
+    {"size", "abc"},
+    {"size", "-1"},
+    {"size", "99999999999999999999999999"},
+    {"uid", "abc"},
+    {"uid", "--1"},
+    // A sign with no digits behind it, which is what makes the sign-stripping in
+    // the signed parser reach its unsigned half with nothing to parse.
+    {"uid", "-"},
+    // A magnitude that fits 64 unsigned bits and not 63 signed ones plus the one
+    // extra a negative gets. The boundary is INT64_MAX + 1, so this is the row
+    // that separates "too large" from "the most negative value", which is legal.
+    {"uid", "-9300000000000000000"},
+    // And the same boundary the other way: a positive magnitude that fits 64
+    // unsigned bits and not a signed int64_t, which gets no extra value the way a
+    // negative one does.
+    {"uid", "9223372036854775808"},
+    {"gid", "abc"},
+    {"gid", ""},
+    {"mtime", "1."},
+    {"mtime", ".5"},
+    {"mtime", "1.2.3"},
+    {"mtime", "not-a-time"},
+    {"mtime", "9223372036854775808"},
+    {"mtime", "-9223372036854775808"},
+  };
+
+  for (const auto & row : rows) {
+    SCOPED_TRACE(row.first + "=" + row.second);
+    // gid="" is a deletion rather than a bad value, so it is the one row here
+    // expected to succeed - and it is in the table so that the table is not a
+    // list of things that all happen to fail the same way.
+    const bool deletion = row.second.empty();
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened,
+                  pax_archive('x', pax_record(row.first, row.second))),
+        GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member),
+        deletion ? GARC_OK : GARC_ERR_CORRUPT);
+  }
+}
+
+TEST(TarPaxRecords, AnUnknownKeyIsIgnoredRatherThanRefused) {
+  // pax is an open vocabulary and real writers use it: GNU emits `SCHILY.*` and
+  // `LIBARCHIVE.*` keys routinely. Refusing an unknown key would refuse most of
+  // what `bsdtar --format=pax` writes.
+  const std::string records = pax_record("SCHILY.xattr.user.thing", "value")
+      + pax_record("LIBARCHIVE.creationtime", "1000000000")
+      + pax_record("path", "still-applied");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "still-applied");
+}
+
+TEST(TarPaxRecords, SparseMembersAreRefusedByName) {
+  // Both spellings. **Refused rather than ignored**, because the member's data is
+  // a map of holes and extents: a reader that dropped the records would hand a
+  // caller the map as the file's contents, at a size that is neither what is
+  // stored nor what the file really is. GARC_ERR_UNSUPPORTED says the construct is
+  // not read yet; silence would say the file is that.
+  {
+    // pax's spelling, which is what GNU tar writes with --sparse --format=pax.
+    const std::string records = pax_record("GNU.sparse.major", "1")
+        + pax_record("GNU.sparse.minor", "0")
+        + pax_record("GNU.sparse.name", "sparse.bin")
+        + pax_record("GNU.sparse.realsize", "1048579");
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_UNSUPPORTED);
+  }
+  {
+    // GNU's older spelling: typeflag 'S', with the sparse map in the header's
+    // spare bytes. Without a refusal this falls through to GARC_MEMBER_OTHER,
+    // which *carries data* - so the map would be reported as the file.
+    TarArchive archive;
+    archive.header(file_header("sparse.bin", 512, 0644u, 'S'))
+        .data(std::string(512, 'm'))
+        .marker();
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_UNSUPPORTED);
+  }
+}
+
+TEST(TarPaxRecords, AnUnknownKeyStartingLikeSparseIsStillIgnored) {
+  // The control for the refusal above: the check is a prefix, so it has to be the
+  // prefix and not a resemblance. `GNU.sparse` without the dot is a different key,
+  // and refusing it would refuse a key nobody has defined for a reason nobody
+  // stated.
+  const std::string records = pax_record("GNU.sparsely", "no")
+      + pax_record("path", "still-applied");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "still-applied");
+}
+
+TEST(TarPaxRecords, HdrcharsetDecidesWhetherANameIsDeclared) {
+  // The one field in a member that says anything about an encoding, and what it
+  // says depends on a record rather than on the name. Four values, because three
+  // of them mean "undeclared" for three different reasons and a reader that
+  // checked only for BINARY gets the fourth wrong.
+  struct Row {
+    const char * hdrcharset; // nullptr for no record at all
+    GARC_Name_Encoding expected;
+    const char * why;
+  };
+  const std::vector<Row> rows = {
+    {nullptr, GARC_NAME_UTF8,
+        "POSIX says the records are UTF-8, so no record is a declaration"},
+    {"ISO-IR 10646 2000 UTF-8", GARC_NAME_UTF8, "POSIX's spelling, said out loud"},
+    {"BINARY", GARC_NAME_UNDECLARED, "these are bytes and nobody is claiming"},
+    {"ISO-8859-1", GARC_NAME_UNDECLARED,
+        "a charset this library cannot vouch for, which is undeclared for a "
+        "different reason than BINARY and has to reach the same answer"},
+  };
+
+  for (const Row & row : rows) {
+    SCOPED_TRACE(row.why);
+    std::string records = pax_record("path", "a-name-from-a-record");
+    if (row.hdrcharset) {
+      records += pax_record("hdrcharset", row.hdrcharset);
+    }
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+    EXPECT_EQ(name_of(member), "a-name-from-a-record");
+    EXPECT_EQ(member->name_encoding, row.expected);
+  }
+}
+
+TEST(TarPaxRecords, AHeaderFieldNameIsUndeclaredWhateverTheRecordsSay) {
+  // hdrcharset says what the *records* are, so it says nothing about a name that
+  // did not come from one. A reader that set the declaration from the record set
+  // rather than from where the name came from would claim UTF-8 for bytes out of
+  // a ustar field that nothing has ever made a statement about.
+  const std::string records = pax_record("hdrcharset", "ISO-IR 10646 2000 UTF-8")
+      + pax_record("uname", "owner");
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "member");
+  EXPECT_EQ(member->name_encoding, GARC_NAME_UNDECLARED);
+}
+
+TEST(TarPaxRecords, APaxRecordBeatsAGnuCarrier) {
+  // No writer produces both - `--format=gnu` writes carriers and `--format=pax`
+  // writes records - so this pins an order rather than testing a format. pax wins
+  // because pax *has* an override rule and this is an instance of it; two GNU
+  // carriers of the same kind are refused instead, because there the format
+  // defines no order between them.
+  const std::string carried(40, 'c');
+  const std::string records = pax_record("path", "from-the-record");
+
+  TarArchive archive;
+  archive.header(long_header('L', carried.size() + 1))
+      .data(carried + std::string(1, '\0'))
+      .header(pax_header('x', records.size()))
+      .data(records)
+      .header(file_header("truncated", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "from-the-record");
+  EXPECT_EQ(garc_tar_member_variant(opened.archive), GARC_TAR_PAX);
+  // Four blocks of metadata in front of the header, so header_offset is the first
+  // of them whichever mechanism won.
+  EXPECT_EQ(member->header_offset, 0u);
+  EXPECT_EQ(member->data_offset, 5u * kTarBlock);
+}
+
+TEST(TarPaxRecords, AnEmptyRecordBlockSaysNothingRatherThanBeingRefused) {
+  // The difference from an empty GNU carrier, which *is* refused. An `L` with no
+  // payload claims to replace a name and then does not, so the truncated copy in
+  // the header stands as if the carrier had never been there. An `x` with no
+  // records claims nothing about any field, so there is nothing for it to be
+  // wrong about.
+  TarArchive archive;
+  archive.header(pax_header('x', 0))
+      .header(file_header("plain", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "plain");
+  EXPECT_EQ(garc_tar_member_variant(opened.archive), GARC_TAR_USTAR);
+}
+
+TEST(TarPaxRecords, AnXHeaderWithNothingBehindItIsRefused) {
+  // As for a GNU carrier: records that describe a member the archive does not
+  // contain, and reporting a clean end would drop them silently.
+  const std::string records = pax_record("path", "describes-nobody");
+
+  TarArchive archive;
+  archive.header(pax_header('x', records.size())).data(records).marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+}
+
+TEST(TarPaxRecords, AGlobalHeaderWithNothingBehindItIsACleanEnd) {
+  // The asymmetry, and the reason for it. A `g` describes every member after it,
+  // and "none" is a number of members - `tar --concatenate` leaves globals at the
+  // end of what it joined. An `x` describes *the* next member, so its absence is
+  // damage.
+  const std::string records = pax_record("uname", "nobody");
+
+  TarArchive archive;
+  archive.header(pax_header('g', records.size())).data(records).marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_END);
+  EXPECT_EQ(garc_member_count(opened.archive), 0u);
+}
+
+TEST(TarPaxRecords, TheExtraCapIsCheckedBeforeTheRecordsAreAllocated) {
+  // **max_extra_bytes had no path to it until pax.** No tar construct read before
+  // this had an "extra field" for it to bound, so it was a status a test could
+  // assert about and nothing could produce - which is worth saying plainly rather
+  // than leaving the cap looking live.
+  //
+  // As with max_name_bytes, the allocator is armed to fail and the expected answer
+  // is still the *limit*: a reader that allocated first returns OOM and passes any
+  // test that only asks for "not OK".
+  TarArchive archive;
+  archive.header(pax_header('x', 1u << 20)).data(std::string(64, 'r'));
+  std::vector<uint8_t> bytes = archive.bytes();
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+
+  GARC_Limits limits;
+  garc_limits_default(&limits);
+  limits.max_extra_bytes = 512;
+
+  garctest::FailingAllocator allocator(1, 16);
+  GARC_Archive * opened = nullptr;
+  ASSERT_EQ(garc_open_with_allocator(stream, &limits, allocator.get(), &opened),
+      GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened, &member), GARC_ERR_LIMIT_EXTRA_BYTES);
+
+  allocator.stop_failing();
+  garc_close(opened);
+  garc_stream_destroy(stream);
+  EXPECT_EQ(allocator.live(), 0u);
+}
+
+TEST(TarPaxRecords, TheExtraCapBoundsTheSumRatherThanEachHeader) {
+  // The cap that matters is on what the reader is *holding*, not on one header.
+  // Two blocks of 300 bytes are each inside a 512-byte cap and their sum is not,
+  // and a cap applied per header would let a hundred of them through - which is
+  // the same argument as max_total_bytes against max_member_bytes.
+  const std::string first = pax_record("path", std::string(280, 'p'));
+  const std::string second = pax_record("uname", std::string(280, 'u'));
+  ASSERT_GT(first.size(), 256u);
+  ASSERT_LT(first.size(), 512u);
+
+  TarArchive archive;
+  archive.header(pax_header('x', first.size()))
+      .data(first)
+      .header(pax_header('x', second.size()))
+      .data(second)
+      .header(file_header("short", 0))
+      .marker();
+
+  GARC_Limits limits;
+  garc_limits_default(&limits);
+  limits.max_extra_bytes = 512;
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes(), &limits), GARC_OK);
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_LIMIT_EXTRA_BYTES);
+}
+
+TEST(TarPaxRecords, TheExtraCapCountsAGlobalAgainstEveryMemberAfterIt) {
+  // A global's records stay in force, so they stay allocated - and a cap that
+  // forgot them would let a global of the whole cap sit underneath an `x` of the
+  // whole cap for every member in the archive.
+  const std::string global = pax_record("uname", std::string(280, 'g'));
+  const std::string local = pax_record("path", std::string(280, 'p'));
+
+  TarArchive archive;
+  archive.header(pax_header('g', global.size()))
+      .data(global)
+      .header(pax_header('x', local.size()))
+      .data(local)
+      .header(file_header("short", 0))
+      .marker();
+
+  GARC_Limits limits;
+  garc_limits_default(&limits);
+  limits.max_extra_bytes = 512;
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes(), &limits), GARC_OK);
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_LIMIT_EXTRA_BYTES);
+}
+
+TEST(TarPaxRecords, ACapAtExactlyTheRecordSizeDoesNotFire) {
+  // The control for the three tests above. A cap that fired one byte early would
+  // pass all of them, and nothing else separates "the cap works" from "the cap is
+  // off by one".
+  const std::string records = pax_record("path", "a-name");
+
+  GARC_Limits limits;
+  garc_limits_default(&limits);
+  limits.max_extra_bytes = records.size();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records), &limits), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "a-name");
+}
+
+TEST(TarPaxRecords, ZeroMeansUnlimitedForTheExtraCapToo) {
+  const std::string records = pax_record("path", std::string(2000, 'p'));
+
+  GARC_Limits limits;
+  garc_limits_default(&limits);
+  limits.max_extra_bytes = 0;
+  limits.max_name_bytes = 0;
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, pax_archive('x', records), &limits), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->name_length, 2000u);
+}
+
+TEST(TarPaxRecords, ARecordBlockShorterThanDeclaredIsRefused) {
+  TarArchive archive;
+  archive.header(pax_header('x', 600)).data(std::string(500, 'r'));
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+}
+
+TEST(TarPaxRecords, AFailedStepLeavesNoRecordsForTheNextOne) {
+  // The same invariant as for a GNU carrier, and it has to hold separately because
+  // the record set is separate state. A block of rubbish between the records and
+  // the member they describe; the member after must be read from its own header.
+  const std::string records = pax_record("path", "from-a-failed-step");
+
+  TarArchive archive;
+  archive.header(pax_header('x', records.size()))
+      .data(records)
+      .raw(std::vector<uint8_t>(kTarBlock, 0xABu))
+      .header(file_header("after", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "after");
+  EXPECT_EQ(garc_tar_member_variant(opened.archive), GARC_TAR_USTAR);
+}
+
+TEST(TarPaxRecords, AFailedStepDoesNotLoseTheGlobalRecords) {
+  // The other side of that: a *global* record survives a failed step, because it
+  // was never the failed step's to hold. A reader that cleared both sets on entry
+  // would drop a global the archive still says is in force.
+  const std::string global = pax_record("uname", "global-owner");
+
+  TarArchive archive;
+  archive.header(pax_header('g', global.size()))
+      .data(global)
+      .raw(std::vector<uint8_t>(kTarBlock, 0xABu))
+      .header(file_header("after", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "after");
+  ASSERT_NE(member->uname, nullptr);
+  EXPECT_EQ(std::string(member->uname, member->uname_length), "global-owner");
+}
+
+TEST(TarPaxRecords, ReportsOutOfMemoryForTheRecords) {
+  const std::string records = pax_record("path", std::string(400, 'p'));
+
+  TarArchive archive;
+  archive.header(pax_header('x', records.size()))
+      .data(records)
+      .header(file_header("short", 0))
+      .marker();
+  std::vector<uint8_t> bytes = archive.bytes();
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+
+  // Request 0 is the archive; request 1 is the record block.
+  garctest::FailingAllocator allocator(1);
+  GARC_Archive * opened = nullptr;
+  ASSERT_EQ(garc_open_with_allocator(stream, nullptr, allocator.get(), &opened),
+      GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened, &member), GARC_ERR_OOM);
+
+  allocator.stop_failing();
+  garc_close(opened);
+  garc_stream_destroy(stream);
+  EXPECT_EQ(allocator.live(), 0u);
+}
+
+TEST(TarPaxRecords, AFailedReadOfARecordBlockIsForwarded) {
+  const std::string records = pax_record("path", std::string(400, 'p'));
+
+  TarArchive archive;
+  archive.header(pax_header('x', records.size()))
+      .data(records)
+      .header(file_header("short", 0))
+      .marker();
+  std::vector<uint8_t> bytes = archive.bytes();
+
+  BufferSource source(bytes.data(), bytes.size(), false, false);
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+  GARC_Archive * opened = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &opened), GARC_OK);
+
+  source.fail_reads(1);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened, &member), GARC_ERR_IO);
+
+  garc_close(opened);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarPaxRecords, AFailedSkipOfTheRecordPaddingIsForwarded) {
+  const std::string records = pax_record("path", std::string(400, 'p'));
+
+  TarArchive archive;
+  archive.header(pax_header('x', records.size()))
+      .data(records)
+      .header(file_header("short", 0))
+      .marker();
+  std::vector<uint8_t> bytes = archive.bytes();
+
+  BufferSource source(bytes.data(), bytes.size(), true, true);
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+  GARC_Archive * opened = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &opened), GARC_OK);
+
+  source.fail_seeks();
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened, &member), GARC_ERR_IO);
+  EXPECT_GT(source.seeks(), 0u);
+
+  garc_close(opened);
+  garc_stream_destroy(stream);
 }
 
 //-----------------------------------------------------------------------------
