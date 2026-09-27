@@ -126,6 +126,77 @@ int garc_tar_identify(const uint8_t * block, size_t length);
 GARC_Result garc_tar_next(GARC_Archive * archive);
 
 /**
+ * Read exactly @p count bytes of the stream, draining the peek window first.
+ *
+ * The window identification filled is logically part of the stream, so nothing
+ * in this reader may go to ::garc_stream_read directly - a read that skipped the
+ * window would read the first header twice on a file and lose it on a pipe.
+ *
+ * @param archive The archive.
+ * @param destination Where to put them.
+ * @param count How many.
+ * @param out_got Receives how many were actually available, which is less than
+ *   @p count only at the end of the stream.
+ * @return GARC_OK, or a stream failure.
+ */
+GARC_Result garc_tar_read(GARC_Archive * archive, uint8_t * destination,
+    size_t count, size_t * out_got);
+
+/**
+ * Step over @p count bytes.
+ *
+ * The one name this reader skips through, so that the rule about the peek window
+ * has one place to live even though today it has nothing to do here - see the
+ * body for why, and for what would change that.
+ *
+ * @param archive The archive.
+ * @param count How many bytes to step over.
+ * @return GARC_OK, or a stream failure.
+ */
+GARC_Result garc_tar_skip(GARC_Archive * archive, uint64_t count);
+
+/**
+ * The logical read position: the stream's own, less the unread peek window.
+ *
+ * ::garc_stream_tell counts what the stream has served, and identification read
+ * a block ahead - so the two differ by whatever of that block has not been
+ * consumed yet. Reporting the stream's figure would put the *first* member's
+ * header at offset 512 in every archive, which is a plausible wrong answer: it
+ * is right for every member after it.
+ *
+ * @param archive The archive.
+ * @return The offset of the next byte this reader will consume.
+ */
+uint64_t garc_tar_offset(const GARC_Archive * archive);
+
+/**
+ * Read the payload of a GNU `L` or `K` member into a buffer.
+ *
+ * The payload is a NUL-terminated string of @p declared bytes, padded out to a
+ * whole block; GNU writes `strlen + 1`. On return the buffer holds the string
+ * without its terminator and the stream is positioned at the next header.
+ *
+ * @param archive The archive, whose allocator and caps are used.
+ * @param declared The `L`/`K` member's declared size.
+ * @param buffer Where to put it.
+ * @return GARC_OK, GARC_ERR_LIMIT_NAME_BYTES when the cap refuses it,
+ *   GARC_ERR_CORRUPT for a payload that is not a string, or GARC_ERR_OOM.
+ */
+GARC_Result garc_tar_read_long_field(
+    GARC_Archive * archive, uint64_t declared, GARC_Tar_Buffer * buffer);
+
+/**
+ * Release whatever the tar reader allocated.
+ *
+ * Called from garc_close() for every archive, not only a tar one: the buffers
+ * start NULL, so this is a pair of no-ops for a format that never used them, and
+ * a switch on the format here would be a branch no input can take.
+ *
+ * @param archive The archive.
+ */
+void garc_tar_release(GARC_Archive * archive);
+
+/**
  * Parse an unsigned numeric header field.
  *
  * Handles both encodings a tar field can carry, because every size field needs

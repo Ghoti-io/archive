@@ -19,9 +19,10 @@ through a compress decoder. This library is the container, not the compression.
 
 ## Status
 
-**Reads tar.** v7 and ustar headers in full, from a file or a pipe; GNU's
-long-name members and pax's extended records are **refused by name** with
-`GARC_ERR_UNSUPPORTED` rather than misreported, and are the next commits. No zip
+**Reads tar.** v7 and ustar headers in full, plus GNU's `L` and `K` members -
+the ones that carry a name or a link target too long for a header field - from a
+file or a pipe. pax's extended records are **refused by name** with
+`GARC_ERR_UNSUPPORTED` rather than misreported, and are the next commit. No zip
 yet, and no filesystem layer.
 
 The fixtures are written by GNU tar 1.35 in a pinned container and the
@@ -29,10 +30,11 @@ expectations come from Python 3.13.5's `tarfile` and libarchive 3.7.4's bsdtar,
 so a passing test is three implementations agreeing rather than this library
 agreeing with itself.
 
-Build clean under GCC 14 with `-Werror`; 133 tests; 99.7% line coverage, the
-remaining line being a defensive arm no input can reach; clean under Valgrind and
-under ASan+UBSan; `check-symbols`, `check-aliasing` and `check-corpus-hashes`
-green; two fuzz harnesses.
+Build clean under GCC 14 with `-Werror`; 154 tests; 99.6% line coverage, the
+three remaining lines being a defensive arm no input can reach and a guard that
+is live only where `size_t` is 32 bits; clean under Valgrind and under
+ASan+UBSan; `check-symbols`, `check-aliasing` and `check-corpus-hashes` green;
+two fuzz harnesses.
 
 ## A minimal complete program
 
@@ -133,6 +135,10 @@ buffer. Three things about that loop:
   normal and cheap - seeking when the stream can, discarding when it cannot.
 - **A member is borrowed**, valid until the next `garc_next()`, and its name is
   bytes plus a length rather than a NUL-terminated string.
+- **Some members are not members.** tar puts a name too long for its header
+  fields in a block of its own in front of the real one. Those never reach you:
+  a listing that showed a file called `././@LongLink` would be reporting an
+  artefact of the format, and the member behind it under a truncated name.
 
 Every field of a member is **what the container declared**, not what this library
 believes. A member's `size` is the size the header gave; whether that many bytes

@@ -146,6 +146,32 @@ inline TarHeader file_header(const std::string & name, uint64_t size,
   return header;
 }
 
+/**
+ * A GNU `L` or `K` carrier header for a payload of `declared` bytes.
+ *
+ * The name is `././@LongLink`, which is what GNU writes and what a reader must
+ * not report as a member. `declared` is taken rather than derived from the
+ * payload, because half the cases here are a declaration that disagrees with the
+ * bytes behind it.
+ *
+ * @param typeflag 'L' for a name, 'K' for a link target.
+ * @param declared The size field: GNU writes the string's length plus one, for
+ *   the terminator.
+ */
+inline TarHeader long_header(char typeflag, uint64_t declared) {
+  TarHeader header;
+  header.field(0, 100, "././@LongLink");
+  header.octal(100, 8, 0644u);
+  header.octal(108, 8, 0);
+  header.octal(116, 8, 0);
+  header.octal(124, 12, declared);
+  header.octal(136, 12, 0);
+  header.bytes[156] = static_cast<uint8_t>(typeflag);
+  header.gnu();
+  header.checksum();
+  return header;
+}
+
 /** An archive: headers and data blocks, with the end marker appended. */
 class TarArchive {
 public:

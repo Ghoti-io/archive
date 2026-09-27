@@ -165,6 +165,13 @@ const char * const readable[] = {
   // fields carries no extended records and reads as ustar - which it should,
   // rather than being refused for the format it declares.
   "pax-basic.tar",
+  // GNU's carriers. These were refused until the commit that read them, so they
+  // are here as well as in the tests below: the reference comparison is what says
+  // the name a carrier produced is the name the archive holds, rather than only
+  // that something was produced.
+  "gnu-longname.tar",
+  "gnu-longname-blocks.tar",
+  "gnu-longlink.tar",
 };
 
 } // namespace
@@ -294,11 +301,12 @@ TEST(TarVariant, APrefixedNameIsJoinedWithASlash) {
   garc_stream_destroy(stream);
 }
 
-TEST(TarVariant, GnuLongNameMembersAreRefusedByName) {
-  // Not yet read, and the refusal is the point: handing a caller a member called
-  // "././@LongLink" would report an artefact of the format as a file. The
-  // members before it are read normally, which is what makes this a refusal of
-  // one construct rather than of the archive.
+TEST(TarVariant, AGnuLongNameReplacesTheHeadersTruncatedCopy) {
+  // GNU writes an 'L' member whose data is the next member's name, and then a
+  // header holding a *truncated* copy of that name in its own field. So there are
+  // two wrong answers a reader can give and both look like a name: reporting the
+  // carrier itself as a file called "././@LongLink", and reporting the truncated
+  // copy. This asserts against neither happening.
   std::vector<uint8_t> bytes = read_fixture(data_path("gnu-longname.tar"));
   ASSERT_FALSE(bytes.empty());
 
@@ -308,19 +316,172 @@ TEST(TarVariant, GnuLongNameMembersAreRefusedByName) {
   GARC_Archive * archive = nullptr;
   ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
 
-  size_t read_before_refusal = 0;
+  size_t over_the_field = 0;
   const GARC_Member * member = nullptr;
   GARC_Result result;
   while ((result = garc_next(archive, &member)) == GARC_OK) {
-    ++read_before_refusal;
+    const std::string name = member_name(member);
+    EXPECT_EQ(name.find("@LongLink"), std::string::npos)
+        << "the carrier was reported as a member";
+    if (name.size() > 100u) {
+      ++over_the_field;
+      // The variant is GNU even though the carrier is what said so, because a
+      // member read through one was not read as a ustar member.
+      EXPECT_EQ(garc_tar_member_variant(archive), GARC_TAR_GNU);
+    }
   }
-  EXPECT_EQ(result, GARC_ERR_UNSUPPORTED);
-  EXPECT_GT(read_before_refusal, 0u)
-      << "the refusal came before any member, so it is not a refusal of the "
-         "'L' member specifically";
+  EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+  EXPECT_GT(over_the_field, 0u)
+      << "no name longer than the 100-byte field, so nothing here needed a "
+         "carrier and the test asserts nothing";
 
   garc_close(archive);
   garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, AGnuLongNamePayloadSpanningBlocksIsReadWhole) {
+  // The payload is a member's data: padded to a block, and longer than one when
+  // the name is. A reader that read it with a single 512-byte read would pass on
+  // every name in gnu-longname.tar - the longest is 108 bytes - and truncate here
+  // at exactly 512, which is a name rather than an error.
+  std::vector<uint8_t> bytes = read_fixture(data_path("gnu-longname-blocks.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  size_t longest = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    longest = member->name_length > longest ? member->name_length : longest;
+    EXPECT_NE(member->name_length, 512u)
+        << "a name of exactly one block is what a single-block read produces";
+  }
+  EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+  EXPECT_GT(longest, 512u)
+      << "no name longer than one block, so the multi-block payload was never "
+         "exercised - the fixture is what makes this test mean anything";
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarVariant, AGnuLongLinkTargetIsNotTruncated) {
+  // 'K' is the same mechanism for the link target, and a reader that implements
+  // 'L' and not 'K' truncates this silently at 100 bytes. A truncated symlink
+  // target is a path to somewhere else, so it is a wrong answer of the worst kind
+  // - which is why the fixture also holds a symlink whose target *does* fit, so
+  // that the field and the carrier are both exercised in one archive.
+  std::vector<uint8_t> bytes = read_fixture(data_path("gnu-longlink.tar"));
+  ASSERT_FALSE(bytes.empty());
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+  size_t from_the_field = 0;
+  size_t from_a_carrier = 0;
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    ASSERT_EQ(member->type, GARC_MEMBER_SYMLINK) << member_name(member);
+    ASSERT_NE(member->link_target, nullptr) << member_name(member);
+    if (member->link_target_length > 100u) {
+      ++from_a_carrier;
+      EXPECT_EQ(garc_tar_member_variant(archive), GARC_TAR_GNU);
+    } else {
+      ++from_the_field;
+    }
+  }
+  EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+  EXPECT_EQ(from_a_carrier, 1u) << "no target needed a 'K' member";
+  EXPECT_EQ(from_the_field, 1u)
+      << "no target came from the header field, so a reader that read every "
+         "target from a carrier would pass this";
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+//-----------------------------------------------------------------------------
+// Offsets
+//-----------------------------------------------------------------------------
+
+TEST(TarOffsets, TheFirstMemberIsAtTheStartOfTheStream) {
+  // Identification reads a block ahead and keeps it, so the stream's own position
+  // is a block past the first header while that window is being drained. Reporting
+  // it put every archive's first member at offset 512 and every member after it in
+  // the right place - which is the shape that looks like a working field.
+  for (const char * fixture : readable) {
+    SCOPED_TRACE(fixture);
+    std::vector<uint8_t> bytes = read_fixture(data_path(fixture));
+    ASSERT_FALSE(bytes.empty());
+
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+        GARC_OK);
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(garc_next(archive, &member), GARC_OK);
+    EXPECT_EQ(member->header_offset, 0u);
+
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
+}
+
+TEST(TarOffsets, EveryMemberStartsOnABlockAndItsDataFollowsItsHeader) {
+  // Two invariants that together pin the pair of fields, rather than asserting
+  // numbers read off this reader's own answers:
+  //
+  //   - both offsets are multiples of 512, because everything in a tar is;
+  //   - the data begins at least one block after the header begins, and exactly
+  //     one when nothing was carried in front of it.
+  //
+  // The second is what says header_offset points at the *carrier* for a member
+  // that had one: gnu-longname-blocks.tar's members sit three blocks apart, one
+  // carrier and two payload blocks, and a reader reporting the real header would
+  // make the gap one everywhere.
+  for (const char * fixture : readable) {
+    SCOPED_TRACE(fixture);
+    std::vector<uint8_t> bytes = read_fixture(data_path(fixture));
+    ASSERT_FALSE(bytes.empty());
+
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+        GARC_OK);
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+
+    uint64_t previous_data_end = 0;
+    const GARC_Member * member = nullptr;
+    GARC_Result result;
+    while ((result = garc_next(archive, &member)) == GARC_OK) {
+      SCOPED_TRACE(member_name(member));
+      EXPECT_EQ(member->header_offset % GARC_TAR_BLOCK, 0u);
+      EXPECT_EQ(member->data_offset % GARC_TAR_BLOCK, 0u);
+      EXPECT_GE(member->data_offset, member->header_offset + GARC_TAR_BLOCK);
+      // Nothing between the end of one member's data and the start of the next
+      // member's first block: a gap would mean a block this reader consumed and
+      // reported to nobody.
+      EXPECT_EQ(member->header_offset, previous_data_end);
+      const uint64_t remainder = member->size % GARC_TAR_BLOCK;
+      previous_data_end = member->data_offset + member->size
+          + (remainder ? GARC_TAR_BLOCK - remainder : 0u);
+    }
+    EXPECT_EQ(result, GARC_END) << garc_result_string(result);
+
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
 }
 
 TEST(TarVariant, APaxArchiveWithNoExtendedRecordsReadsAsUstar) {

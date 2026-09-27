@@ -32,6 +32,7 @@
 using garctest::BufferSource;
 using garctest::file_header;
 using garctest::kTarBlock;
+using garctest::long_header;
 using garctest::TarArchive;
 using garctest::TarHeader;
 
@@ -722,6 +723,484 @@ TEST(TarType, V7DoesNotReadThePrefixField) {
 }
 
 //-----------------------------------------------------------------------------
+// GNU's carriers: the 'L' and 'K' members
+//-----------------------------------------------------------------------------
+//
+// The generated corpus has what GNU tar writes: a payload of exactly strlen + 1,
+// one carrier per field, and a real header behind it. Everything below is a
+// payload no writer produces, and every one of them has a plausible wrong answer
+// rather than a crash - a name that is a prefix of the right one, a name applied
+// to the wrong member, or a member that is really an artefact of the format.
+
+TEST(TarGnuCarrier, TheCarrierIsNeverReportedAsAMember) {
+  // Hand-built, with the shortest possible long name, so that the assertion is
+  // about the carrier rather than about a length. A reader that simply walks
+  // headers reports two members here and the first is called "././@LongLink".
+  const std::string name = "a-name-that-came-from-the-carrier";
+
+  TarArchive archive;
+  archive.header(long_header('L', name.size() + 1))
+      .data(name + std::string(1, '\0'))
+      .header(file_header("truncated-copy", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), name);
+  // The variant is GNU although this header's magic is ustar's: the carrier is
+  // GNU's construct, and a member read through one was not read as ustar.
+  EXPECT_EQ(garc_tar_member_variant(opened.archive), GARC_TAR_GNU);
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_END);
+  EXPECT_EQ(garc_member_count(opened.archive), 1u);
+}
+
+TEST(TarGnuCarrier, ALinkTargetCarrierAndANameCarrierApplyTogether) {
+  // Both in front of one header, which is legal and which GNU will write when a
+  // symlink has a long name *and* a long target. A reader that handles one
+  // carrier and then treats the next block as the header reports the second
+  // carrier as the member.
+  const std::string name = "a-very-long-name";
+  const std::string target = "a-very-long-target";
+
+  TarArchive archive;
+  archive.header(long_header('L', name.size() + 1))
+      .data(name + std::string(1, '\0'))
+      .header(long_header('K', target.size() + 1))
+      .data(target + std::string(1, '\0'))
+      .header(file_header("short", 0, 0777u, '2'))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), name);
+  ASSERT_NE(member->link_target, nullptr);
+  EXPECT_EQ(std::string(member->link_target, member->link_target_length),
+      target);
+  EXPECT_EQ(member->type, GARC_MEMBER_SYMLINK);
+  // Three blocks of carrier and payload in front of the header, so this is also
+  // the assertion that header_offset points at the first of them: a caller
+  // re-reading the member from a later offset would get the truncated name.
+  EXPECT_EQ(member->header_offset, 0u);
+  EXPECT_EQ(member->data_offset, 5u * kTarBlock);
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_END);
+}
+
+TEST(TarGnuCarrier, ACarrierAppliesOnlyToTheMemberBehindIt) {
+  // The pax rule stated for GNU: a carrier describes the *next* member and
+  // nothing after it. A reader that left the name in place would give both
+  // members the long name and still round-trip, which is the shape that reads as
+  // working.
+  const std::string name = "only-the-first-member-has-this-name";
+
+  TarArchive archive;
+  archive.header(long_header('L', name.size() + 1))
+      .data(name + std::string(1, '\0'))
+      .header(file_header("first", 0))
+      .header(file_header("second", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), name);
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "second");
+  // And the variant goes back to what the magic says, because this member was
+  // not read through a carrier.
+  EXPECT_EQ(garc_tar_member_variant(opened.archive), GARC_TAR_USTAR);
+}
+
+TEST(TarGnuCarrier, AShorterNameAfterALongerOneIsNotTheLongerOnesTail) {
+  // The buffer is grown and kept across members, so a second, shorter name is
+  // written into storage that still holds the first. A length not reset with the
+  // contents reports the first name's tail behind the second - a name that is a
+  // real path with extra components, which is exactly the answer a traversal
+  // check would be asked about.
+  const std::string longer(400, 'L');
+  const std::string shorter(20, 's');
+
+  TarArchive archive;
+  archive.header(long_header('L', longer.size() + 1))
+      .data(longer + std::string(1, '\0'))
+      .header(file_header("first", 0))
+      .header(long_header('L', shorter.size() + 1))
+      .data(shorter + std::string(1, '\0'))
+      .header(file_header("second", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), longer);
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(member->name_length, shorter.size());
+  EXPECT_EQ(name_of(member), shorter);
+}
+
+TEST(TarGnuCarrier, APayloadWithContentBehindItsTerminatorIsRefused) {
+  // The ambiguous shape, and the reason it is refused rather than read. The
+  // payload declares 40 bytes and holds "safe/path", a NUL, and then more path:
+  // this reader would report "safe/path" and a reader using the declared length
+  // would report the whole thing. A member whose name depends on which reader is
+  // asked is how a checked name and an extracted name come apart, so neither
+  // answer is given.
+  std::string payload = "safe/path";
+  payload.push_back('\0');
+  payload += "../../etc/cron.d/x";
+  payload.push_back('\0');
+
+  TarArchive archive;
+  archive.header(long_header('L', payload.size()))
+      .data(payload)
+      .header(file_header("short", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+}
+
+TEST(TarGnuCarrier, APayloadWithNoTerminatorAtAllIsRead) {
+  // The control for the test above, and a real variation: a writer that wrote
+  // strlen rather than strlen + 1 leaves no terminator, and the payload is then
+  // the whole field. Refusing this would reject archives over a spelling that
+  // carries no ambiguity at all - there is exactly one reading.
+  const std::string name(30, 'n');
+
+  TarArchive archive;
+  archive.header(long_header('L', name.size()))
+      .data(name)
+      .header(file_header("short", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), name);
+}
+
+TEST(TarGnuCarrier, AnEmptyPayloadIsRefusedRatherThanFallingBackToTheHeader) {
+  // A carrier that carries nothing. The tempting reading is "no name here, use
+  // the header's" - which silently produces the truncated name the carrier
+  // existed to replace, so the archive reads as complete and one member is called
+  // something else.
+  //
+  // Three spellings of empty, because the size field and the bytes can each say
+  // it: a declared size of zero, a declared size whose bytes are all NUL, and a
+  // 'K' rather than an 'L' - a link target the format cannot express as empty.
+  {
+    TarArchive archive;
+    archive.header(long_header('L', 0))
+        .header(file_header("truncated", 0))
+        .marker();
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+  }
+  {
+    TarArchive archive;
+    archive.header(long_header('L', 4))
+        .data(std::string(4, '\0'))
+        .header(file_header("truncated", 0))
+        .marker();
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+  }
+  {
+    TarArchive archive;
+    archive.header(long_header('K', 0))
+        .header(file_header("link", 0, 0777u, '2'))
+        .marker();
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+  }
+}
+
+TEST(TarGnuCarrier, TwoCarriersOfTheSameKindAreRefused) {
+  // Each carrier allocates its declared size, so a chain of them turns a few
+  // hundred bytes of archive into as many allocations of the cap as there are
+  // links. libarchive refuses the same shape for the same reason. The other
+  // reading, last-one-wins, would make a member's name depend on how far a
+  // reader got before it stopped.
+  const std::string first(40, 'f');
+  const std::string second(40, 's');
+
+  TarArchive archive;
+  archive.header(long_header('L', first.size() + 1))
+      .data(first + std::string(1, '\0'))
+      .header(long_header('L', second.size() + 1))
+      .data(second + std::string(1, '\0'))
+      .header(file_header("short", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+}
+
+TEST(TarGnuCarrier, ACarrierWithNothingBehindItIsRefused) {
+  // The end of the archive where a header was owed. Both spellings: the marker,
+  // and the stream simply stopping. Treating either as a clean end would report a
+  // complete archive whose last member's name was read and then discarded.
+  const std::string name(40, 'n');
+  const std::string payload = name + std::string(1, '\0');
+
+  {
+    TarArchive archive;
+    archive.header(long_header('L', payload.size()))
+        .data(payload)
+        .marker();
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+  }
+  {
+    TarArchive archive;
+    archive.header(long_header('L', payload.size())).data(payload);
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+  }
+}
+
+TEST(TarGnuCarrier, APayloadShorterThanDeclaredIsRefused) {
+  // The carrier says 600 bytes and the archive holds one block. Reporting the 512
+  // bytes that were there would be a name that is a prefix of the real one, which
+  // is a path - and a prefix of a path is a different path, not a damaged one.
+  TarArchive archive;
+  archive.header(long_header('L', 600)).data(std::string(500, 'n'));
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+}
+
+TEST(TarGnuCarrier, TheNameCapIsCheckedBeforeThePayloadIsAllocated) {
+  // **This is the one place in the tar reader where a length is declared in one
+  // block and the bytes arrive in the next**, so it is the one place a cap has to
+  // fire on the declaration rather than on what was read. Checking afterwards
+  // would mean allocating whatever a hostile archive asked for in order to find
+  // out it was too much.
+  //
+  // The proof is the allocator: it is set to fail its next request, and the
+  // expected answer is still the *limit*. A reader that allocated first would
+  // return GARC_ERR_OOM here and pass a test that only asserted "not OK".
+  TarArchive archive;
+  archive.header(long_header('L', 1u << 20))
+      .data(std::string(64, 'n'));
+  std::vector<uint8_t> bytes = archive.bytes();
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+
+  GARC_Limits limits;
+  garc_limits_default(&limits);
+  limits.max_name_bytes = 64;
+
+  // One allocation for the archive itself, then fail everything after it.
+  garctest::FailingAllocator allocator(1, 16);
+  GARC_Archive * opened = nullptr;
+  ASSERT_EQ(garc_open_with_allocator(stream, &limits, allocator.get(), &opened),
+      GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened, &member), GARC_ERR_LIMIT_NAME_BYTES);
+
+  allocator.stop_failing();
+  garc_close(opened);
+  garc_stream_destroy(stream);
+  EXPECT_EQ(allocator.live(), 0u);
+}
+
+TEST(TarGnuCarrier, TheNameCapAllowsExactlyOneByteForTheTerminator) {
+  // The boundary, from both sides. GNU's payload is the name *and* its
+  // terminator, and the cap is on the name - so a cap of N has to accept a
+  // payload of N + 1 and refuse one of N + 2. A check written against the payload
+  // rather than the name would refuse a name of exactly N, which is a cap that is
+  // off by one in the direction nothing notices.
+  const size_t cap = 64;
+
+  {
+    const std::string name(cap, 'n');
+    TarArchive archive;
+    archive.header(long_header('L', name.size() + 1))
+        .data(name + std::string(1, '\0'))
+        .header(file_header("short", 0))
+        .marker();
+
+    GARC_Limits limits;
+    garc_limits_default(&limits);
+    limits.max_name_bytes = cap;
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, archive.bytes(), &limits), GARC_OK);
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+    EXPECT_EQ(member->name_length, cap);
+  }
+  {
+    // One byte longer. The payload is cap + 2, which the declaration check
+    // refuses on its own.
+    const std::string name(cap + 1u, 'n');
+    TarArchive archive;
+    archive.header(long_header('L', name.size() + 1))
+        .data(name + std::string(1, '\0'))
+        .header(file_header("short", 0))
+        .marker();
+
+    GARC_Limits limits;
+    garc_limits_default(&limits);
+    limits.max_name_bytes = cap;
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, archive.bytes(), &limits), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_LIMIT_NAME_BYTES);
+  }
+  {
+    // And the case the declaration check *cannot* see: a payload of cap + 1 whose
+    // string really is cap + 1 bytes long, because the writer left no terminator.
+    // garc_reader_account() is what refuses this, which is why the declaration
+    // check is allowed its one byte of slack rather than being made exact.
+    const std::string name(cap + 1u, 'n');
+    TarArchive archive;
+    archive.header(long_header('L', name.size()))
+        .data(name)
+        .header(file_header("short", 0))
+        .marker();
+
+    GARC_Limits limits;
+    garc_limits_default(&limits);
+    limits.max_name_bytes = cap;
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, archive.bytes(), &limits), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_LIMIT_NAME_BYTES);
+  }
+}
+
+TEST(TarGnuCarrier, ACarrierIsNotCountedAsAMemberNorAgainstTheByteCaps) {
+  // A carrier has a size and a name and is not a member, so neither the member
+  // count nor the declared-byte total may move for it. A reader that accounted
+  // for carriers would make max_members refuse an archive of half as many
+  // members as it says, and the failure would look like a cap set too low.
+  const std::string name(300, 'n');
+
+  TarArchive archive;
+  archive.header(long_header('L', name.size() + 1))
+      .data(name + std::string(1, '\0'))
+      .header(file_header("first", 10)).data(std::string(10, 'a'))
+      .header(long_header('L', name.size() + 1))
+      .data(name + std::string(1, '\0'))
+      .header(file_header("second", 10)).data(std::string(10, 'b'))
+      .marker();
+
+  GARC_Limits limits;
+  garc_limits_default(&limits);
+  limits.max_members = 2;
+  limits.max_total_bytes = 20;
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes(), &limits), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(garc_next(opened.archive, &member), GARC_END);
+  EXPECT_EQ(garc_member_count(opened.archive), 2u);
+  // 20, not 622: the carriers' 301 bytes each are metadata.
+  EXPECT_EQ(garc_total_declared_bytes(opened.archive), 20u);
+}
+
+TEST(TarGnuCarrier, AFailedStepLeavesNoNameForTheNextOne) {
+  // The claim on a carried name is cleared at the start of every step, not where
+  // the name is applied. Without that, a caller that carried on after a failure
+  // would see the failed step's name on whatever header it reached next - a name
+  // from one part of the archive attached to a member from another, which is a
+  // real path on the wrong file.
+  //
+  // The archive is built so that the failure lands *after* the carrier succeeded
+  // and *before* a member that is perfectly good: a carrier, its payload, a block
+  // of rubbish, and then a real header. The first step reads the name and then
+  // fails on the rubbish; the second must report "after" under its own name.
+  const std::string carried(40, 'c');
+
+  TarArchive archive;
+  archive.header(long_header('L', carried.size() + 1))
+      .data(carried + std::string(1, '\0'))
+      .raw(std::vector<uint8_t>(kTarBlock, 0xABu))
+      .header(file_header("after", 0))
+      .marker();
+
+  Opened opened;
+  ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
+  ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
+  EXPECT_EQ(name_of(member), "after");
+  EXPECT_EQ(member->name_length, 5u);
+  // And the variant, which the carrier also sets.
+  EXPECT_EQ(garc_tar_member_variant(opened.archive), GARC_TAR_USTAR);
+}
+
+TEST(TarGnuCarrier, ReportsOutOfMemoryForThePayload) {
+  // The carrier's payload is the only allocation the tar reader makes after the
+  // archive itself, so it is the only one that can fail. An OOM here has to be
+  // OOM rather than a corrupt archive: the bytes were fine.
+  const std::string name(400, 'n');
+
+  TarArchive archive;
+  archive.header(long_header('L', name.size() + 1))
+      .data(name + std::string(1, '\0'))
+      .header(file_header("short", 0))
+      .marker();
+  std::vector<uint8_t> bytes = archive.bytes();
+
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+      GARC_OK);
+
+  // Request 0 is the archive; request 1 is the payload.
+  garctest::FailingAllocator allocator(1);
+  GARC_Archive * opened = nullptr;
+  ASSERT_EQ(garc_open_with_allocator(stream, nullptr, allocator.get(), &opened),
+      GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened, &member), GARC_ERR_OOM);
+
+  allocator.stop_failing();
+  garc_close(opened);
+  garc_stream_destroy(stream);
+  EXPECT_EQ(allocator.live(), 0u);
+}
+
+//-----------------------------------------------------------------------------
 // Limits
 //-----------------------------------------------------------------------------
 
@@ -1243,6 +1722,72 @@ TEST(TarStreamFailure, AFailedSkipIsForwarded) {
   // And skip_member reports it too, rather than claiming to have skipped.
   EXPECT_EQ(garc_skip_member(opened), GARC_ERR_INVALID)
       << "there should be no current member after a failed next";
+
+  garc_close(opened);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarStreamFailure, AFailedReadOfACarrierPayloadIsForwarded) {
+  // The payload is read from the stream after the carrier's header, so a failure
+  // there is a failure of the archive rather than a corrupt name. GARC_ERR_IO and
+  // not GARC_ERR_CORRUPT: the bytes were never seen, so nothing is known about
+  // them, and a reader that reported corruption would accuse the archive of the
+  // stream's fault.
+  const std::string name(400, 'n');
+
+  TarArchive archive;
+  archive.header(long_header('L', name.size() + 1))
+      .data(name + std::string(1, '\0'))
+      .header(file_header("short", 0))
+      .marker();
+  std::vector<uint8_t> bytes = archive.bytes();
+
+  BufferSource source(bytes.data(), bytes.size(), false, false);
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+  GARC_Archive * opened = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &opened), GARC_OK);
+
+  // Armed after the open, because identification reads the first block and an
+  // arm before it would test a failure during identification instead - which is
+  // a different branch, already covered above.
+  source.fail_reads(1);
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened, &member), GARC_ERR_IO);
+
+  garc_close(opened);
+  garc_stream_destroy(stream);
+}
+
+TEST(TarStreamFailure, AFailedSkipOfACarriersPaddingIsForwarded) {
+  // The payload is padded to a block like any member's data, so there is a skip
+  // between the last byte of the name and the header it describes. On a seekable
+  // stream that skip is a seek, and a seek that fails leaves the cursor somewhere
+  // unknown - so the only safe answer is the failure, not the name that was
+  // already read.
+  const std::string name(400, 'n');
+
+  TarArchive archive;
+  archive.header(long_header('L', name.size() + 1))
+      .data(name + std::string(1, '\0'))
+      .header(file_header("short", 0))
+      .marker();
+  std::vector<uint8_t> bytes = archive.bytes();
+
+  BufferSource source(bytes.data(), bytes.size(), true, true);
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+  GARC_Archive * opened = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &opened), GARC_OK);
+
+  source.fail_seeks();
+
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened, &member), GARC_ERR_IO);
+  EXPECT_GT(source.seeks(), 0u)
+      << "no seek was attempted, so the failure came from somewhere else and "
+         "this test is not asserting what it says";
 
   garc_close(opened);
   garc_stream_destroy(stream);

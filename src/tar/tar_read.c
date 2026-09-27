@@ -21,10 +21,10 @@
 /**
  * @file
  *
- * Reading tar: v7 and ustar headers.
+ * Reading tar: v7, ustar, and GNU's long-name members.
  *
- * GNU's long-name members and pax's extended records are separate commits of
- * the same phase; where this file would have to change for them, it says so.
+ * pax's extended records are a separate commit of the same phase; where this
+ * file would have to change for them, it says so.
  *
  * Reference documents are named in tar_internal.h.
  */
@@ -318,38 +318,38 @@ static GARC_Result tar_read_header(GARC_Archive * archive,
   return GARC_OK;
 }
 
-/**
- * Read one whole block, or report how much was there.
- *
- * A callback stream may serve fewer bytes than asked for without being at its
- * end - a pipe does it constantly - so a single read of 512 bytes is not a
- * block. Accumulating here is what keeps "the stream ended" (zero bytes) apart
- * from "the stream ended inside a header" (one to 511), which are the two
- * answers the caller has to tell apart.
- *
- * @param archive The archive.
- * @param block Destination of GARC_TAR_BLOCK bytes.
- * @param out_got Receives how many bytes were available, 0 to GARC_TAR_BLOCK.
- * @return GARC_OK, or a stream failure.
- */
-static GARC_Result tar_read_block(
-    GARC_Archive * archive, uint8_t * block, size_t * out_got) {
+uint64_t garc_tar_offset(const GARC_Archive * archive) {
+  const uint64_t served = garc_stream_tell(archive->stream);
+  const uint64_t pending
+      = (uint64_t)(archive->peek_length - archive->peek_consumed);
+  // The window was filled by reading `peek_length` bytes from the stream, so
+  // what it has served is never less than what is still unread of it.
+  return served - pending;
+}
+
+GARC_Result garc_tar_read(GARC_Archive * archive, uint8_t * destination,
+    size_t count, size_t * out_got) {
   size_t total = 0;
 
   // Whatever identification looked at comes first. Without this the first
   // header would be read twice on a seekable stream and skipped on a pipe.
   if (archive->peek_consumed < archive->peek_length) {
     size_t available = archive->peek_length - archive->peek_consumed;
-    size_t take = available < GARC_TAR_BLOCK ? available : GARC_TAR_BLOCK;
-    memcpy(block, archive->peek + archive->peek_consumed, take);
+    size_t take = available < count ? available : count;
+    memcpy(destination, archive->peek + archive->peek_consumed, take);
     archive->peek_consumed += take;
     total = take;
   }
 
-  while (total < GARC_TAR_BLOCK) {
+  // A callback stream may serve fewer bytes than asked for without being at its
+  // end - a pipe does it constantly - so a single read is not an answer.
+  // Accumulating here is what keeps "the stream ended" (zero bytes) apart from
+  // "the stream ended partway through" (one to count - 1), which are the two
+  // answers a caller has to tell apart.
+  while (total < count) {
     size_t got = 0;
     GARC_Result result = garc_stream_read(
-        archive->stream, block + total, GARC_TAR_BLOCK - total, &got);
+        archive->stream, destination + total, count - total, &got);
     if (result != GARC_OK) {
       return result;
     }
@@ -362,6 +362,33 @@ static GARC_Result tar_read_block(
   return GARC_OK;
 }
 
+GARC_Result garc_tar_skip(GARC_Archive * archive, uint64_t count) {
+  // **No peek window to drain here, and that is a fact rather than an
+  // assumption.** Every skip in this reader is reached after a whole 512-byte
+  // block has been read, and the window is one block - so reading a block always
+  // empties it. A drain was written here first and `make coverage` showed it
+  // never executed; dead handling in a reader is worse than absent, because it
+  // reads as a guard somebody relies on.
+  //
+  // If a format ever wants to skip before reading a block, this is the function
+  // that has to learn about the window, and the two call sites in garc_tar_next()
+  // and garc_tar_read_long_field() are what establish the rule today.
+  return count ? garc_stream_skip(archive->stream, count) : GARC_OK;
+}
+
+/**
+ * Read one whole block, or report how much was there.
+ *
+ * @param archive The archive.
+ * @param block Destination of GARC_TAR_BLOCK bytes.
+ * @param out_got Receives how many bytes were available, 0 to GARC_TAR_BLOCK.
+ * @return GARC_OK, or a stream failure.
+ */
+static GARC_Result tar_read_block(
+    GARC_Archive * archive, uint8_t * block, size_t * out_got) {
+  return garc_tar_read(archive, block, GARC_TAR_BLOCK, out_got);
+}
+
 GARC_Result garc_tar_next(GARC_Archive * archive) {
   uint8_t block[GARC_TAR_BLOCK];
 
@@ -369,8 +396,8 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
   // together. A caller is never required to read bytes it does not want in
   // order to reach the next header.
   if (archive->data_remaining || archive->data_padding) {
-    GARC_Result skipped = garc_stream_skip(
-        archive->stream, archive->data_remaining + archive->data_padding);
+    GARC_Result skipped = garc_tar_skip(
+        archive, archive->data_remaining + archive->data_padding);
     archive->data_remaining = 0;
     archive->data_padding = 0;
     if (skipped != GARC_OK) {
@@ -378,16 +405,38 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
     }
   }
 
+  // A member's metadata arrives in front of it, so nothing carried over from the
+  // previous call may still be claimed. Cleared here rather than where it is
+  // applied, because the case that matters is the call that *failed* partway
+  // through a carrier: without this, its name would be applied to whatever
+  // header a caller reached next.
+  archive->have_long_name = 0;
+  archive->have_long_link = 0;
+
+  // Where the member's first block is, which is the carrier's when there is one.
+  // A caller re-reading a member from this offset has to get the same member,
+  // and starting at the header behind a carrier would lose the long name.
+  uint64_t group_offset = 0;
+  int in_group = 0;
+
   // A loop rather than recursion on the zero-block case. A stream of nothing but
   // zero blocks is a 40-byte gzip file that expands to any size you like, so
   // recursing once per block is a stack overflow reachable from input.
   for (;;) {
-    const uint64_t header_offset = garc_stream_tell(archive->stream);
+    const uint64_t header_offset = garc_tar_offset(archive);
 
     size_t got = 0;
     GARC_Result result = tar_read_block(archive, block, &got);
     if (result != GARC_OK) {
       return result;
+    }
+
+    if (in_group && (got < GARC_TAR_BLOCK || tar_block_is_zero(block))) {
+      // A carrier with nothing behind it. The name it carried describes a member
+      // that is not in the archive, and treating the end of the stream as a clean
+      // end here would report a complete archive whose last member's name was
+      // silently dropped.
+      return GARC_ERR_CORRUPT;
     }
 
     if (got < GARC_TAR_BLOCK) {
@@ -432,15 +481,50 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
     archive->tar_checksum_was_signed
         = (declared != (uint64_t)sum_unsigned) ? 1 : 0;
 
-    // GNU's 'L' and 'K' members and pax's 'x' and 'g' carry metadata for the
-    // member that follows rather than being members themselves. Until the
-    // commit that reads them they are refused by name: handing one to a caller
-    // as a member called "././@LongLink" reports an artefact of the format as a
-    // file, which is worse than saying this cannot be read yet. Checked before
-    // the header is parsed, so that nothing half-filled is left behind.
+    // GNU's 'L' and 'K' carry the next member's name and link target. They are
+    // not members: handing one to a caller as a file called "././@LongLink"
+    // reports an artefact of the format as content, and does it while the real
+    // member's name is silently the truncated copy in the header behind it. So
+    // the payload is read here and the loop goes round for the header it
+    // describes. Checked before the header is parsed, because a carrier's own
+    // name, mode and times describe nothing.
     const uint8_t typeflag = block[GARC_TAR_OFF_TYPEFLAG];
-    if (typeflag == 'L' || typeflag == 'K' || typeflag == 'x'
-        || typeflag == 'g') {
+    if (typeflag == 'L' || typeflag == 'K') {
+      uint64_t declared = 0;
+      result = garc_tar_parse_uint(
+          block + GARC_TAR_OFF_SIZE, GARC_TAR_LEN_SIZE, &declared);
+      if (result != GARC_OK) {
+        return result;
+      }
+
+      const int is_name = (typeflag == 'L');
+      int * have = is_name ? &archive->have_long_name : &archive->have_long_link;
+      if (*have) {
+        // **Two carriers of the same kind for one member, refused.** Not a
+        // stylistic objection: each one allocates its declared size, so a chain
+        // of them is a few hundred bytes of archive asking for as much memory as
+        // the cap allows, once per link in the chain. libarchive added the same
+        // refusal for the same reason. No writer emits one, and last-one-wins
+        // would make a member's name depend on how far a reader got.
+        return GARC_ERR_CORRUPT;
+      }
+
+      result = garc_tar_read_long_field(archive, declared,
+          is_name ? &archive->long_name : &archive->long_link);
+      if (result != GARC_OK) {
+        return result;
+      }
+      *have = 1;
+      if (!in_group) {
+        group_offset = header_offset;
+        in_group = 1;
+      }
+      continue;
+    }
+
+    // pax's 'x' and 'g' records are the other half of this phase and are still
+    // refused by name, for the reason above.
+    if (typeflag == 'x' || typeflag == 'g') {
       return GARC_ERR_UNSUPPORTED;
     }
 
@@ -449,8 +533,23 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
       return result;
     }
 
-    archive->member.header_offset = header_offset;
-    archive->member.data_offset = garc_stream_tell(archive->stream);
+    // A name or a target that arrived in front of the header replaces the
+    // header's own field, which holds a truncated copy of it. The variant becomes
+    // GNU whatever the magic said, because the carrier is GNU's construct and a
+    // member read through one was not read as a ustar member.
+    if (archive->have_long_name) {
+      archive->member.name = archive->long_name.bytes;
+      archive->member.name_length = archive->long_name.length;
+      archive->tar_variant = GARC_TAR_GNU;
+    }
+    if (archive->have_long_link) {
+      archive->member.link_target = archive->long_link.bytes;
+      archive->member.link_target_length = archive->long_link.length;
+      archive->tar_variant = GARC_TAR_GNU;
+    }
+
+    archive->member.header_offset = in_group ? group_offset : header_offset;
+    archive->member.data_offset = garc_tar_offset(archive);
 
     archive->data_remaining = archive->member.size;
     // Data is padded to a whole block. The modulo is on the declared size, so a

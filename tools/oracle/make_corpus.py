@@ -121,6 +121,25 @@ def build_tree(base):
     # 0x7F appears.
     write("na\xefve.txt", b"latin-1 name\n", 0o644)
 
+    # A name that fits in no ustar field at all: a single 200-byte component
+    # cannot be split at a '/' into a 155-byte prefix and a 100-byte name, so
+    # neither field nor any pair of them can hold it. This is what forces GNU's
+    # 'L' member and pax's `path=` record, and the length is chosen so that the
+    # payload is **longer than one block**: the deepest name here is 611 bytes,
+    # so its carrier spans two. A reader that read the payload with a single
+    # 512-byte read would pass on every shorter long name and truncate this one -
+    # and the existing long-name fixture is 108 bytes, which is one block.
+    very_deep = "/".join(["e" * 200] * 3) + "/leaf.txt"
+    write(very_deep, b"deeper\n", 0o644)
+
+    # A symlink whose target does not fit the 100-byte linkname field, which is
+    # what forces GNU's 'K' member and pax's `linkpath=` record. Separate from
+    # the long *name* above and pointed at it, because a reader that implements
+    # one mechanism and not the other truncates silently - and a truncated
+    # symlink target is a path to somewhere else.
+    os.symlink(very_deep, os.path.join(base, "link-to-deep"))
+    entries.append("link-to-deep")
+
     return sorted(entries)
 
 
@@ -172,6 +191,13 @@ ARCHIVES = [
         "checksum readings differ"),
     ("gnu-longname.tar", "gnu", ["dddddddddddddddddddddddd"], False,
         "GNU: an 'L' member carrying the next member's name"),
+    ("gnu-longname-blocks.tar", "gnu", ["e" * 200], False,
+        "GNU: 'L' payloads longer than one block, 201 to 611 bytes, which a "
+        "reader that read the payload with a single block read truncates"),
+    ("gnu-longlink.tar", "gnu", ["link-to-hello", "link-to-deep"], False,
+        "GNU: a 'K' member carrying a link target too long for the 100-byte "
+        "field, beside a symlink whose target fits - so the fixture shows both "
+        "the field and the carrier"),
     # pax, split in two because the interesting half and the reproducible half
     # are not the same archive. See PAX_OPTIONS for why atime and ctime have to
     # go, and what that leaves.

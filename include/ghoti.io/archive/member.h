@@ -189,6 +189,12 @@ typedef struct GARC_Member {
    *
    * For diagnostics, and for a caller keeping its own index. Meaningful even on
    * a stream that cannot seek, because the stream counts its own position.
+   *
+   * Where a format puts a member's metadata in *front* of its header - tar does,
+   * for a name or a link target too long for the header's fields - this is the
+   * offset of the first of those blocks rather than of the header itself, because
+   * that is the offset the member can be re-read from. Starting at the header
+   * would produce the truncated name the format put there.
    */
   uint64_t header_offset;
   /** Offset at which this member's data begins. */

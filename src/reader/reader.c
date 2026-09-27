@@ -328,6 +328,10 @@ void garc_close(GARC_Archive * archive) {
   if (!archive) {
     return;
   }
+  // Whatever a format reader allocated for this archive. A name too long for a
+  // header field is the only thing that is, so an ordinary archive frees nothing
+  // here - which is why this is a call rather than a switch on the format.
+  garc_tar_release(archive);
   // The stream is the caller's. This library never frees what it did not
   // allocate, and a close that destroyed it would make the borrowing in
   // garc_open() a lie a caller finds out about as a double free.

@@ -141,11 +141,9 @@ without ever erroring:
 | GNU | an `L` member carrying the next member's name | base-256 when the high bit is set | `magic` is `ustar  \0` |
 | pax (POSIX.1-2001) | an `x`/`g` member of `len key=value\n` records | a `size=` record, decimal | an `x` member before the one it describes |
 
-**v7 and ustar are read; GNU's `L`/`K` and pax's `x`/`g` are refused by name**,
-with `GARC_ERR_UNSUPPORTED`. The refusal is the point: handing a caller a member
-called `././@LongLink` reports an artefact of the format as a file, which is
-worse than saying it cannot be read yet. The members *around* one are read
-normally, so it is a refusal of one construct rather than of the archive.
+**v7, ustar and GNU's `L`/`K` are read; pax's `x`/`g` are refused by name**, with
+`GARC_ERR_UNSUPPORTED`. The members *around* a refused one are read normally, so
+it is a refusal of one construct rather than of the archive.
 
 Note that a pax archive whose names all fit the ustar fields contains no extended
 records at all - pax's magic *is* ustar's - so `tar --format=pax` output is
@@ -157,6 +155,67 @@ one: GNU tar writes pax records in front of ustar headers. `garc_tar_member_vari
 answers for the member `garc_next()` last handed out, and it lives in `tar.h`
 rather than on `GARC_Member` because a member field whose meaning depends on which
 format filled it in is the shape that goes wrong when the second format arrives.
+
+### A carrier is not a member
+
+GNU cannot put a name longer than 100 bytes, or a link target longer than 100
+bytes, in a header - so it writes one of its own in front: a member with typeflag
+`L` or `K`, named `././@LongLink`, whose *data* is the string, followed by the
+real header with a truncated copy of it in the ordinary field. pax does the same
+job with `len key=value\n` records in an `x` or `g` member.
+
+The wrong answers here are all names, which is what makes them worth naming:
+
+- **Reporting the carrier as a member** hands a caller a file called
+  `././@LongLink` whose contents are somebody's path, *and* reports the real
+  member under the truncated name in the header behind it. Two wrong members from
+  one construct, neither of them an error.
+- **Reading the payload with a single block read** truncates every name longer
+  than 512 bytes at exactly 512 and reports the rest correctly. A corpus whose
+  longest long name is 108 bytes cannot tell; `gnu-longname-blocks.tar` exists
+  because of this, with names of 201, 402, 603 and 611 bytes.
+- **Implementing `L` and not `K`** truncates a symlink's target at 100 bytes, and
+  a truncated path is a path to somewhere else rather than a damaged one.
+- **Leaving the carried name in place for the next member** gives two members one
+  name and still round-trips. A carrier describes the member immediately behind
+  it and nothing after it.
+
+Three things a payload can be that no writer writes, each refused:
+
+- **A payload with content behind its terminator.** GNU writes `strlen + 1`, so
+  there is one NUL at the end; a writer that omitted it writes `strlen` and there
+  is none. Both are read, because each has exactly one reading. A NUL with more
+  bytes behind it has two - this reader would report the bytes before it and a
+  reader using the declared length would report all of them - and a member whose
+  name depends on which reader is asked is how a checked name and an extracted
+  name come apart. `GARC_ERR_CORRUPT` rather than either answer.
+- **An empty payload**, by a declared size of zero or by bytes that are all NUL.
+  The tempting reading is "no name here, use the header's", which silently
+  produces the truncated name the carrier existed to replace.
+- **Two carriers of the same kind for one member.** Each allocates its declared
+  size, so a chain of them turns a few hundred bytes of archive into one
+  allocation of the cap per link; libarchive refuses the same shape for the same
+  reason. The alternative reading, last-one-wins, would make a member's name
+  depend on how far a reader got.
+
+Two consequences in the API worth knowing:
+
+- **`max_name_bytes` is checked against the *declared* size, before the payload
+  is allocated.** This is the only place in the tar reader where a length arrives
+  in one block and the bytes in the next, so it is the only place a cap has to
+  fire on a declaration. The cap is on the name and the payload is the name plus
+  its terminator, so a cap of *N* accepts a payload of *N* + 1 and
+  `garc_reader_account()` remains the authority on the name itself.
+- **`header_offset` is the offset of the carrier**, not of the header behind it,
+  because that is the offset a member can be re-read from. Re-reading from the
+  real header would produce the truncated name. A carrier is not counted in
+  `garc_member_count()` and its size is not added to
+  `garc_total_declared_bytes()`: it is metadata, bounded by `max_name_bytes` and
+  by nothing else.
+
+And the variant a member read through a carrier reports is `GARC_TAR_GNU` even
+when the header's own magic says `ustar`, because the construct is GNU's and the
+member was not read as a ustar member.
 
 ### What a header field can do to a reader
 

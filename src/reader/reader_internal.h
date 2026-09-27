@@ -31,6 +31,7 @@
 
 #include <ghoti.io/archive/reader.h>
 #include <ghoti.io/archive/tar.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -40,13 +41,14 @@ extern "C" {
 /**
  * Storage for a ustar member's name.
  *
- * 155 bytes of prefix, a separator, 100 bytes of name, and a NUL. **Fixed
- * rather than growable on purpose**: no name a v7 or ustar header can express
- * is longer, so a growable buffer here would be growth code that nothing in
- * this phase could exercise - and untested growth code is worse than a
- * restructure later. GNU's `L` member and pax's `path=` record are unbounded in
- * the format and are what make a growable buffer necessary; the phase that
- * reads them is the phase that can test it.
+ * 155 bytes of prefix, a separator, 100 bytes of name, and a NUL. Fixed,
+ * because no name a v7 or ustar *header* can express is longer - and an
+ * ordinary archive is then walked with no allocation per member at all, which
+ * is what makes ::GARC_Member's borrowing worth having.
+ *
+ * A name GNU's `L` member or pax's `path=` record carries is unbounded in the
+ * format and cannot live here. Those go in ::GARC_Tar_Buffer instead, so the
+ * allocation happens for the archives that need one and not for every archive.
  */
 #define GARC_TAR_NAME_STORAGE 257u
 
@@ -55,6 +57,23 @@ extern "C" {
 
 /** Storage for a user or group name: ustar's 32 bytes and a NUL. */
 #define GARC_TAR_OWNER_STORAGE 33u
+
+/**
+ * A growable byte buffer for a string the header fields cannot bound.
+ *
+ * Bytes, a length and a capacity, rather than a C string: what it holds is a
+ * member name, and a member name is attacker-controlled bytes that may contain
+ * anything. A NUL is written one past @ref length as a convenience for a
+ * debugger, and nothing reads it.
+ */
+typedef struct {
+  /** The bytes, or NULL before the first use. */
+  char * bytes;
+  /** How many of them are in use. */
+  size_t length;
+  /** How many were allocated, which is at least @ref length + 1. */
+  size_t capacity;
+} GARC_Tar_Buffer;
 
 struct GARC_Archive {
   /** The stream, borrowed. The caller destroys it; garc_close() does not. */
@@ -99,6 +118,12 @@ struct GARC_Archive {
    * from a pipe", the reason this library has a callback stream at all, false.
    * So the bytes are kept here and the format reader drains them before it
    * reads anything.
+   *
+   * The window is one block, and a format reader consumes a whole block before it
+   * reports a member - so by the time garc_read_member() or garc_skip_member()
+   * can be called there is nothing left in it. That is why those two may go to
+   * the stream directly while everything inside the tar reader goes through
+   * garc_tar_read() and garc_tar_skip().
    */
   uint8_t peek[GARC_TAR_BLOCK];
   /** How many of @ref peek are still to be consumed. */
@@ -110,6 +135,29 @@ struct GARC_Archive {
   char link_storage[GARC_TAR_LINK_STORAGE];
   char uname_storage[GARC_TAR_OWNER_STORAGE];
   char gname_storage[GARC_TAR_OWNER_STORAGE];
+
+  /**
+   * A name carried in front of the header rather than in it.
+   *
+   * GNU writes an `L` member whose data is the next member's name; pax writes a
+   * `path=` record. Both are unbounded in the format, so this is where a name
+   * too long for @ref name_storage goes. Allocated on first use and **kept
+   * across members**, because an archive of long names would otherwise allocate
+   * and free once per member; freed by garc_tar_release().
+   */
+  GARC_Tar_Buffer long_name;
+  /** The same for a link target: GNU's `K` member, pax's `linkpath=`. */
+  GARC_Tar_Buffer long_link;
+  /**
+   * Non-zero when @ref long_name holds a name for the header being read.
+   *
+   * Cleared at the start of every garc_tar_next(), so a carrier member whose
+   * read failed cannot leave a name to be applied to some later header. The
+   * *storage* is not cleared with it; only the claim on it is.
+   */
+  int have_long_name;
+  /** The same for @ref long_link. */
+  int have_long_link;
 };
 
 /**
