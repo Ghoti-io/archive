@@ -29,12 +29,6 @@
 
 namespace {
 
-/** A field of `width` bytes from a list, NUL-padded to the width. */
-std::vector<uint8_t> field(std::vector<uint8_t> bytes, size_t width) {
-  bytes.resize(width, 0);
-  return bytes;
-}
-
 uint64_t parse_uint(const std::vector<uint8_t> & bytes,
     GARC_Result * out_result = nullptr) {
   uint64_t value = 0xDEADBEEFu;
@@ -355,6 +349,166 @@ TEST(TarNumber, IdentifyRefusesNullAndShortInput) {
   EXPECT_TRUE(garc_tar_identify(block.data(), 512))
       << "a zero block is an empty archive";
   EXPECT_FALSE(garc_tar_block_is_header(nullptr));
+}
+
+//-----------------------------------------------------------------------------
+// Writing a field, which is the parser run backwards
+//-----------------------------------------------------------------------------
+
+namespace {
+
+/** Format into a field of @p width bytes and hand back the bytes. */
+std::vector<uint8_t> format_int(int64_t value, size_t width,
+    GARC_Tar_Number_Form * out_form = nullptr, GARC_Result * out_result = nullptr) {
+  std::vector<uint8_t> bytes(width, 0xAA);
+  GARC_Tar_Number_Form form = GARC_TAR_NUMBER_FORM_COUNT;
+  const GARC_Result result
+      = garc_tar_format_int(bytes.data(), width, value, &form);
+  if (out_form) {
+    *out_form = form;
+  }
+  if (out_result) {
+    *out_result = result;
+  }
+  return bytes;
+}
+
+} // namespace
+
+TEST(TarFormat, EveryValueAFieldCanHoldSurvivesTheRoundTrip) {
+  // The two widths a tar header uses land on different branches of the base-256
+  // arithmetic, so both are swept: 12 bytes carries 95 bits of two's complement
+  // and has its leading bits peeled as sign extension, 8 bytes carries 63 and
+  // does not.
+  const int64_t values[] = {
+    0, 1, 7, 8, 0644, 2097151,       // the seven-octal-digit boundary
+    2097152, 8589934591,             // the eleven-digit boundary
+    8589934592, 1700000000,
+    -1, -2, -1000000,
+    (int64_t)1 << 40,
+  };
+  for (size_t width : {size_t{8}, size_t{12}}) {
+    for (int64_t value : values) {
+      GARC_Tar_Number_Form form = GARC_TAR_NUMBER_FORM_COUNT;
+      GARC_Result result = GARC_ERR_INTERNAL;
+      const std::vector<uint8_t> bytes
+          = format_int(value, width, &form, &result);
+      if (result != GARC_OK) {
+        // An 8-byte field holds 63 bits of two's complement, so a few of these
+        // do not fit it - and that is the refusal, not a wrong number.
+        EXPECT_EQ(result, GARC_ERR_UNSUPPORTED) << width << " " << value;
+        continue;
+      }
+      int64_t back = 0xDEAD;
+      ASSERT_EQ(garc_tar_parse_int(bytes.data(), bytes.size(), &back), GARC_OK)
+          << width << " " << value;
+      EXPECT_EQ(back, value) << width << " " << value << " form " << form;
+      // Octal for everything that fits it, so the threshold at which a pax
+      // record becomes necessary is as high as the field allows.
+      const bool fits_octal = value >= 0
+          && (width == 8 ? value <= 2097151 : value <= 8589934591);
+      EXPECT_EQ(form,
+          fits_octal ? GARC_TAR_NUMBER_OCTAL : GARC_TAR_NUMBER_BASE256)
+          << width << " " << value;
+    }
+  }
+}
+
+TEST(TarFormat, TheOctalFormIsDigitsAndOneNul) {
+  // GNU tar writes this; libarchive spends one of the digits on a trailing space
+  // instead. Both are legal, and this is the one that holds an octal digit more.
+  const std::vector<uint8_t> mode = format_int(0644, 8);
+  EXPECT_EQ(std::string(mode.begin(), mode.end()), std::string("0000644\0", 8));
+  const std::vector<uint8_t> size = format_int(5, 12);
+  EXPECT_EQ(
+      std::string(size.begin(), size.end()), std::string("00000000005\0", 12));
+}
+
+TEST(TarFormat, Base256IsSignExtendedAcrossTheWholeField) {
+  // Bit 7 of the first byte is the flag and bit 6 is the *sign*, which is what
+  // sign extension puts there. Writing "0x80 then the magnitude" would put a
+  // positive value's top bit where the sign belongs, so every value at or above
+  // half the field's span would read back negative.
+  const std::vector<uint8_t> positive = format_int(8589934592, 12);
+  EXPECT_EQ(positive[0], 0x80u);
+  for (size_t i = 1; i < 4; ++i) {
+    EXPECT_EQ(positive[i], 0x00u) << i;
+  }
+  const std::vector<uint8_t> negative = format_int(-1, 12);
+  EXPECT_EQ(negative[0], 0xFFu);
+  for (size_t i = 1; i < 12; ++i) {
+    EXPECT_EQ(negative[i], 0xFFu) << i;
+  }
+}
+
+TEST(TarFormat, TheMostExtremeValuesFitATwelveByteField) {
+  for (int64_t value : {INT64_MIN, INT64_MAX}) {
+    GARC_Result result = GARC_ERR_INTERNAL;
+    const std::vector<uint8_t> bytes = format_int(value, 12, nullptr, &result);
+    ASSERT_EQ(result, GARC_OK) << value;
+    int64_t back = 0;
+    ASSERT_EQ(garc_tar_parse_int(bytes.data(), bytes.size(), &back), GARC_OK)
+        << value;
+    EXPECT_EQ(back, value);
+  }
+}
+
+TEST(TarFormat, AnEightByteFieldRefusesWhatItsSignBitWouldSwallow) {
+  // 63 bits of two's complement, so the span is 2^62 either side. One past it is
+  // refused rather than written, because bit 6 would then carry value rather than
+  // sign and the number would read back as roughly its own negation.
+  const int64_t limit = (int64_t)1 << 62;
+  GARC_Result result = GARC_ERR_INTERNAL;
+  format_int(limit - 1, 8, nullptr, &result);
+  EXPECT_EQ(result, GARC_OK);
+  format_int(limit, 8, nullptr, &result);
+  EXPECT_EQ(result, GARC_ERR_UNSUPPORTED);
+  format_int(-limit, 8, nullptr, &result);
+  EXPECT_EQ(result, GARC_OK);
+  format_int(-limit - 1, 8, nullptr, &result);
+  EXPECT_EQ(result, GARC_ERR_UNSUPPORTED);
+}
+
+TEST(TarFormat, AnUnsignedValueAboveInt64MaxIsRefused) {
+  // Base-256 is two's complement, so it would read back negative - which is the
+  // range garc_tar_parse_uint() refuses from the other side. A writer that can
+  // produce a field its own reader rejects is a library that disagrees with
+  // itself.
+  std::vector<uint8_t> bytes(12, 0);
+  GARC_Tar_Number_Form form = GARC_TAR_NUMBER_FORM_COUNT;
+  EXPECT_EQ(garc_tar_format_uint(
+                bytes.data(), bytes.size(), (uint64_t)INT64_MAX, &form),
+      GARC_OK);
+  EXPECT_EQ(garc_tar_format_uint(
+                bytes.data(), bytes.size(), (uint64_t)INT64_MAX + 1u, &form),
+      GARC_ERR_UNSUPPORTED);
+}
+
+TEST(TarFormat, ANullFieldOrAFieldTooNarrowForOneDigitIsInvalid) {
+  // Two bytes is the narrowest field that holds a digit and a terminator, and
+  // nothing in tar is narrower - so this is the argument check rather than a
+  // format limit.
+  std::vector<uint8_t> bytes(12, 0);
+  GARC_Tar_Number_Form form = GARC_TAR_NUMBER_FORM_COUNT;
+  EXPECT_EQ(garc_tar_format_int(nullptr, 12, 0, &form), GARC_ERR_INVALID);
+  EXPECT_EQ(garc_tar_format_int(bytes.data(), 12, 0, nullptr),
+      GARC_ERR_INVALID);
+  EXPECT_EQ(garc_tar_format_int(bytes.data(), 1, 0, &form), GARC_ERR_INVALID);
+  EXPECT_EQ(garc_tar_format_int(bytes.data(), 0, 0, &form), GARC_ERR_INVALID);
+}
+
+TEST(TarPaxKeys, EveryKeyHasAName) {
+  // One table serves the reader's matching and the writer's spelling, so a key
+  // the table forgot would be one the library writes as an empty string and then
+  // cannot read. The sentinel is asked too, because the lookup has to answer
+  // something for a value that is not a key.
+  for (int key = 0; key < GARC_PAX_KEY_COUNT; ++key) {
+    const char * name = garc_tar_pax_key_name((GARC_Pax_Key)key);
+    ASSERT_NE(name, nullptr) << key;
+    EXPECT_NE(std::string(name), std::string()) << key;
+  }
+  EXPECT_EQ(std::string(garc_tar_pax_key_name(GARC_PAX_KEY_COUNT)),
+      std::string());
 }
 
 int main(int argc, char ** argv) {

@@ -1149,12 +1149,17 @@ fuzz-run-$2: $$(FUZZ_APP_DIR)/$1
 		-max_total_time=$$(FUZZ_TIME) -print_final_stats=1
 endef
 
-$(eval $(call fuzz-rule,fuzz_stream,stream))
-$(eval $(call fuzz-rule,fuzz_tar,tar))
-$(eval $(call fuzz-rule,fuzz_name,name))
+# One list, read twice: once to generate each harness's rules and once for the
+# aggregate target below. Two lists is how a harness comes to exist, build, and
+# never be run by `make fuzz` - which adding the writer harness demonstrated, by
+# building and passing while the aggregate still named three.
+FUZZ_HARNESSES := stream tar name writer
+
+$(foreach harness,$(FUZZ_HARNESSES),\
+	$(eval $(call fuzz-rule,fuzz_$(harness),$(harness))))
 
 fuzz: ## Build and run every fuzzer for $(FUZZ_TIME) seconds each
-fuzz: fuzz-run-stream fuzz-run-tar fuzz-run-name
+fuzz: $(addprefix fuzz-run-,$(FUZZ_HARNESSES))
 
 fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 	-@rm -rf $(FUZZ_DIR)

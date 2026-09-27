@@ -60,6 +60,8 @@
 #define GARC_Stream_Callbacks GHOTIIO_ARCHIVE(GARC_Stream_Callbacks)
 #define GARC_Tar_Variant GHOTIIO_ARCHIVE(GARC_Tar_Variant)
 #define GARC_Time_Source GHOTIIO_ARCHIVE(GARC_Time_Source)
+#define GARC_Writer GHOTIIO_ARCHIVE(GARC_Writer)
+#define GARC_Writer_Options GHOTIIO_ARCHIVE(GARC_Writer_Options)
 
 // Public functions.
 #define garc_allocator_default GHOTIIO_ARCHIVE(garc_allocator_default)
@@ -115,16 +117,34 @@
 #define garc_stream_skip GHOTIIO_ARCHIVE(garc_stream_skip)
 #define garc_stream_tell GHOTIIO_ARCHIVE(garc_stream_tell)
 #define garc_version_number GHOTIIO_ARCHIVE(garc_version_number)
+#define garc_writer_add GHOTIIO_ARCHIVE(garc_writer_add)
+#define garc_writer_create GHOTIIO_ARCHIVE(garc_writer_create)
+#define garc_writer_create_with_allocator                                      \
+  GHOTIIO_ARCHIVE(garc_writer_create_with_allocator)
+#define garc_writer_data_remaining GHOTIIO_ARCHIVE(garc_writer_data_remaining)
+#define garc_writer_destroy GHOTIIO_ARCHIVE(garc_writer_destroy)
+#define garc_writer_dump GHOTIIO_ARCHIVE(garc_writer_dump)
+#define garc_writer_finish GHOTIIO_ARCHIVE(garc_writer_finish)
+#define garc_writer_member_count GHOTIIO_ARCHIVE(garc_writer_member_count)
+#define garc_writer_options_default GHOTIIO_ARCHIVE(garc_writer_options_default)
+#define garc_writer_write GHOTIIO_ARCHIVE(garc_writer_write)
 #define garc_version_string GHOTIIO_ARCHIVE(garc_version_string)
 
 // Internal names. Hidden by -fvisibility=hidden and so unable to collide, but
 // renamed anyway so that there is one rule rather than two.
 #define garc_reader_account GHOTIIO_ARCHIVE(garc_reader_account)
 #define garc_tar_block_is_header GHOTIIO_ARCHIVE(garc_tar_block_is_header)
+#define garc_tar_buffer_free GHOTIIO_ARCHIVE(garc_tar_buffer_free)
+#define garc_tar_buffer_grow GHOTIIO_ARCHIVE(garc_tar_buffer_grow)
+#define garc_tar_format_int GHOTIIO_ARCHIVE(garc_tar_format_int)
+#define garc_tar_format_uint GHOTIIO_ARCHIVE(garc_tar_format_uint)
 #define garc_tar_identify GHOTIIO_ARCHIVE(garc_tar_identify)
 #define garc_tar_next GHOTIIO_ARCHIVE(garc_tar_next)
 #define garc_tar_parse_int GHOTIIO_ARCHIVE(garc_tar_parse_int)
+#define garc_tar_pax_key_name GHOTIIO_ARCHIVE(garc_tar_pax_key_name)
 #define garc_tar_parse_uint GHOTIIO_ARCHIVE(garc_tar_parse_uint)
+#define garc_tar_write_end GHOTIIO_ARCHIVE(garc_tar_write_end)
+#define garc_tar_write_member GHOTIIO_ARCHIVE(garc_tar_write_member)
 
 /// @endcond
 

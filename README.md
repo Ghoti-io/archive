@@ -29,7 +29,7 @@ through a compress decoder. This library is the container, not the compression.
 `x`/`g` records, from a file or a pipe. What is refused, by name and with
 `GARC_ERR_UNSUPPORTED`, is a *sparse* member: there the data is a map of holes and
 extents rather than the file's contents, so reading it as contents would be a
-wrong answer rather than a missing feature. No zip yet, and no filesystem layer.
+wrong answer rather than a missing feature.
 
 The fixtures are written by GNU tar 1.35 in a pinned container and the
 expectations come from Python 3.13.5's `tarfile` and libarchive 3.7.4's bsdtar,
@@ -42,17 +42,24 @@ letter, a NUL, a Windows device name, malformed UTF-8 - one finding at a time,
 and the reader hands over the bytes the archive actually holds. It is a
 classifier and not a permission: see `examples/name_findings.c`, which prints why.
 
-**Nothing is written yet.** `GARC_Sink` is here - the byte sink a writer will
-write through - and the writer that fills it is not. A header with no consumer is
-usually a promise nobody keeps, so it is worth saying which this is: the sink is
-the half of tar-write that needs no format, committed on its own for the same
-reason the stream was committed before any reader.
+**Writes pax** — a ustar header with every field filled in, and an extended
+record only for what ustar cannot say, so a reader that knows only POSIX.1-1988
+gets a correct answer wherever one exists in its vocabulary. `GARC_TAR_USTAR`
+writes the same headers and *refuses*, by name, anything that would need a record:
+a caller who needs an archive a 1988 reader can read wants to be told rather than
+handed one with records in it. No zip either way yet, and no filesystem layer.
 
-Build clean under GCC 14 with `-Werror`; 253 tests; 99.6% line coverage, the
-five remaining lines being a defensive arm no input can reach and three guards
-that are live only where `size_t` is 32 bits; clean under Valgrind and under
-ASan+UBSan; `check-symbols`, `check-aliasing`, `check-corpus-hashes` and
-`check-fixtures` green; three fuzz harnesses.
+The three reference writers disagree about nearly every spelling in a pax header —
+the digits in a numeric field, whether to use the ustar name split, what the
+extended header is called — so each was measured and each choice is argued in
+`documentation/design.md` rather than copied.
+
+Build clean under GCC 14 with `-Werror`; 326 tests; 99.7% line coverage, the six
+remaining lines being a defensive arm no input can reach, three guards that are
+live only where `size_t` is 32 bits, and one that needs a record set larger than
+`INT64_MAX`; clean under Valgrind and under ASan+UBSan; `check-symbols`,
+`check-aliasing`, `check-corpus-hashes` and `check-fixtures` green; four fuzz
+harnesses.
 
 ## A minimal complete program
 
@@ -226,6 +233,28 @@ sink owns its buffer**, where a memory stream borrows one, because the bytes a
 writer produces do not exist yet and their number is not known until the archive
 is finished. And **there is no `seek` yet**: tar is append-only, zip is not, so
 that callback arrives with the writer that reads it.
+
+**Building one.** `garc_writer_create()` takes a sink and a format,
+`garc_writer_add()` begins a member, `garc_writer_write()` writes its bytes, and
+`garc_writer_finish()` writes the end-of-archive marker. Four things about that:
+
+- **A member is a `GARC_Member`** — the same struct the reader hands out, so
+  copying an archive needs no translation step. `header_offset` and `data_offset`
+  are where a member *was*; a writer decides where it goes, and ignores them.
+- **A size is declared before its bytes**, because tar puts it in the header and
+  the header goes first. Writing a different number of bytes is an error rather
+  than something padded over: `garc_writer_data_remaining()` is how many are owed.
+- **There are no limits here.** `GARC_Limits` caps a *reader*, which allocates on
+  a declaration it did not make. A writer allocates on its caller's own request,
+  so a cap would be this library second-guessing the program that called it.
+- **Nothing is normalised.** A directory's trailing slash is yours to include, the
+  typeflag is what says it is a directory either way, and a name
+  `garc_name_check()` has findings about is written as given. Deciding what is
+  safe to *create* is the filesystem layer's job, and that is phase F.
+
+`garc_writer_finish()` is not called by `garc_writer_destroy()`, on purpose:
+finishing can fail, a destructor cannot report it, and a destructor that finished
+silently would turn an abandoned archive into a complete-looking one.
 
 **Names.** `garc_name_check()` takes bytes and a length — a member's name, or a
 symlink's target, since they are equally dangerous and it is the same question —

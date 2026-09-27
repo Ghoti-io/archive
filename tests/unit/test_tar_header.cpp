@@ -1506,6 +1506,50 @@ TEST(TarPaxRecords, ANegativeWholeTimeIsNotShifted) {
   EXPECT_EQ(member->mtime_nanoseconds, 0u);
 }
 
+TEST(TarPaxRecords, TheMostNegativeTimeIsReadAndOneBelowItIsNot) {
+  // `uid=-9223372036854775808` was accepted and `mtime=-9223372036854775808` was
+  // refused, because the two parsers spelled the same bound differently - one
+  // against INT64_MAX and one against INT64_MAX + 1, which is INT64_MIN's
+  // magnitude. Nothing in the reader's own corpus could see it: what did was
+  // writing the value out and reading it back, since the base-256 header field
+  // beside the record accepts it.
+  struct Case {
+    const char * value;
+    GARC_Result result;
+    int64_t seconds;
+    uint32_t nanoseconds;
+  };
+  const Case cases[] = {
+    {"-9223372036854775808", GARC_OK, INT64_MIN, 0u},
+    // One below, which no int64_t holds.
+    {"-9223372036854775809", GARC_ERR_CORRUPT, 0, 0u},
+    // A fraction floors one second further from zero, so this is the most
+    // negative *whole* second a fraction can sit on.
+    {"-9223372036854775807.5", GARC_OK, INT64_MIN, 500000000u},
+    // And a fraction on the most negative second names a time one below it.
+    {"-9223372036854775808.5", GARC_ERR_CORRUPT, 0, 0u},
+    {"9223372036854775807", GARC_OK, INT64_MAX, 0u},
+    {"9223372036854775808", GARC_ERR_CORRUPT, 0, 0u},
+    // "-0" and "-0.5" go through the same magnitude arithmetic, where a
+    // subtraction from the magnitude would underflow if it were not guarded.
+    {"-0", GARC_OK, 0, 0u},
+    {"-0.5", GARC_OK, -1, 500000000u},
+  };
+  for (const Case & one : cases) {
+    const std::string records = pax_record("mtime", one.value);
+    Opened opened;
+    ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK)
+        << one.value;
+    const GARC_Member * member = nullptr;
+    const GARC_Result result = garc_next(opened.archive, &member);
+    EXPECT_EQ(result, one.result) << one.value;
+    if (one.result == GARC_OK) {
+      EXPECT_EQ(member->mtime_seconds, one.seconds) << one.value;
+      EXPECT_EQ(member->mtime_nanoseconds, one.nanoseconds) << one.value;
+    }
+  }
+}
+
 TEST(TarPaxRecords, PositiveIdsAreRead) {
   // The ordinary case, and the control for the negative one below: a signed parser
   // whose positive half was never exercised would be a parser tested only on the
@@ -1616,7 +1660,12 @@ TEST(TarPaxRecords, ARecordWhoseValueIsNotWhatItsKeyNeedsIsRefused) {
     {"mtime", "1.2.3"},
     {"mtime", "not-a-time"},
     {"mtime", "9223372036854775808"},
-    {"mtime", "-9223372036854775808"},
+    // One below INT64_MIN. This row used to read -9223372036854775808, which is
+    // INT64_MIN itself and *is* representable: the expectation had been written
+    // from what the parser did rather than from what the value is, and it kept
+    // passing while the parser's bound was one too strict. See
+    // TheMostNegativeTimeIsReadAndOneBelowItIsNot for the boundary either side.
+    {"mtime", "-9223372036854775809"},
   };
 
   for (const auto & row : rows) {

@@ -250,6 +250,94 @@ void garc_tar_pax_reset(GARC_Tar_Pax * pax);
 void garc_tar_release(GARC_Archive * archive);
 
 /**
+ * The record key this reader acts on, spelled as it appears in an archive.
+ *
+ * The writer needs the same nine strings the reader matches against, and one
+ * table serving both is the point: two lists would agree until somebody
+ * corrected a spelling in one of them, at which point the library would write a
+ * key it could not read.
+ *
+ * @param key The key.
+ * @return A static string, never NULL.
+ */
+const char * garc_tar_pax_key_name(GARC_Pax_Key key);
+
+/**
+ * Make sure a buffer can hold @p wanted bytes and a terminator, keeping what it
+ * already holds.
+ *
+ * Used by the reader for a record set, which is *appended* to - a second `x`
+ * header for one member adds to it, and a second `g` overrides individual keys -
+ * and by the writer for the record set it builds. It takes an allocator rather
+ * than an archive because the writer has no archive; that is also what makes it
+ * the one growable buffer in the tar code rather than two.
+ *
+ * @param allocator The allocator.
+ * @param buffer The buffer.
+ * @param wanted How many bytes have to fit.
+ * @return GARC_OK, or GARC_ERR_OOM with the old contents intact.
+ */
+GARC_Result garc_tar_buffer_grow(const GARC_Allocator * allocator,
+    GARC_Tar_Buffer * buffer, size_t wanted);
+
+/**
+ * Free a buffer and leave it in its unused state.
+ *
+ * @param allocator The allocator it was grown through.
+ * @param buffer The buffer.
+ */
+void garc_tar_buffer_free(
+    const GARC_Allocator * allocator, GARC_Tar_Buffer * buffer);
+
+/**
+ * Which encoding a numeric field was written in.
+ *
+ * Reported rather than left for the caller to work out, because "did the octal
+ * form fit" is the question that decides whether a pax record has to carry the
+ * value as well - and a second function answering it separately would be the
+ * same predicate written twice, free to drift from the one that did the writing.
+ */
+typedef enum {
+  GARC_TAR_NUMBER_OCTAL = 0, ///< Zero-padded octal digits and a NUL.
+  GARC_TAR_NUMBER_BASE256,   ///< GNU's extension, for what octal cannot hold.
+  GARC_TAR_NUMBER_FORM_COUNT
+} GARC_Tar_Number_Form;
+
+/**
+ * Write a signed value into a numeric header field.
+ *
+ * Octal when it fits in @p length - 1 digits, base-256 otherwise, which is the
+ * pair garc_tar_parse_int() reads. The field is filled completely; nothing is
+ * left of whatever was there.
+ *
+ * @param field The field bytes to fill.
+ * @param length The field length; at least 2.
+ * @param value The value.
+ * @param out_form Receives which encoding was used.
+ * @return GARC_OK, GARC_ERR_INVALID, or GARC_ERR_UNSUPPORTED when neither
+ *   encoding can hold the value in a field this narrow.
+ */
+GARC_Result garc_tar_format_int(uint8_t * field, size_t length, int64_t value,
+    GARC_Tar_Number_Form * out_form);
+
+/**
+ * Write an unsigned value into a numeric header field.
+ *
+ * As garc_tar_format_int(). A value above INT64_MAX is refused rather than
+ * written, because base-256 is two's complement and it would read back negative
+ * - which is exactly the range garc_tar_parse_uint() refuses from the other
+ * side.
+ *
+ * @param field The field bytes to fill.
+ * @param length The field length; at least 2.
+ * @param value The value.
+ * @param out_form Receives which encoding was used.
+ * @return GARC_OK, GARC_ERR_INVALID, or GARC_ERR_UNSUPPORTED.
+ */
+GARC_Result garc_tar_format_uint(uint8_t * field, size_t length, uint64_t value,
+    GARC_Tar_Number_Form * out_form);
+
+/**
  * Parse an unsigned numeric header field.
  *
  * Handles both encodings a tar field can carry, because every size field needs

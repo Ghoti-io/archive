@@ -90,10 +90,7 @@ void garc_tar_release(GARC_Archive * archive) {
     &archive->pax_global.records,
   };
   for (size_t i = 0; i < 4u; ++i) {
-    gcu_allocator_free(archive->allocator, buffers[i]->bytes);
-    buffers[i]->bytes = NULL;
-    buffers[i]->capacity = 0;
-    buffers[i]->length = 0;
+    garc_tar_buffer_free(archive->allocator, buffers[i]);
   }
 }
 
@@ -197,35 +194,29 @@ GARC_Result garc_tar_read_long_field(
 // pax: `len key=value\n` records in an `x` or `g` member
 //-----------------------------------------------------------------------------
 
-/**
- * Make sure a buffer can hold @p wanted bytes, keeping what it already holds.
- *
- * The counterpart to tar_buffer_reserve(), which does not. A record set is
- * *appended* to - a second `x` header for one member adds to it, and a second `g`
- * overrides individual keys of it - so this one has to preserve, and the record
- * table holds offsets rather than pointers precisely so that a move here costs
- * nothing.
- *
- * @param archive The archive, for its allocator.
- * @param buffer The buffer.
- * @param wanted How many bytes have to fit.
- * @return GARC_OK, or GARC_ERR_OOM with the old contents intact.
- */
-static GARC_Result tar_buffer_grow(
-    GARC_Archive * archive, GARC_Tar_Buffer * buffer, size_t wanted) {
+GARC_Result garc_tar_buffer_grow(const GARC_Allocator * allocator,
+    GARC_Tar_Buffer * buffer, size_t wanted) {
   if (buffer->capacity >= wanted + 1u) {
     return GARC_OK;
   }
   // realloc rather than malloc-and-copy: it returns NULL without freeing the old
   // block, so a failure here leaves the set that was already parsed readable.
-  char * bytes = (char *)gcu_allocator_realloc(
-      archive->allocator, buffer->bytes, wanted + 1u);
+  char * bytes
+      = (char *)gcu_allocator_realloc(allocator, buffer->bytes, wanted + 1u);
   if (!bytes) {
     return GARC_ERR_OOM;
   }
   buffer->bytes = bytes;
   buffer->capacity = wanted + 1u;
   return GARC_OK;
+}
+
+void garc_tar_buffer_free(
+    const GARC_Allocator * allocator, GARC_Tar_Buffer * buffer) {
+  gcu_allocator_free(allocator, buffer->bytes);
+  buffer->bytes = NULL;
+  buffer->capacity = 0;
+  buffer->length = 0;
 }
 
 void garc_tar_pax_reset(GARC_Tar_Pax * pax) {
@@ -260,6 +251,18 @@ static const struct {
   {"gid", GARC_PAX_GID},
   {"hdrcharset", GARC_PAX_HDRCHARSET},
 };
+
+const char * garc_tar_pax_key_name(GARC_Pax_Key key) {
+  for (size_t i = 0; i < sizeof(tar_pax_keys) / sizeof(tar_pax_keys[0]); ++i) {
+    if (tar_pax_keys[i].key == key) {
+      return tar_pax_keys[i].name;
+    }
+  }
+  // Unreachable while the table names every key, and an empty string rather
+  // than NULL so that a caller cannot be made to write a NUL byte into a record
+  // if it ever stops doing so.
+  return "";
+}
 
 /** GNU's sparse records, which change what a member's data *is*. */
 static const char tar_pax_sparse_prefix[] = "GNU.sparse.";
@@ -394,7 +397,8 @@ GARC_Result garc_tar_read_pax_records(
 
   const size_t from = pax->records.length;
   const size_t wanted = from + (size_t)declared;
-  GARC_Result result = tar_buffer_grow(archive, &pax->records, wanted);
+  GARC_Result result
+      = garc_tar_buffer_grow(archive->allocator, &pax->records, wanted);
   if (result != GARC_OK) {
     return result;
   }
@@ -567,20 +571,38 @@ static GARC_Result tar_pax_time(const char * bytes, size_t length,
   }
 
   if (negative) {
-    if (seconds > (uint64_t)INT64_MAX) {
+    // **INT64_MIN's magnitude is one above INT64_MAX**, so the bound is
+    // `INT64_MAX + 1` and not `INT64_MAX`. tar_pax_i64() a few lines up already
+    // spelled it that way for `uid=` and `gid=`, and this said `INT64_MAX`: two
+    // parsers of the same kind of value in the same file disagreeing about its
+    // most negative one. What found it was writing the value out and reading it
+    // back - `mtime=-9223372036854775808` is a record the base-256 header field
+    // beside it accepts and this refused, so the library could produce an archive
+    // it would not read.
+    if (seconds > (uint64_t)INT64_MAX + 1u) {
       return GARC_ERR_CORRUPT;
     }
-    int64_t signed_seconds = -(int64_t)seconds;
+    uint64_t magnitude = seconds;
     if (nanoseconds) {
-      // No guard on the subtraction, and `make coverage` is what settled that: a
-      // check for INT64_MIN here never executed, because the range check above
-      // leaves `signed_seconds` in [-INT64_MAX, 0] and INT64_MIN is one below
-      // that. The borrow therefore lands at INT64_MIN at worst, which is
-      // representable. A dead guard would read as though it were load-bearing.
-      signed_seconds -= 1;
+      // The floor is one whole second further from zero, because the nanoseconds
+      // are counted upwards from it. So a fraction on the most negative second
+      // names a time one below INT64_MIN, which is refused rather than wrapped.
+      //
+      // This guard was dead while the bound above was one too strict, and a
+      // previous revision deleted it for that reason with `make coverage` as the
+      // evidence. It is live now, and the pair is worth remembering: a guard that
+      // no input can reach can be unreachable because of *another* check that is
+      // wrong.
+      if (magnitude > (uint64_t)INT64_MAX) {
+        return GARC_ERR_CORRUPT;
+      }
+      magnitude += 1u;
       nanoseconds = 1000000000u - nanoseconds;
     }
-    *out_seconds = signed_seconds;
+    // Spelled against the magnitude rather than as -(int64_t)magnitude, because
+    // INT64_MIN's magnitude does not fit an int64_t and converting it is out of
+    // range - which UBSan sees and a release build does not.
+    *out_seconds = magnitude ? -(int64_t)(magnitude - 1u) - 1 : 0;
   } else {
     if (seconds > (uint64_t)INT64_MAX) {
       return GARC_ERR_CORRUPT;

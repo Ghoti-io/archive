@@ -180,11 +180,26 @@ public:
   /** Make the next @p count writes report ::GARC_ERR_IO. */
   void fail_writes(size_t count) { failing_writes_ = count; }
 
+  /**
+   * Make the write with this index - counting from the next one - fail.
+   *
+   * `fail_writes(1)` can only reach the first write of a sequence, so a call that
+   * makes several - a tar extended header is a header block, its records, and the
+   * padding after them - would have its second and third arms left untested by a
+   * sweep that looked like it covered them.
+   */
+  void fail_write_at(size_t index) {
+    skip_writes_ = index;
+    failing_writes_ = 1;
+  }
+
 private:
   static GARC_Result write_cb(void * ctx, const void * buffer, size_t size) {
     BufferDrain * self = static_cast<BufferDrain *>(ctx);
     self->writes_++;
-    if (self->failing_writes_) {
+    if (self->skip_writes_) {
+      self->skip_writes_--;
+    } else if (self->failing_writes_) {
       self->failing_writes_--;
       // All or nothing: a refused write keeps none of the bytes, which is what
       // lets a test assert that a failed write left the sink's count alone.
@@ -199,6 +214,7 @@ private:
   std::vector<uint8_t> bytes_;
   size_t writes_ = 0;
   size_t failing_writes_ = 0;
+  size_t skip_writes_ = 0;
 };
 
 /**

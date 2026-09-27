@@ -529,7 +529,153 @@ computes padding from, so counting a refused write would pad the next member to
 the wrong boundary - and every reader would then report the damage at a header
 some distance after the cause.
 
-## 10. Testing
+## 10. Writing tar, which is one header and a record for the rest
+
+The writer emits **pax**: a ustar header with every field filled in, and an
+extended record only for what ustar cannot say. A reader that knows only
+POSIX.1-1988 therefore gets a correct answer wherever one exists in its
+vocabulary, and a reader that knows pax gets the exact one. The alternative -
+records for everything with the fields left blank, which is legal - produces an
+archive half the world reads as empty.
+
+`GARC_TAR_USTAR` is the same code with the records turned into a status: anything
+that would need one, or a base-256 field, is `GARC_ERR_UNSUPPORTED` naming the
+member. That is not a second writer. It is what makes every threshold in the
+table below *testable as a threshold* rather than as "a record appeared", and it
+is what a caller who needs an archive a 1988 reader can read actually wants -
+to be told, rather than handed one with records in it.
+
+### What the three references disagree about
+
+Measured rather than assumed, with `tools/oracle/`. Each row is a decision this
+writer had to make and each reference makes it differently, so none of them could
+simply be copied:
+
+| | GNU tar 1.35 | libarchive 3.7.4 | Python 3.13 `tarfile` | this writer |
+| --- | --- | --- | --- | --- |
+| numeric field | 7 digits + NUL | 6 digits + space + NUL | 7 digits + NUL | **7 digits + NUL** |
+| the ustar name split | never | always | never | **when it is exact** |
+| fields behind a `path=` record | truncated | split, dropping components | truncated | **truncated** |
+| the extended header's name | `<dir>/PaxHeaders/<base>` | `PaxHeader/<base>` | `././@PaxHeader` | **`././@PaxHeader`** |
+| device fields on a non-device | blank | `000000 \0` | blank | **blank** |
+| end padding | to 20 blocks | two zero blocks | to 20 blocks | **two zero blocks**, or a blocking factor |
+
+And the reasons, because each is a judgement rather than a coin toss:
+
+- **The widest octal run.** Seven digits rather than six holds one more octal
+  digit, which is three more bits before an extended record becomes necessary.
+  libarchive's space is equally legal and expresses less.
+- **The split when it is exact.** A name too long for the 100-byte field can
+  often be cut at a `/` into a 155-byte prefix and a 100-byte name, which between
+  them hold 255 bytes with no record at all. Only libarchive does this. It is not
+  a compromise: it is the ustar format doing the job it has a prefix field for,
+  and it means a ustar-only reader gets the *whole* name rather than its first
+  hundred bytes. The last usable slash is chosen, so the name field holds the
+  basename.
+- **Truncation when it is not.** Here libarchive splits anyway, at a slash that
+  leaves the middle of the path out: a 300-byte `f…/g…/h…` goes out with `f…` in
+  the prefix and `h…` in the name, so a ustar-only reader sees a path with a
+  directory silently missing. Two of three references truncate, and the argument
+  agrees with them - every answer here is wrong, and a *recognisably* wrong one
+  beats a *plausibly* wrong one. A truncated name puts a file with a mangled name
+  in the right place; a name with a component dropped puts it somewhere else.
+- **A constant for the carrier's name.** Nothing reads it - it names a carrier,
+  and a carrier is not a member - so the choice falls to what costs least. A
+  constant cannot be truncated, needs no basename arithmetic, cannot collide with
+  a real path because `././` is not something a filesystem produces, and is
+  already in this library's vocabulary from GNU's `././@LongLink`. The carrier's
+  mode, owner and time are **zero rather than the member's**: it is not a file,
+  and a reader that extracted it anyway should not be handed the member's mode to
+  apply to it.
+- **Blank device fields.** Every header in the wild leaves them blank on a
+  non-device, the reader reads blank as zero and reports no device at all, and
+  writing `0000000` there would be putting a number where the archive has none.
+- **Two zero blocks.** 10240 bytes was a tape record. Every reader accepts
+  either, and this library's archives are built in memory and handed to a caller
+  far more often than written to tape - so the padding is an option, defaulting
+  to none.
+
+### What makes an extended record necessary
+
+One table, and every row has a test at the last value that fits and the first
+that does not, because a cap tested from one side cannot tell a cap that is off
+by one from a cap that is right:
+
+| field | fits | beyond it |
+| --- | --- | --- |
+| name | 100 bytes, or 255 with a usable `/` | `path=`, field truncated to 100 |
+| link target | 100 bytes | `linkpath=`, field truncated to 100 |
+| owner, group name | 32 bytes | `uname=`, `gname=` |
+| size | 8589934591 (11 octal digits) | base-256 **and** `size=` |
+| mtime | 0 … 8589934591 | base-256 **and** `mtime=` |
+| uid, gid | 2097151 (7 octal digits) | base-256 **and** `uid=`, `gid=` |
+| mode, device numbers | 2097151 | base-256, and no record: pax has no key for them |
+
+**Both statements say the same number**, which is the opposite of the reader's
+"one payload, two readings" refusal and is why writing base-256 beside a record is
+safe rather than ambiguous. A reader that does base-256 gets the right answer from
+the field alone; a reader that does not gets an error rather than a wrong number,
+because a high bit is not an octal digit. The third option - zeroing the field, as
+`tarfile` does - is the one that gives every reader a wrong answer: a ustar reader
+then skips no data and reads the member's contents as headers.
+
+`hdrcharset=BINARY` is written, first in the set, when any value in it is not
+well-formed UTF-8. POSIX says a record's bytes are UTF-8, so writing bytes that
+are not without saying so would put a claim in the archive that this library's own
+reader reports back as `GARC_NAME_UTF8` - a declaration made by the writer rather
+than by the data. Whether the bytes are UTF-8 is asked of `garc_name_check()`,
+because a second validator is a second answer.
+
+### What the writer refuses
+
+Each of these is the caller's argument being wrong rather than the format falling
+short, so each is `GARC_ERR_INVALID`:
+
+- **An empty name**, which is how an archive says the name is elsewhere.
+- **A NUL in the name, the link target, or either owner name.** A NUL ends a
+  header field and does not end a record, so the value would be two different
+  values depending on which a reader believed. Written as a sweep over all four
+  strings rather than a check per field, because the first version checked two of
+  them and the fuzz harness found an owner name of raw bytes coming back empty
+  within four thousand executions - four near-identical checks is the shape where
+  the fourth gets forgotten.
+- **`GARC_MEMBER_OTHER`**, which is a *reading* of an unnamed typeflag rather
+  than a thing to write. There is no byte to put in the field.
+- **A size on a member that carries no data.** The reader ignores a stale size
+  there because real archives have one; a writer cannot, because it would accept
+  the declaration and then refuse every byte written against it.
+- **A symlink or hard link with no target**, and a device with no numbers. Both
+  are the member's defining field.
+- **A sub-second time that did not come from a pax record**, which says two
+  things at once, and a nanosecond count of a whole second or more.
+
+And two things it deliberately does *not* refuse, because the reader produces
+both and a library that cannot write back what it reads is one that disagrees with
+itself: a **link target on a member that is not a link** - the linkname field is
+read whatever the typeflag says, because a hostile archive can carry one - and a
+name `garc_name_check()` has findings about. Nothing is normalised either: a
+directory's trailing slash is the caller's to include, and the typeflag is what
+says it is a directory.
+
+### What a round trip can and cannot promise
+
+Two fields cannot survive one, and both are facts about tar rather than defects.
+Both are asserted rather than absorbed into a tolerance:
+
+- **`mode_valid` and `ids_valid` come back set.** Every tar header *has* a mode
+  field, so a writer cannot un-have one; a member written with `mode_valid` clear
+  reads back with mode 0 and the flag set.
+- **`GARC_TIME_NONE` comes back as `GARC_TIME_TAR_OCTAL` with a time of zero**,
+  for the same reason: the header has an `mtime` field whether or not the caller
+  had a time, and zero is what goes in it.
+- **`mtime_source` cannot always be kept.** `GARC_TIME_PAX_DECIMAL` is honoured
+  as a request - a record is written even for a whole second, so a member read out
+  of a pax archive and written back still says a record answered - but a time the
+  octal field cannot hold can *only* be a record, so it reads back as
+  `GARC_TIME_PAX_DECIMAL` whatever was asked. The writer's fuzz harness found that
+  on its first run, by asserting that it could not happen.
+
+## 11. Testing
 
 **Four stream shapes, not one.** Seekability and known-size are two independent
 properties, so there are four combinations and a memory stream is one of them.
@@ -548,6 +694,29 @@ shape and the operation programme, so one harness covers the seekable and
 non-seekable paths rather than whichever one a constructor happened to pick. It
 also drives the failing allocator, so the out-of-memory arms are walked by the
 same corpus rather than by a separate campaign.
+
+**The writer harness can check the answer, not only the survival.** The other three
+check invariants that hold *by construction* - that `tell` advances by exactly what
+`read` reported, that a traversal implies a parent component, that prefixing
+`safe/` cannot turn a contained name into an escape - which is real and is not the
+same thing as an expected value. `fuzz_writer` has an expected value for free,
+because an archive it writes is an archive the reader reads: the member that comes
+back either is the member that went in or it is not. It also checks that a *refused* member left the sink's offset exactly where it
+was - not merely lower - that two writes of one member produce identical bytes, and
+that `GARC_TAR_USTAR` refuses a superset of what `GARC_TAR_PAX` refuses.
+
+It earned that twice within its first four thousand executions, and neither finding
+was a crash. The first was an over-strong invariant of its own: a negative time can
+only be written as a record, and a record *is* `GARC_TIME_PAX_DECIMAL`, so
+`mtime_source` cannot always survive a round trip - which is now said in
+`writer.h`. The second was a real gap in the writer's own validation: a NUL was
+refused in a member's name and in its link target and not in its owner names, so an
+owner name of raw bytes came back empty. Four near-identical checks is the shape
+where the fourth gets forgotten, and the fix is a sweep over all four rather than a
+fourth check.
+
+What it cannot find is a field with the wrong *meaning*: a writer and a reader that
+share a misunderstanding agree perfectly. That is what `make check-oracle` is for.
 
 ### The oracle, and why two references answer two questions
 

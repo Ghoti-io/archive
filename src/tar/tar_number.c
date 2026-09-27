@@ -281,3 +281,86 @@ GARC_Result garc_tar_parse_int(
   *out_value = (int64_t)value;
   return GARC_OK;
 }
+
+GARC_Result garc_tar_format_int(uint8_t * field, size_t length, int64_t value,
+    GARC_Tar_Number_Form * out_form) {
+  // Two bytes is the narrowest field that can hold one octal digit and a
+  // terminator; nothing in tar is narrower, and a length of 0 or 1 would make
+  // the digit loop below write outside the field.
+  if (!field || !out_form || length < 2u) {
+    return GARC_ERR_INVALID;
+  }
+
+  // **Octal with the widest run of digits the field allows**, zero-padded, with
+  // a single NUL terminator. GNU tar writes exactly this; libarchive spends one
+  // of the digits on a trailing space instead, which is equally legal and
+  // expresses one octal digit less - so this spelling is the one that keeps the
+  // threshold at which a pax record becomes necessary as high as the format
+  // permits, and it is the spelling every reader sees most often.
+  if (value >= 0) {
+    const size_t digits = length - 1u;
+    // Three bits per digit. A field wide enough for the shift to overflow is
+    // one whose octal form holds any int64_t there is, so the comparison is
+    // skipped rather than computed - `1u << 64` is undefined, not large.
+    const int fits = (digits * 3u >= 63u)
+        || ((uint64_t)value < ((uint64_t)1u << (digits * 3u)));
+    if (fits) {
+      uint64_t magnitude = (uint64_t)value;
+      field[digits] = '\0';
+      for (size_t i = digits; i-- > 0u;) {
+        field[i] = (uint8_t)('0' + (magnitude & 7u));
+        magnitude >>= 3;
+      }
+      *out_form = GARC_TAR_NUMBER_OCTAL;
+      return GARC_OK;
+    }
+  }
+
+  // Base-256: the value **sign-extended across the whole field**, with bit 7 of
+  // the first byte set as the flag. Bit 6 is then the value's sign bit, which is
+  // what sign extension puts there, and it is what garc_tar_parse_uint() reads
+  // the sign from. Writing "0x80 then the magnitude" instead would put a
+  // positive value's top bit where the sign belongs, so every value at or above
+  // half the field's span would read back negative.
+  const size_t bits = 7u + 8u * (length - 1u);
+  if (bits < 64u) {
+    // A field narrow enough to constrain an int64_t: the value has to fit the
+    // two's-complement span, or bit 6 ends up carrying value rather than sign
+    // and the number reads back as its own negation. An 8-byte field holds
+    // 63 bits, so this refuses at 2^62.
+    const int64_t limit = (int64_t)1 << (bits - 1u);
+    if (value >= limit || value < -limit) {
+      return GARC_ERR_UNSUPPORTED;
+    }
+  }
+
+  // Conversion to an unsigned type is modulo 2^64 and so is defined for a
+  // negative value; the two's-complement pattern is what that produces.
+  const uint64_t pattern = (uint64_t)value;
+  const uint8_t extend = (value < 0) ? 0xFFu : 0x00u;
+  for (size_t i = 0; i < length; ++i) {
+    // How far this byte is from the low end. The low eight bytes come from the
+    // pattern and everything above them is sign extension, which is what the
+    // parser peels.
+    const size_t from_end = length - 1u - i;
+    field[i] = (from_end < 8u)
+        ? (uint8_t)((pattern >> (from_end * 8u)) & 0xFFu)
+        : extend;
+  }
+  field[0] = (uint8_t)(field[0] | GARC_TAR_BASE256_FLAG);
+  *out_form = GARC_TAR_NUMBER_BASE256;
+  return GARC_OK;
+}
+
+GARC_Result garc_tar_format_uint(uint8_t * field, size_t length, uint64_t value,
+    GARC_Tar_Number_Form * out_form) {
+  // Above INT64_MAX there is no field this library can write: the octal form
+  // would need 22 digits and base-256 is two's complement, so the value would
+  // read back negative. garc_tar_parse_uint() refuses the same values from the
+  // other side, which is the property worth having - a writer that can produce
+  // a field its own reader rejects is a library that disagrees with itself.
+  if (value > (uint64_t)INT64_MAX) {
+    return GARC_ERR_UNSUPPORTED;
+  }
+  return garc_tar_format_int(field, length, (int64_t)value, out_form);
+}
