@@ -557,13 +557,31 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(CUTIL_LIBS)
 
 ####################################################################
+# The writer's oracle probe
+####################################################################
+
+# Neither an example nor a test, and tools/oracle/writer_probe.c says why it is
+# neither: `make check-writer` needs the writer's bytes to leave this process so
+# that GNU tar, bsdtar and Python's tarfile can be asked about them, and needs
+# this library's reading of what two of them re-wrote. Built like an example -
+# the static library whole, so the binary carries the code under test rather than
+# whatever is installed.
+WRITER_PROBE := $(APP_DIR)/oracle/writer_probe$(EXE_EXTENSION)
+
+$(WRITER_PROBE): tools/oracle/writer_probe.c $(APP_DIR)/$(STATIC_TARGET) \
+		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Probe: writer_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(CUTIL_LIBS)
+
+####################################################################
 # Commands
 ####################################################################
 
 # General commands
 .PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-aliasing
 .PHONY: check-corpus-hashes check-corpus corpus oracle-build oracle-version
-.PHONY: check-oracle
+.PHONY: check-oracle check-writer
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1168,9 +1186,9 @@ fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 # Oracles and the corpus
 ####################################################################
 #
-# **Two gates, and the split is the point.** Hashing the committed fixtures needs
-# nothing but sha256, so `check-corpus-hashes` is in TEST_GATES and runs on every
-# machine. Regenerating them needs the pinned image, so `check-corpus` is
+# **Three gates about the references, one about us, and both splits are the
+# point.** Hashing the committed fixtures needs nothing but sha256, so
+# `check-corpus-hashes` is in TEST_GATES and runs on every machine. Regenerating them needs the pinned image, so `check-corpus` is
 # separate and fails closed without it - its only caller is somebody who typed
 # the target. A gate that skipped when the image was absent would make a machine
 # with no engine look exactly like one where the references still agree.
@@ -1188,6 +1206,15 @@ fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 #                        from check-corpus: this one re-reads, that one re-writes,
 #                        and a reference can change its reading without changing
 #                        its writing.
+#   check-writer         **this library's writer** no longer producing something
+#                        the references understand. The other three all have a
+#                        reference as their subject and the committed bytes as
+#                        their fixture; this one has no fixture - it writes the
+#                        archives on the spot - and its subject is us. Nothing
+#                        that runs on this machine alone can replace it, because
+#                        tests/unit/test_writer.cpp asserts that the writer agrees
+#                        with this library's own idea of tar, which is exactly the
+#                        agreement a shared misunderstanding preserves.
 
 ORACLE := tools/oracle
 ORACLE_RUN := python3 $(ORACLE)/oracle_run.py
@@ -1221,6 +1248,20 @@ check-corpus: ## Fail if the pinned references no longer produce the corpus
 check-oracle: ## Fail if the live references disagree with the committed manifest
 	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- \
 		python3 $(ORACLE)/check_manifest.py
+
+check-writer: ## Fail if the references disagree with what the writer produces
+# **The one gate here whose subject is this library rather than a reference.**
+# The other three ask whether tar, bsdtar and tarfile still write and still read
+# the committed corpus the way they did. This hands them bytes the writer produced a
+# moment ago and asks whether they understand them - which no amount of asserting
+# against our own buffer can answer, because a shared misunderstanding of a format
+# passes every one of those assertions.
+#
+# Not in TEST_GATES and not in DEPLESS_GOALS: it needs the container, like the
+# other two, and unlike them it links the library under test.
+check-writer: $(WRITER_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/check_writer.py \
+		--probe $(WRITER_PROBE)
 
 ####################################################################
 # Install / uninstall
