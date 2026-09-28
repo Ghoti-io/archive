@@ -1354,6 +1354,23 @@ member. Four planted regressions were then caught as well - a flipped CRC bit in
 directory entry, a name length one byte short, a symlink written as a file, and an
 end record claiming one member too few.
 
+It grew two archives when the writer learned to deflate, one with the compressed
+size patched into each local header and one with it in a data descriptor, because
+those are the two places that number goes and a *stored* archive cannot tell them
+apart - its two sizes are the same number, so a writer putting the wrong one in the
+local header passes every stored archive. Three more regressions were planted and
+caught: the CRC taken over the compressed bytes instead of the uncompressed ones
+(Python refused the archive outright), the uncompressed size written into both the
+local header and the descriptor (unzip refused it), and symlink targets deflated
+again - which no reference minded, and which our own reading caught, because the
+target came back empty.
+
+One comparison got sharper rather than wider. libarchive deflates whatever it
+re-writes, so the method column used to be skipped for its whole round trip; now it
+is a predicate on the intent row, and libarchive *agrees* about every member we
+deflated. The skip applies only to the members we stored, which is a statement about
+libarchive rather than a hole in the gate.
+
 What it compares, and what it deliberately does not: four archives, the same member
 list encoded four ways, are accepted by unzip, bsdtar, 7-Zip and Python, with
 `unzip -t`, `7z t` and `zipfile.testzip()` each recomputing every member's CRC.

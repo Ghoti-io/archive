@@ -46,10 +46,12 @@ and all four shape what is compared:
   high byte. That is a predicate on the input, not a model of libarchive's
   quoting; a wrong model would compare the wrong string and pass.
 - **`bsdtar --format zip` deflates what it re-writes**, so every member of its
-  round trip comes back as method 8. That column is skipped and the size and the
-  CRC are not, which makes it the strongest statement in this gate: libarchive
-  deflated our bytes and this library inflated them back to the same bytes with
-  the same checksum.
+  round trip comes back as method 8 whatever it went in as. The size and the CRC
+  are still compared, which makes it the strongest statement in this gate:
+  libarchive deflated our bytes and this library inflated them back to the same
+  bytes with the same checksum. The method column started as a blanket skip and is
+  now a predicate - since the writer learned to deflate, libarchive *agrees* about
+  every member we deflated, and the skip applies only to the ones we stored.
 - **Python decodes a name with general purpose flag bit 11 clear as cp437**, so
   its name column is re-encoded through the codec the flag selects. Every ASCII
   name is unaffected, which is why this only had to be got right once there was a
@@ -94,8 +96,8 @@ COLUMNS = ["archive", "index", "name", "type", "size", "mtime", "mode",
 # green while testing less. These two numbers are the one thing here that has to be
 # edited when a fixture is added, which is where somebody says out loud that the
 # corpus grew - an accidental shrink has no such edit anywhere.
-EXPECTED_ARCHIVES = 4
-EXPECTED_MEMBERS = 44
+EXPECTED_ARCHIVES = 6
+EXPECTED_MEMBERS = 72
 
 # What each reference is allowed to say while doing its job, matched whole.
 #
@@ -120,11 +122,15 @@ ROUNDTRIP_SKIP = {
     # the strong half of this round trip: libarchive deflated our bytes and this
     # library inflated them back to the same bytes with the same checksum.
     #
-    # The name is not skipped here. libarchive translates a backslash and renders a
-    # high byte, so the name is compared for every member `bsdtar_verbatim()`
-    # accepts and counted for the rest - a member at a time rather than a column at
-    # a time.
-    "bsdtar": ("method",),
+    # **Neither column is skipped wholesale here, and the method stopped being so
+    # when the writer learned to deflate.** libarchive deflates, so it *agrees*
+    # about a member we deflated and differs about one we stored - which is a
+    # sharper statement than "skip the method", and it is `deflated_only()` that
+    # makes it. libarchive also translates a backslash and renders a high byte, so
+    # the name is compared for every member `bsdtar_verbatim()` accepts and counted
+    # for the rest. A member at a time rather than a column at a time, in both
+    # cases.
+    "bsdtar": (),
     # **Python re-encodes a name it decoded from cp437.** A member whose name is not
     # well-formed UTF-8 has general purpose flag bit 11 clear, so `zipfile` reads it
     # as cp437 and writes it back as UTF-8 with the flag set: `bad\x80utf.txt`
@@ -197,8 +203,19 @@ def python_verbatim(escaped):
     return "\\x" not in escaped
 
 
+def deflated_only(row):
+    """Whether this member's intent says deflate.
+
+    The predicate libarchive's round trip needs: `bsdtar --format zip` deflates
+    whatever it re-writes, so it agrees about a member we deflated and differs about
+    one we stored. Asked of the *intent* row, which is what keeps it a statement
+    about the input rather than a model of libarchive's choice.
+    """
+    return column(row, "method") == "8"
+
+
 def compare(failures, what, want_rows, got_rows, not_asked=(), finding_skip=(),
-        name_predicate=None):
+        predicates=None):
     """Compare two row lists field by field, index-aligned.
 
     Aligned by position rather than matched by name on purpose: a member that moved
@@ -208,16 +225,21 @@ def compare(failures, what, want_rows, got_rows, not_asked=(), finding_skip=(),
     things.** @p not_asked is a column this reference has no answer for - Python's
     zipfile has no link target, libarchive prints no CRC - and it is a property of
     the *question*, stated at the call site, so counting it would inflate a figure
-    nobody can act on. @p finding_skip and @p name_predicate are exclusions about
-    a *reference's behaviour*, and those are the ones worth watching: the number is
+    nobody can act on. @p finding_skip and @p predicates are exclusions about a
+    *reference's behaviour*, and those are the ones worth watching: the number is
     printed, and a field quietly joining that set is visible.
 
     @param not_asked Columns this reference cannot answer. Not counted.
-    @param finding_skip Columns a reference is known to change. Counted.
-    @param name_predicate Called with the intended escaped name; when it returns
-      false the `name` column is skipped for that member alone, and counted.
+    @param finding_skip Columns a reference is known to change for every member.
+      Counted.
+    @param predicates A column name to a callable taking the *intent* row; when it
+      returns false that column is skipped for that member alone, and counted. A
+      per-member predicate rather than a whole column wherever a reference changes
+      a field for some members and not others - which is stronger, because the
+      members it does not change are then compared.
     @return How many fields were compared and how many were skipped as findings.
     """
+    predicates = predicates or {}
     compared = 0
     skipped = 0
     want_by = by_archive(want_rows)
@@ -236,8 +258,8 @@ def compare(failures, what, want_rows, got_rows, not_asked=(), finding_skip=(),
                 if name in finding_skip:
                     skipped += 1
                     continue
-                if (name == "name" and name_predicate
-                        and not name_predicate(column(want_row, "name"))):
+                predicate = predicates.get(name)
+                if predicate and not predicate(want_row):
                     skipped += 1
                     continue
                 compared += 1
@@ -577,7 +599,7 @@ def run(binary, work, ours):
     bsdtar_compared, bsdtar_skipped = compare(failures, "bsdtar", intent,
         rows_from(read_tsv("rows-bsdtar.tsv")),
         not_asked=("size", "mtime", "method", "crc"),
-        name_predicate=bsdtar_verbatim)
+        predicates={"name": lambda row: bsdtar_verbatim(column(row, "name"))})
     counts.append(("fields from bsdtar", bsdtar_compared, bsdtar_skipped))
 
     # 5. Python's metadata. Its `size` column is the declared size and its `mtime`
@@ -607,10 +629,13 @@ def run(binary, work, ours):
     #    again from what it read.
     for label, directory in (("bsdtar", "rt-bsdtar"), ("python", "rt-python")):
         got = read_directory(binary, os.path.join(work, directory))
+        verbatim = bsdtar_verbatim if label == "bsdtar" else python_verbatim
+        predicates = {"name": lambda row, f=verbatim: f(column(row, "name"))}
+        if label == "bsdtar":
+            predicates["method"] = deflated_only
         compared, skipped = compare(failures, "%s round trip" % label, intent,
             got, finding_skip=ROUNDTRIP_SKIP.get(label, ()),
-            name_predicate=(bsdtar_verbatim if label == "bsdtar"
-                            else python_verbatim))
+            predicates=predicates)
         counts.append(("fields after %s re-wrote" % label, compared, skipped))
 
     if failures:
@@ -636,7 +661,8 @@ def run(binary, work, ours):
     # reference has no answer for is not in this number, because a figure that
     # counted those would be dominated by them and nobody could act on it.
     print("  %d fields skipped because a reference changes them, each named in "
-        "ROUNDTRIP_SKIP, bsdtar_verbatim() or python_verbatim()" % skipped_total)
+        "ROUNDTRIP_SKIP, bsdtar_verbatim(), python_verbatim() or deflated_only()"
+        % skipped_total)
     return 0
 
 

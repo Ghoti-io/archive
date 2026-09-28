@@ -124,6 +124,11 @@ static const Entry ENTRIES[] = {
    * writer adds an extended timestamp to. */
   {LIT("odd-second.txt"), GARC_MEMBER_FILE, LIT("odd\n"), NULL, 0644,
       1000000001},
+  /* Bytes deflate cannot shrink, so this is the member whose *compressed* size
+   * is larger than its uncompressed one in the deflated archives - which is a
+   * shape a reader's arithmetic can get wrong and the stored archives cannot
+   * produce. */
+  {LIT("noise.bin"), GARC_MEMBER_FILE, NULL, 0u, NULL, 0644, 1000000000},
   /* Modes the high half of external_file_attributes has to carry intact. */
   {LIT("setuid"), GARC_MEMBER_FILE, LIT("root\n"), NULL, 04755, 1000000000},
   {LIT("noperms"), GARC_MEMBER_FILE, LIT("none\n"), NULL, 0000, 1000000000},
@@ -135,31 +140,52 @@ static const Entry ENTRIES[] = {
 static char BIG[3000];
 
 /**
- * **Four encodings of one member list**, which is what the gate compares against
+ * `noise.bin`'s contents: bytes deflate cannot shrink.
+ *
+ * A linear congruential generator, so the same bytes come out on every host and
+ * the intent rows are reproducible. Not cryptographic and it does not need to be -
+ * it needs no runs and no skewed byte frequency, which is what defeats both halves
+ * of deflate.
+ */
+static char NOISE[3000];
+
+/**
+ * **Six encodings of one member list**, which is what the gate compares against
  * each other and against the references.
  *
- * The encodings differ in nothing but their encoding, which is what makes "all
- * four read the same" a statement about the writer rather than about four
- * different inputs. `pipe.zip` is the streaming form reached the way a caller
- * reaches it by accident - a sink with no `patch`, which is what a socket is - and
- * it must come out identical to asking for descriptors outright.
+ * The encodings differ in nothing but their encoding, which is what makes "all six
+ * read the same" a statement about the writer rather than about six different
+ * inputs. `pipe.zip` is the streaming form reached the way a caller reaches it by
+ * accident - a sink with no `patch`, which is what a socket is - and it must come
+ * out identical to asking for descriptors outright.
  */
 static const struct {
   const char * name;
   GARC_Zip_Sizes sizes;
   int patchable;
   int force_zip64;
+  GARC_Zip_Method method;
   const char * purpose;
 } ARCHIVES[] = {
-  {"local.zip", GARC_ZIP_SIZES_LOCAL, 1, 0,
+  {"local.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_STORED,
       "sizes and CRC filled into each local header, which needs a patchable sink"},
-  {"descriptor.zip", GARC_ZIP_SIZES_DESCRIPTOR, 1, 0,
+  {"descriptor.zip", GARC_ZIP_SIZES_DESCRIPTOR, 1, 0, GARC_ZIP_METHOD_STORED,
       "sizes and CRC in a data descriptor after each member, flag bit 3 set"},
-  {"pipe.zip", GARC_ZIP_SIZES_AUTO, 0, 0,
+  {"pipe.zip", GARC_ZIP_SIZES_AUTO, 0, 0, GARC_ZIP_METHOD_STORED,
       "the same descriptors, reached by a sink that cannot patch rather than by "
       "asking"},
-  {"zip64.zip", GARC_ZIP_SIZES_LOCAL, 1, 1,
+  {"zip64.zip", GARC_ZIP_SIZES_LOCAL, 1, 1, GARC_ZIP_METHOD_STORED,
       "zip64 fields on every member plus a zip64 end record and locator"},
+  // **Deflate, both ways the sizes can be written**, because those are the two
+  // places a compressed size goes and it is a different number from the
+  // uncompressed one in both. A stored archive cannot tell them apart: its two
+  // sizes are the same number, so a writer that put the wrong one in the local
+  // header would pass every stored archive here.
+  {"deflate.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_DEFLATE,
+      "deflated members with the compressed size patched into each local header"},
+  {"deflate-descriptor.zip", GARC_ZIP_SIZES_DESCRIPTOR, 1, 0,
+      GARC_ZIP_METHOD_DEFLATE,
+      "deflated members with the compressed size in a data descriptor"},
 };
 
 #define ARCHIVE_COUNT (sizeof(ARCHIVES) / sizeof(*ARCHIVES))
@@ -266,10 +292,12 @@ static GARC_Result size_cb(void * ctx, uint64_t * out_size) {
  * @param sizes Which size discipline to use.
  * @param patchable Whether to offer the sink a `patch` callback.
  * @param force_zip64 Whether to force zip64 fields.
+ * @param method Which method to write the members with.
  * @return 0 on success.
  */
 static int write_one(const char * directory, const char * name,
-    GARC_Zip_Sizes sizes, int patchable, int force_zip64) {
+    GARC_Zip_Sizes sizes, int patchable, int force_zip64,
+    GARC_Zip_Method method) {
   char path[1024];
   snprintf(path, sizeof(path), "%s/%s", directory, name);
   FILE * file = fopen(path, "wb");
@@ -298,6 +326,7 @@ static int write_one(const char * directory, const char * name,
   garc_writer_options_default(&options);
   options.zip_sizes = sizes;
   options.zip_force_zip64 = force_zip64;
+  options.zip_method = method;
   GARC_Writer * writer = NULL;
   result = garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer);
   if (result != GARC_OK) {
@@ -314,6 +343,10 @@ static int write_one(const char * directory, const char * name,
     if (strcmp(entry->name, "big.bin") == 0) {
       data = BIG;
       data_length = sizeof(BIG);
+    }
+    else if (strcmp(entry->name, "noise.bin") == 0) {
+      data = NOISE;
+      data_length = sizeof(NOISE);
     }
 
     GARC_Member member;
@@ -353,9 +386,16 @@ static int write_one(const char * directory, const char * name,
     const uint32_t crc = gcomp_crc32_finalize(gcomp_crc32_update(
         GCOMP_CRC32_INIT, (const uint8_t *)(content ? content : ""),
         (size_t)size));
+    // **The method the writer is expected to have used**, which is the archive's
+    // except where the writer's own rules override it: a member with no data is
+    // stored, and so is a symlink. Spelled here rather than read back out of the
+    // archive, because that is what makes this an intent row - a probe that asked
+    // the archive would agree with it whatever the writer did.
+    const uint16_t expect = entry->type == GARC_MEMBER_FILE && size
+        ? (uint16_t)method : (uint16_t)GARC_ZIP_METHOD_STORED;
     print_row(name, i, entry->name, entry->name_length, type_name(entry->type),
         size, entry->mtime, entry->mode, entry->link,
-        entry->link ? strlen(entry->link) : 0u, GARC_ZIP_METHOD_STORED, crc);
+        entry->link ? strlen(entry->link) : 0u, expect, crc);
   }
 
   if (result == GARC_OK) {
@@ -471,6 +511,11 @@ int main(int argc, char ** argv) {
   // Not a constant expression, so it is filled in here rather than spelled in the
   // table. The pattern repeats, so deflate would shrink it - which matters when
   // this member is compressed rather than stored.
+  uint32_t state = 0x13579BDFu;
+  for (size_t i = 0; i < sizeof(NOISE); ++i) {
+    state = state * 1103515245u + 12345u;
+    NOISE[i] = (char)(unsigned char)(state >> 16);
+  }
   for (size_t i = 0; i < sizeof(BIG); ++i) {
     BIG[i] = (char)('a' + (i % 26u));
   }
@@ -492,7 +537,8 @@ int main(int argc, char ** argv) {
 
   for (size_t i = 0; i < ARCHIVE_COUNT; ++i) {
     if (write_one(argv[2], ARCHIVES[i].name, ARCHIVES[i].sizes,
-            ARCHIVES[i].patchable, ARCHIVES[i].force_zip64)) {
+            ARCHIVES[i].patchable, ARCHIVES[i].force_zip64,
+            ARCHIVES[i].method)) {
       return 1;
     }
   }
