@@ -73,6 +73,19 @@ typedef enum {
   GARC_ERR_OOM,         ///< The allocator returned NULL.
   GARC_ERR_INVALID,     ///< A caller-supplied argument is wrong.
   GARC_ERR_INTERNAL,    ///< The library's own invariant failed; a bug.
+  /**
+   * The source cannot seek, and what was asked for needs to.
+   *
+   * ::garc_find() and nothing else, today. Not ::GARC_ERR_UNSUPPORTED, which
+   * says *this library* does not implement something: finding a member is
+   * implemented, and this stream cannot be rewound to do it. The difference is
+   * the caller's next move - a feature this library lacks is a wait, and a
+   * stream that cannot seek is a different stream or a different approach.
+   *
+   * Every compressed archive is in this case and cannot leave it: a codec stream
+   * has no seek, so a `tar.gz` is walked with ::garc_next() or not at all.
+   */
+  GARC_ERR_NOT_SEEKABLE,
 
   GARC_ERR_LIMIT_MEMBERS,      ///< ::GARC_Limits.max_members exceeded.
   GARC_ERR_LIMIT_MEMBER_BYTES, ///< ::GARC_Limits.max_member_bytes exceeded.

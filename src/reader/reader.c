@@ -130,6 +130,10 @@ GARC_Result garc_open_with_allocator(GARC_Stream * stream,
     garc_limits_default(&archive->limits);
   }
 
+  // Before reader_identify(), which reads a block: this is where the archive
+  // begins, and after the read it is no longer where the stream is.
+  archive->start_offset = garc_stream_tell(stream);
+
   GARC_Result result = reader_identify(archive);
   if (result != GARC_OK) {
     gcu_allocator_free(allocator, archive);
@@ -215,6 +219,112 @@ GARC_Result garc_next(GARC_Archive * archive, const GARC_Member ** out_member) {
 
   *out_member = &archive->member;
   return GARC_OK;
+}
+
+/**
+ * Put the archive back to the state ::garc_open() left it in.
+ *
+ * **Per-*walk* state only, and the split is the design rather than an
+ * omission.** ::garc_tar_next() already clears everything that belongs to one
+ * member at the top of every call - the pending `L`/`K` name, the `x` record set -
+ * and says there that it does so for the call which *failed* partway through a
+ * carrier. Resetting them here as well would be the same decision written in two
+ * places, which is the pair that drifts. What does not belong to a member is
+ * this function's: `pax_global`, which ::garc_tar_next() deliberately leaves
+ * alone because POSIX keeps a `g` set in force until something replaces it, and
+ * which therefore survives to the end of a walk and must not survive past it.
+ *
+ * Every line below was put in a position to fail before it was kept: removing any
+ * one of the seek offset, `pax_global`, `at_end`, `peek_length`, the data cursor
+ * or the counts makes a test in `test_find.cpp` fail. Three more were tried here
+ * and deleted, because nothing could distinguish them:
+ *
+ * - `have_member`, and the pending `L`/`K` name, and the `x` record set, are
+ *   *per-member* state that ::garc_next() and ::garc_tar_next() clear at the top
+ *   of every call - resetting them here is the same decision in two places, and
+ *   that is the pair that drifts.
+ * - `tar_saw_end_marker` is *derived* state. It is computed from the blocks on
+ *   the way to the point where it is read, and a second walk reads the same
+ *   blocks, so its value at that point cannot depend on what it was before.
+ *
+ * `peek_consumed` is the one kept without a test that can see it, and the reason
+ * is an invariant rather than caution: it is half of one value.
+ *
+ * A future format reader adding a `next` of its own inherits the same contract:
+ * per-member state is its, per-walk state is here.
+ *
+ * The `peek` window is emptied rather than refilled. It exists so that the bytes
+ * identification consumed can be put back on a stream that cannot seek; this
+ * path only runs on one that can, and the format is already known, so there is
+ * nothing to identify and nothing to put back.
+ *
+ * @param archive The archive.
+ * @return ::GARC_OK, or the seek's failure.
+ */
+static GARC_Result reader_rewind(GARC_Archive * archive) {
+  GARC_Result result
+      = garc_stream_seek(archive->stream, archive->start_offset);
+  if (result != GARC_OK) {
+    return result;
+  }
+
+  // Written as a pair because they are one value: a length with a stale offset
+  // beside it is a state no other path in this file produces.
+  archive->peek_length = 0;
+  archive->peek_consumed = 0;
+
+  archive->at_end = 0;
+  archive->data_remaining = 0;
+  archive->data_padding = 0;
+  garc_tar_pax_reset(&archive->pax_global);
+
+  // The caps count a walk, and this is a new one. Carrying the counts forward
+  // would make garc_find() fail with GARC_ERR_LIMIT_MEMBERS on an archive whose
+  // member count is merely *near* max_members, which is a cap firing on the sum
+  // of two passes over the same members rather than on anything in the archive.
+  archive->member_count = 0;
+  archive->total_declared_bytes = 0;
+
+  // The buffers themselves are kept: they are sized to the longest name seen so
+  // far and a second walk sees the same names, so freeing them here would make
+  // every find reallocate what it is about to need.
+  return GARC_OK;
+}
+
+GARC_Result garc_find(GARC_Archive * archive, const void * name,
+    size_t name_length, const GARC_Member ** out_member) {
+  if (!archive || !out_member || (!name && name_length)) {
+    return GARC_ERR_INVALID;
+  }
+  // Asked of the stream before anything is disturbed, so that a refusal leaves
+  // the cursor exactly where the caller left it. A find that reset the walk and
+  // then discovered it could not seek would be worse than useless on a pipe.
+  if (!garc_stream_is_seekable(archive->stream)) {
+    return GARC_ERR_NOT_SEEKABLE;
+  }
+
+  GARC_Result result = reader_rewind(archive);
+  if (result != GARC_OK) {
+    return result;
+  }
+
+  const GARC_Member * member = NULL;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    // Bytes, exactly, with no normalisation: this library reports the name the
+    // container carries, so a directory written as `notes/` is found under
+    // `notes/` and not under `notes`. A find that stripped a slash would be
+    // deciding something garc_next() deliberately does not.
+    if (member->name_length == name_length
+        && (!name_length
+            || memcmp(member->name, name, name_length) == 0)) {
+      *out_member = member;
+      return GARC_OK;
+    }
+  }
+  // GARC_END when the name is not there, which leaves the archive at its end -
+  // the same place a completed walk leaves it - or the failure that stopped the
+  // walk.
+  return result;
 }
 
 GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,

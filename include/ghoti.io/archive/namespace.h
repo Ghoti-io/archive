@@ -68,6 +68,7 @@
 #define garc_archive_dump GHOTIIO_ARCHIVE(garc_archive_dump)
 #define garc_close GHOTIIO_ARCHIVE(garc_close)
 #define garc_format GHOTIIO_ARCHIVE(garc_format)
+#define garc_find GHOTIIO_ARCHIVE(garc_find)
 #define garc_format_string GHOTIIO_ARCHIVE(garc_format_string)
 #define garc_limits_default GHOTIIO_ARCHIVE(garc_limits_default)
 #define garc_member_count GHOTIIO_ARCHIVE(garc_member_count)

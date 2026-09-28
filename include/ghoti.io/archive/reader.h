@@ -161,6 +161,47 @@ GARC_API GARC_Result garc_next(
     GARC_Archive * archive, const GARC_Member ** out_member);
 
 /**
+ * @brief Find a member by name, from the start of the archive.
+ *
+ * **This is a scan, and the name says `find` because that is what a caller
+ * wants, not because there is an index.** tar has no index and cannot gain one:
+ * the only way to know whether a name is present is to read every header until
+ * it is. So this rewinds to where the archive began and walks forward, and the
+ * cost is linear in the members before the match. It exists so that the walk is
+ * written once, correctly - resetting a pax global record set on the way back is
+ * easy to forget - rather than in every caller.
+ *
+ * **A stream that cannot seek gets ::GARC_ERR_NOT_SEEKABLE, and every
+ * compressed archive is in that case permanently.** A `tar.gz` is a codec stream
+ * with no seek (see codec.h), so there is no way back to the start and no index
+ * to consult instead; random access into one means decompressing it to find the
+ * offsets, which is not something a library should do behind a caller's back.
+ * Walk it with ::garc_next() instead, or decompress it to something seekable
+ * first. The refusal is checked before anything moves, so a refused find leaves
+ * the cursor exactly where it was.
+ *
+ * On ::GARC_OK the member is current, exactly as if ::garc_next() had returned
+ * it: ::garc_read_member() reads its bytes and ::garc_next() continues after it.
+ * The name is matched **byte for byte with no normalisation**, so a directory
+ * the archive spells `notes/` is found under `notes/` and not under `notes`.
+ *
+ * Two things a second walk changes, both documented rather than hidden:
+ * ::garc_member_count() is reset and counts this walk, so after a successful
+ * find it is the matched member's position; and the caps in ::GARC_Limits apply
+ * to the scan from zero rather than to the sum of every pass.
+ *
+ * @param archive The archive.
+ * @param name The name to match. May be NULL only when @p name_length is 0.
+ * @param name_length Its length in bytes.
+ * @param out_member Receives the member on ::GARC_OK. Untouched otherwise.
+ * @return ::GARC_OK with a member, ::GARC_END when the archive holds no such
+ *   name - which is **not** an error - ::GARC_ERR_NOT_SEEKABLE on a stream that
+ *   cannot be rewound, ::GARC_ERR_INVALID, or whatever failure stopped the walk.
+ */
+GARC_API GARC_Result garc_find(GARC_Archive * archive, const void * name,
+    size_t name_length, const GARC_Member ** out_member);
+
+/**
  * @brief Read some of the current member's data.
  *
  * Call repeatedly until `*out_read` is zero, which is the end of the member.

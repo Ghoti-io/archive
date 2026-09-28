@@ -137,6 +137,16 @@ struct GARC_Archive {
   GARC_Limits limits;
   /** Which container. */
   GARC_Format format;
+  /**
+   * Where in the stream this archive begins.
+   *
+   * Not assumed to be zero. ::garc_open() takes a stream *positioned at* the
+   * start of an archive, which is not the same as the start of the stream - an
+   * archive inside another one, or after a header the caller read itself. It is
+   * what ::garc_find() seeks back to, and taking it at open is the only moment
+   * it can be known.
+   */
+  uint64_t start_offset;
 
   /** The member garc_next() last handed out. */
   GARC_Member member;

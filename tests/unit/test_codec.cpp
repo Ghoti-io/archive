@@ -806,6 +806,72 @@ TEST(Codec, AFailingInnerSinkDuringTheDataIsReported) {
   garc_sink_destroy(file);
 }
 
+////////////////////////////////////////////////////////////////////////
+// The refusal a compressed archive cannot leave
+////////////////////////////////////////////////////////////////////////
+
+TEST(Codec, FindRefusesACompressedArchiveBecauseItCannotBeRewound) {
+  // The item phase C owed, and the reason it waited for a garc_find to refuse
+  // on. A codec stream has no seek, so there is no way back to the start and no
+  // index to consult instead - and the refusal has a status of its own rather
+  // than being GARC_ERR_UNSUPPORTED, because finding is implemented and it is
+  // *this stream* that cannot do it.
+  const std::vector<Entry> entries = small_entries();
+  for (const char * method : kMethods) {
+    SCOPED_TRACE(method);
+    std::string packed;
+    ASSERT_EQ(GARC_OK, pack(method, entries, &packed));
+
+    GARC_Stream * file = nullptr;
+    ASSERT_EQ(GARC_OK,
+        garc_stream_create_memory(packed.data(), packed.size(), &file));
+    // The *inner* stream is a memory stream and seeks perfectly well. That is
+    // the point of checking here: what refuses is the decompressing wrapper, so
+    // a caller cannot get random access by handing over a seekable file.
+    EXPECT_TRUE(garc_stream_is_seekable(file));
+
+    GARC_Stream * plain = nullptr;
+    ASSERT_EQ(GARC_OK,
+        garc_stream_create_decompress(file, method, nullptr, &plain));
+    EXPECT_FALSE(garc_stream_is_seekable(plain));
+
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(GARC_OK, garc_open(plain, nullptr, &archive));
+    const GARC_Member * found = nullptr;
+    EXPECT_EQ(GARC_ERR_NOT_SEEKABLE,
+        garc_find(archive, "notes/hello.txt", 15, &found));
+    EXPECT_EQ(nullptr, found);
+
+    // And the refusal moved nothing: the walk still starts at the first member.
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(GARC_OK, garc_next(archive, &member));
+    EXPECT_EQ("notes/hello.txt",
+        std::string(member->name, member->name_length));
+
+    garc_close(archive);
+    garc_stream_destroy(plain);
+    garc_stream_destroy(file);
+  }
+}
+
+TEST(Codec, TheSameArchiveUncompressedIsFindable) {
+  // The other half of the claim. Without this the refusal above would pass just
+  // as well if garc_find() refused everything.
+  const std::string plain = plain_tar(small_entries());
+  ASSERT_FALSE(plain.empty());
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(plain.data(), plain.size(), &stream));
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(GARC_OK, garc_open(stream, nullptr, &archive));
+  const GARC_Member * found = nullptr;
+  ASSERT_EQ(GARC_OK, garc_find(archive, "notes/empty.txt", 15, &found));
+  ASSERT_NE(nullptr, found);
+  EXPECT_EQ("notes/empty.txt", std::string(found->name, found->name_length));
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
 int main(int argc, char ** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

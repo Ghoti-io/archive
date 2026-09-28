@@ -48,6 +48,8 @@ const char * garc_result_string(GARC_Result result) {
       return "Invalid argument";
     case GARC_ERR_INTERNAL:
       return "Internal error";
+    case GARC_ERR_NOT_SEEKABLE:
+      return "The source cannot seek, and this needs to";
     // Each cap says which cap. A shared string would undo half of what six
     // separate constants buy, since a message is what a caller prints.
     case GARC_ERR_LIMIT_MEMBERS:
