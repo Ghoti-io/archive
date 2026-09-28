@@ -8,7 +8,7 @@
 # Ghoti.io Archive is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version 3 as
 # published by the Free Software Foundation.
-"""Generate the zip corpus in the pinned container, and three readings of it.
+"""Generate the zip corpus in the pinned container, and five readings of it.
 
     make zip-corpus         regenerate tests/data/zip/ and the hash list
     make check-zip-corpus   regenerate into a scratch directory and compare
@@ -150,8 +150,17 @@ def build_tree(base):
 
 
 def run(argv, cwd=None, what=""):
-    """Run a writer, and fail loudly rather than leaving a short fixture."""
-    finished = subprocess.run(argv, cwd=cwd, capture_output=True, text=True)
+    """Run a writer, and fail loudly rather than leaving a short fixture.
+
+    **Every reference in this file is run with stdin closed**, here and in each
+    of the other invocations. An extractor that meets an encrypted member asks
+    for a password on the terminal, and with stdin attached to whatever launched
+    `make` the generator does not fail - it waits, silently, forever. That is how
+    the first run of the verdict half of this corpus ended: three encrypted
+    fixtures, and unzip blocked on the first of them with no output at all.
+    """
+    finished = subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL)
     if finished.returncode != 0:
         raise SystemExit("%s failed (%s):\n%s\n%s" % (argv[0], what,
             finished.stdout.strip(), finished.stderr.strip()))
@@ -196,6 +205,14 @@ INFOZIP = [
         "ZipCrypto, which phase D reads and will never write. Info-ZIP also "
         "sets general purpose flag bit 3 here, so the sizes are in a data "
         "descriptor as well - two features that arrive together in practice"),
+    ("infozip-crypto-deflate.zip", ["-9", "-X", "-P", PASSWORD],
+        ["compressible.txt", "hello.txt"],
+        "ZipCrypto around *deflate*, which is a different shape from ZipCrypto "
+        "around stored: the cipher is outermost and the decoder reads what it "
+        "produces, so a reader that decrypts and decompresses in the wrong "
+        "order reads the stored fixture correctly and this one not at all. "
+        "Info-ZIP falls back to stored for hello.txt, so one archive holds "
+        "both layerings"),
 ]
 
 
@@ -403,6 +420,204 @@ def generate_python(destination):
         handle.write(stub + body)
 
 
+# The hostile names, each with the reason it is here. **Python's zipfile is the
+# writer for all of these**, because it is the only one of the four that stores
+# the name it is given: `zip` resolves a path against the filesystem before it
+# stores it, and there is no `--transform` to lie to it with. That is a real
+# difference from the tar corpus, where GNU tar wrote the hostile fixtures - here
+# the writer is not one of the references that reads them back.
+#
+# The names point at /tmp rather than /etc for the same reason the tar corpus's
+# do: these fixtures are extracted inside the container to record what the
+# extractors do with them, and an absolute name that *succeeds* writes a file.
+MALICIOUS_NAMES = [
+    ("../../../tmp/ghoti-escaped",
+        "the classic traversal: leading parent components, which every reference "
+        "here acts on and no two of them act on the same way"),
+    ("/tmp/ghoti-escaped",
+        "absolute, which ignores the extraction root rather than climbing out of "
+        "it - and which all three references *rewrite* rather than refuse"),
+    ("a/../../b",
+        "a traversal that starts inside, so a check that only looks at the first "
+        "component misses it"),
+    ("a/..",
+        "a parent component that resolves *inside* the root. libarchive refuses "
+        "it for containing '..' at all; Python's zipfile has no policy to apply "
+        "and fails on the filesystem instead, which is a different thing and is "
+        "why the column below records the exception's name"),
+    ("./x",
+        "a current-directory component, which is not an escape - so a checker "
+        "that treats any non-ordinary component as one is wrong here"),
+    ("a//b", "an empty component, which nothing objects to"),
+    ("..\\..\\..\\tmp\\ghoti-esc-bs",
+        "**the discriminating case, and it is zip's own.** libarchive "
+        "translates backslash to slash for a zip member and then refuses this "
+        "for containing '..'; unzip and Python store and create it as one "
+        "ordinary filename with backslashes in it. Nothing in the tar corpus "
+        "separates the references on this axis, and it is the whole reason "
+        "GARC_NAME_BACKSLASH and GARC_NAME_WINDOWS_TRAVERSAL are two findings "
+        "rather than one"),
+    ("a\\..\\..\\b",
+        "the same axis starting inside, so the depth arithmetic has to run over "
+        "the backslash-separated components too"),
+    ("C:\\Windows\\ghoti",
+        "a drive letter, which libarchive strips and the other two keep - the "
+        "same disagreement the tar corpus found, confirmed for zip"),
+    ("\\\\server\\share\\ghoti",
+        "a UNC path, which libarchive turns into `server/share/ghoti` and the "
+        "other two create verbatim"),
+    ("..",
+        "the whole name is a parent component. unzip rewrites it to `__`, which "
+        "no other reference does and which is why a rewrite target is recorded "
+        "rather than a bit"),
+    ("CON",
+        "reserved on Windows, ordinary everywhere else. No reference here can "
+        "answer it: all three run on POSIX"),
+    ("aux.txt",
+        "reserved on Windows *with* an extension, which is the form that gets "
+        "missed"),
+    ("COM1", "the numbered device family"),
+    ("trailing.",
+        "Windows strips a trailing dot, so this collides with `trailing`"),
+    ("trailing ", "and a trailing space, likewise"),
+    ("esc\x1b[31mred",
+        "an ANSI escape in a name, which rewrites a terminal that prints a "
+        "listing unescaped"),
+    ("a/b/../../../c",
+        "descends twice and climbs three times, so the arithmetic has to be a "
+        "running depth rather than a count of components"),
+]
+
+# **A zip symlink has no link field: the target is the member's data.** So the
+# question garc_name_check() exists to ask about a target cannot be asked in zip
+# until the member has been read, which is a different order of operations from
+# tar and is why these are a fixture rather than a note. Every reference here
+# creates all three of these links without a word of complaint.
+MALICIOUS_LINKS = [
+    ("abs-target", "/tmp/ghoti-escaped", "an absolute link target"),
+    ("up-target", "../../..", "a target that climbs out of any root"),
+    ("dot-target", "./sibling", "a target that does not escape, as the control"),
+]
+
+# Eight bytes, so it replaces an eight-byte ASCII placeholder without moving a
+# single offset in the archive. Not well-formed UTF-8 twice over: 0x80 is a
+# continuation byte with nothing in front of it, and 0xC0 begins an overlong
+# encoding.
+MALICIOUS_RAW_NAME = b"bad\x80utf\xc0"
+
+
+def generate_malicious(destination):
+    """The hostile-name fixtures, all of them from Python's zipfile."""
+    import warnings
+    import zipfile
+
+    path = os.path.join(destination, "mal-paths.zip")
+    with zipfile.ZipFile(path, "w") as handle:
+        for name, _why in MALICIOUS_NAMES:
+            # Asserted rather than trusted: a name that arrived re-encoded would
+            # make the fixture test something other than what the table says, and
+            # that is exactly the mistake the tar corpus made once - two names
+            # meant to hold raw bytes were valid UTF-8 by the time tar saw them.
+            assert name.encode("utf-8").decode("utf-8") == name, name
+            handle.writestr(python_info(name), b"hostile\n")
+
+    # Symlinks, whose targets are the hostile part. `0o120777` is S_IFLNK with
+    # its usual mode; the target is the data, which is what makes a zip symlink a
+    # symlink.
+    path = os.path.join(destination, "mal-links.zip")
+    with zipfile.ZipFile(path, "w") as handle:
+        handle.writestr(python_info("sibling"), b"target\n")
+        for name, target, _why in MALICIOUS_LINKS:
+            handle.writestr(python_info(name, mode=0o120777),
+                target.encode("utf-8"))
+
+    # Collisions: two names differing only in case, and two differing only in
+    # Unicode normalisation. **Neither is detectable from one name**, which is
+    # the point - they are here so that phase F has them and so that this
+    # library's tests can say out loud that the check does not claim to find
+    # them. Case folding and normalisation need tables this library deliberately
+    # does not carry; they are `unicode`'s.
+    path = os.path.join(destination, "mal-collisions.zip")
+    with zipfile.ZipFile(path, "w") as handle:
+        for name in ("A.txt", "a.txt",
+                b"caf\xc3\xa9".decode("utf-8"),
+                b"cafe\xcc\x81".decode("utf-8")):
+            handle.writestr(python_info(name), b"collide\n")
+
+    # A name whose bytes are not well-formed UTF-8, in **two archives that differ
+    # only in general purpose flag bit 11** - the flag that is the whole of what a
+    # zip ever says about a name's encoding. With it clear the name is cp437 by
+    # specification and every reference reads the archive; with it set the archive
+    # *claims* UTF-8 about bytes that are not, and Python and libarchive both
+    # refuse it while unzip and 7-Zip read it. tar has no flag to lie with, so
+    # this axis is zip's alone, and it is two fixtures rather than two members of
+    # one because an archive Python cannot open contributes no rows to any
+    # per-member reading.
+    #
+    # Written as an ASCII placeholder and substituted afterwards, because
+    # `zipfile` encodes a name before storing it and there is no spelling of a
+    # lone 0x80 it will pass through. The placeholder appears exactly twice - once
+    # in the local header and once in the central directory - and that count is
+    # asserted, because a replacement that hit one record and not the other would
+    # produce an archive whose two copies of the name disagree, which is a
+    # different fixture testing a different thing.
+    placeholder = b"AAAAAAAA"
+    assert len(placeholder) == len(MALICIOUS_RAW_NAME)
+    for name, lie in (("mal-encodings.zip", False), ("mal-utf8-lie.zip", True)):
+        path = os.path.join(destination, name)
+        with zipfile.ZipFile(path, "w") as handle:
+            handle.writestr(python_info(placeholder.decode("ascii")),
+                b"not utf-8\n")
+            # A control in the same archive, so that a reference which refuses the
+            # hostile name can still be seen to have read the rest of it.
+            handle.writestr(python_info("ordinary.txt"), b"control\n")
+        with open(path, "rb") as reader:
+            raw = reader.read()
+        if lie:
+            # The flag word sits at a fixed offset from each signature, so it is
+            # found from the signature and the placeholder rather than from an
+            # extra field's length.
+            raw = zip_set_utf8_flag(raw, placeholder)
+        if raw.count(placeholder) != 2:
+            raise SystemExit("%s: %r appears %d times, not twice"
+                % (name, placeholder, raw.count(placeholder)))
+        with open(path, "wb") as writer:
+            writer.write(raw.replace(placeholder, MALICIOUS_RAW_NAME))
+    del warnings
+
+
+def zip_set_utf8_flag(raw, name):
+    """Set general purpose flag bit 11 on the member called @p name.
+
+    Both of its records: the local header, where the flag word is at +6, and the
+    central directory entry, where it is at +8. Located from each signature and
+    the name that follows it, so nothing here depends on an extra field's length.
+
+    @param raw The whole archive.
+    @param name The member's name, as bytes.
+    @return The archive with that member's two flag words changed.
+    """
+    out = bytearray(raw)
+    found = 0
+    for signature, flag_at, name_at in (
+            (b"PK\x03\x04", 6, 30), (b"PK\x01\x02", 8, 46)):
+        start = 0
+        while True:
+            at = out.find(signature, start)
+            if at < 0:
+                break
+            start = at + 4
+            if bytes(out[at + name_at:at + name_at + len(name)]) != name:
+                continue
+            flags = struct.unpack_from("<H", out, at + flag_at)[0]
+            struct.pack_into("<H", out, at + flag_at, flags | 0x800)
+            found += 1
+    if found != 2:
+        raise SystemExit(
+            "mal-encodings.zip: set the UTF-8 flag on %d records, not 2" % found)
+    return bytes(out)
+
+
 def generate(destination):
     """Write every fixture into `destination`."""
     tree = os.path.join(destination, ".tree")
@@ -415,6 +630,7 @@ def generate(destination):
     generate_bsdtar(destination, tree)
     generate_sevenzip(destination, tree)
     generate_python(destination)
+    generate_malicious(destination)
 
     shutil.rmtree(tree)
 
@@ -464,6 +680,29 @@ def extra_ids(raw):
         # decide what to do with it.
         ids.append("+%d" % (len(raw) - offset))
     return ",".join(ids)
+
+
+def name_bytes(info):
+    """The member's name as the *archive's bytes*, undoing Python's decode.
+
+    **A zip name with bit 11 clear is cp437 by specification**, and Python
+    implements that: `ZipInfo.orig_filename` for such a member is a `str` decoded
+    from cp437, so re-encoding it as UTF-8 would put a name in the manifest that
+    is in no record of the archive. cp437 is a total, invertible single-byte
+    mapping, so encoding back through the codec Python decoded with recovers the
+    bytes exactly - which is what a reader reports and therefore what a row this
+    library can be compared against has to hold.
+
+    For every name in this corpus that is ASCII the two codecs agree, so this
+    changes nothing except for the fixture that is *about* a name which is not
+    well-formed UTF-8. Said out loud here because the alternative - a name column
+    holding the UTF-8 of a cp437 reading - looks right in every row until one.
+
+    @param info A `ZipInfo`.
+    @return The name as it appears in the archive.
+    """
+    codec = "utf-8" if info.flag_bits & 0x800 else "cp437"
+    return info.orig_filename.encode(codec, "surrogateescape")
 
 
 MANIFEST_COLUMNS = ("archive", "index", "name", "size", "csize", "method",
@@ -530,8 +769,7 @@ def manifest(destination, out=None):
                 lines.append("\t".join([
                     name,
                     str(index),
-                    escape(info.orig_filename.encode("utf-8",
-                        "surrogateescape")),
+                    escape(name_bytes(info)),
                     str(info.file_size),
                     str(info.compress_size),
                     str(info.compress_type),
@@ -572,7 +810,7 @@ def bsdtar_rows(destination):
     for name in fixtures(destination):
         finished = subprocess.run(
             ["bsdtar", "-tvf", os.path.join(destination, name)],
-            capture_output=True)
+            capture_output=True, stdin=subprocess.DEVNULL)
         if finished.returncode != 0:
             # Not a failure here: an archive libarchive refuses has no rows, and
             # openings.tsv is where the refusal is recorded. Recording it in both
@@ -591,14 +829,28 @@ def bsdtar_rows(destination):
             target = b""
             if b" -> " in remainder:
                 remainder, _, target = remainder.partition(b" -> ")
-            if b" " in remainder:
+            # A space in a name is safe: the split above has a maxsplit, so the
+            # ninth field is everything after the seven fixed ones however many
+            # spaces it holds. What is *not* safe is a second ` -> ` - the
+            # partition above took the first one, and a name containing one would
+            # have had its tail read as a link target. The malicious corpus has a
+            # name ending in a space on purpose, which is how the older, stricter
+            # form of this check was found to be refusing a legitimate name.
+            if b" -> " in remainder:
                 raise SystemExit(
-                    "%s: a member name with a space in it breaks this parse: %r"
+                    "%s: a member name containing ' -> ' breaks this parse: %r"
                     % (name, remainder))
             kind = {0x64: "directory", 0x6C: "symlink", 0x2D: "file"}.get(
                 mode[0], "other")
-            rows.append((name, str(index), kind, escape(mode), escape(remainder),
-                escape(target)))
+            # **Through unrender_bsdtar(), so this column holds the archive's
+            # bytes.** libarchive prints a byte outside printable ASCII as `\NNN`
+            # octal, so without this the row for a name that is not well-formed
+            # UTF-8 would hold libarchive's rendering of it - four characters
+            # where the archive has one byte - and a reader comparing its own
+            # name against this row would disagree with itself.
+            rows.append((name, str(index), kind, escape(mode),
+                escape(unrender_bsdtar(remainder)),
+                escape(unrender_bsdtar(target))))
             index += 1
     return rows
 
@@ -710,7 +962,7 @@ def openings(destination, out=None):
             # in the committed file - and the fixture's hash would then depend on
             # where the repository happens to live.
             finished = subprocess.run(argv + [name], cwd=destination,
-                capture_output=True)
+                capture_output=True, stdin=subprocess.DEVNULL)
             rows.append((name, reference,
                 "accepted" if finished.returncode == 0 else "refused",
                 str(finished.returncode),
@@ -754,28 +1006,462 @@ def openings(destination, out=None):
         handle.write("\n".join(lines) + "\n")
 
 
-# The three emitters above take an `out` directory separately from the corpus
+VERDICT_COLUMNS = ("archive", "index", "name", "python", "unzip", "libarchive")
+
+# The verbs unzip prints one of per member, in archive order. `skipping` is in the
+# list because a member whose method unzip does not implement still gets a line -
+# which keeps the sequence aligned with the members, and a parse that only knew
+# the success verbs would silently attribute every later line to the wrong member.
+UNZIP_VERBS = {
+    b"extracting": "same",
+    b"inflating": "same",
+    b"linking": "same",
+    b"creating": "same",
+    b"skipping": "refused",
+}
+
+
+def unrender_bsdtar(field):
+    """Undo libarchive's rendering of a non-printable byte in a listing.
+
+    libarchive prints a byte outside printable ASCII as `\\NNN` octal, so the name
+    it reports for a member with an ESC in it is not the member's bytes - and a
+    comparison against the archive's name would score an unchanged name as a
+    rewrite. This is the one place that rendering is undone, and an unknown escape
+    is an error rather than a guess: a wrong decode here would be invisible.
+
+    @param field The name as libarchive printed it, as bytes.
+    @return The bytes it stands for.
+    """
+    out = bytearray()
+    index = 0
+    while index < len(field):
+        byte = field[index]
+        if byte != 0x5C:
+            out.append(byte)
+            index += 1
+            continue
+        if field[index + 1:index + 2] == b"\\":
+            out.append(0x5C)
+            index += 2
+            continue
+        digits = field[index + 1:index + 4]
+        if len(digits) != 3 or any(d < 0x30 or d > 0x37 for d in digits):
+            raise SystemExit("libarchive rendered something this does not "
+                "understand: %r" % field)
+        out.append(int(digits, 8))
+        index += 4
+    return bytes(out)
+
+
+def extractor_verdicts(destination, name, members):
+    """Ask unzip and libarchive what they DO with each member of one archive.
+
+    Returns `(unzip, libarchive, comments)`, the first two being lists as long as
+    @p members holding one of `same`, `rewrite=<name>` or `refused=<reason>` - or
+    `-` where the reference could not open the archive at all, which is a fact
+    `openings.tsv` already records and which must not be confused with a verdict.
+
+    **Both references are parsed from an ordered per-member line**, not by
+    matching a diagnostic against a name. `bsdtar -xv` prints exactly one
+    `x <name>[: <reason>]` line per member, and unzip prints one verb line per
+    member on stdout. Matching by name cannot work here: libarchive reports the
+    name it *decided*, so the member whose backslashes it translated is not
+    findable under the name the archive holds - which is the very member the
+    fixture exists for. The line counts are asserted against the member count, so
+    a reference that changes its output shape fails loudly rather than shifting
+    every verdict by one.
+    """
+    comments = []
+
+    def room_for(reference):
+        where = os.path.join("/tmp", "ghoti-zip-extract", name, reference)
+        if os.path.exists(where):
+            shutil.rmtree(where)
+        os.makedirs(where)
+        return where
+
+    # libarchive. One line per member on stderr, plus archive-level notes.
+    room = room_for("bsdtar")
+    finished = subprocess.run(["bsdtar", "-xvf",
+        os.path.join(destination, name)], cwd=room, capture_output=True,
+        stdin=subprocess.DEVNULL)
+    libarchive = []
+    notes = []
+    for raw in finished.stderr.split(b"\n"):
+        if not raw:
+            continue
+        if raw.startswith(b"bsdtar: "):
+            text = raw[len(b"bsdtar: "):]
+            if not text.startswith(b"Error exit delayed"):
+                notes.append(escape(text))
+            continue
+        if not raw.startswith(b"x "):
+            raise SystemExit("%s: bsdtar printed a line this parse does not "
+                "understand: %r" % (name, raw))
+        field, separator, reason = raw[2:].partition(b": ")
+        if separator:
+            libarchive.append("refused=%s" % escape(reason))
+        elif unrender_bsdtar(field) == members[len(libarchive)]:
+            libarchive.append("same")
+        else:
+            libarchive.append("rewrite=%s" % escape(unrender_bsdtar(field)))
+    if notes:
+        comments.append("# %s: libarchive also said: %s"
+            % (name, "; ".join(notes)))
+    # **What it created, and not only what it said.** libarchive reports the
+    # composed form of a decomposed name, so the two halves of the collision pair
+    # land on one path and the second overwrites the first: four members, three
+    # files, exit 0, and not a word about it. That is only visible in the tree.
+    created = []
+    for here, directories, files in os.walk(room):
+        relative = os.path.relpath(here, room)
+        for entry in sorted(files) + sorted(directories):
+            joined = entry if relative == "." else os.path.join(relative, entry)
+            created.append(escape(os.fsencode(joined)))
+    if created:
+        comments.append("# %s: libarchive created: %s"
+            % (name, " ".join(sorted(created))))
+    if not libarchive:
+        libarchive = ["-"] * len(members)
+    elif len(libarchive) != len(members):
+        raise SystemExit("%s: bsdtar printed %d member lines for %d members"
+            % (name, len(libarchive), len(members)))
+    shutil.rmtree(room, ignore_errors=True)
+
+    # unzip. One verb line per member on stdout, and a member it gives up on
+    # entirely names itself on stderr instead - so those are removed from the
+    # sequence before the rest is aligned.
+    room = room_for("unzip")
+    finished = subprocess.run(["unzip", "-o",
+        os.path.join(destination, name)], cwd=room, capture_output=True,
+        stdin=subprocess.DEVNULL)
+    gave_up = {}
+    for raw in finished.stderr.split(b"\n"):
+        marker = b"unable to process "
+        at = raw.find(marker)
+        if at < 0:
+            continue
+        who = raw[at + len(marker):].rstrip().rstrip(b".")
+        gave_up[who] = escape(raw.strip())
+    lines = []
+    for raw in finished.stdout.split(b"\n"):
+        stripped = raw.strip()
+        verb, separator, rest = stripped.partition(b": ")
+        if not separator or verb not in UNZIP_VERBS:
+            continue
+        # A `linking:` line carries ` -> <target>` after the name, and every verb
+        # pads the name out to a column. Both are display, so both come off here.
+        shown = rest.partition(b" -> ")[0].strip()
+        lines.append((verb, shown))
+    # **What unzip created, from the filesystem rather than from its output.**
+    # Its display drops a control byte and its column padding eats a trailing
+    # space, so two names in the malicious fixture came back as rewrites of
+    # themselves when the verdict was read off the line. The tree is what it
+    # actually did; the line is only consulted for a rewrite's target.
+    tree = set()
+    for here, directories, files in os.walk(room):
+        relative = os.path.relpath(here, room)
+        for entry in sorted(files) + sorted(directories):
+            joined = entry if relative == "." else os.path.join(relative, entry)
+            tree.add(os.fsencode(joined))
+    unzip = []
+    for member in members:
+        if member in gave_up:
+            unzip.append("refused=%s" % gave_up[member])
+            continue
+        if not lines:
+            unzip = []
+            break
+        verb, shown = lines.pop(0)
+        if UNZIP_VERBS[verb] == "refused":
+            unzip.append("refused=%s" % escape(verb))
+        elif member.rstrip(b"/") in tree:
+            unzip.append("same")
+        else:
+            unzip.append("rewrite=%s" % escape(shown))
+    if lines:
+        raise SystemExit("%s: unzip printed %d member lines more than there are "
+            "members" % (name, len(lines)))
+    if not unzip:
+        unzip = ["-"] * len(members)
+    if tree:
+        comments.append("# %s: unzip created: %s"
+            % (name, " ".join(escape(entry) for entry in sorted(tree))))
+    shutil.rmtree(room, ignore_errors=True)
+
+    return unzip, libarchive, comments
+
+
+def verdict_rows(destination):
+    """Ask all three references what they would do, and return (comments, rows).
+
+    Separate from verdicts() so that `check-zip-oracle` can ask the same question
+    of the committed bytes without a second copy of how it is asked.
+    """
+    import zipfile
+
+    comments = []
+    rows = []
+    for name in fixtures(destination):
+        path = os.path.join(destination, name)
+        try:
+            handle = zipfile.ZipFile(path)
+        except Exception:
+            # An archive Python refuses has no rows here and a row in
+            # openings.tsv, which is the file that records a refusal to open.
+            continue
+        with handle:
+            infos = handle.infolist()
+            members = [name_bytes(info) for info in infos]
+            unzip, libarchive, notes = extractor_verdicts(
+                destination, name, members)
+            comments += notes
+
+            # Python, in process and member by member, into one room - so that a
+            # member whose sanitised name collides with something an earlier
+            # member created fails the way it does in a real extraction.
+            room = os.path.join("/tmp", "ghoti-zip-extract", name, "python")
+            if os.path.exists(room):
+                shutil.rmtree(room)
+            os.makedirs(room)
+            for index, info in enumerate(infos):
+                try:
+                    out = handle.extract(info, room)
+                    relative = os.path.relpath(out, room)
+                    python = ("same"
+                        if relative.encode("utf-8", "surrogateescape")
+                            == members[index].rstrip(b"/")
+                        else "rewrite=%s" % escape(
+                            relative.encode("utf-8", "surrogateescape")))
+                except Exception as problem:
+                    # The exception's *name*, because Python's zipfile has no name
+                    # policy to report: it drops parent components and leading
+                    # separators on the way to a path and then lets the
+                    # filesystem answer. An IsADirectoryError here is not a
+                    # refusal, and a column that called it one would be claiming
+                    # a policy that does not exist.
+                    python = type(problem).__name__
+                rows.append((name, str(index), escape(members[index]),
+                    python, unzip[index], libarchive[index]))
+            shutil.rmtree(room, ignore_errors=True)
+
+    return comments, rows
+
+
+def verdicts(destination, out=None):
+    """What each reference would *do* with every member's name.
+
+    **The only part of the zip corpus that records a decision rather than a
+    reading**, and what turns garc_name_check() from a set of assertions about
+    itself into a cross-check. A classifier whose expectations were written by the
+    same session that wrote the classifier measures nothing.
+
+    Three columns, and the important thing about them is that **zip has no
+    reference that states a policy.** PEP 706 gave `tarfile` a `data_filter`
+    whose verdict is a documented decision; `zipfile` has no equivalent and never
+    did. So all three columns here are *actions*: what the reference created, or
+    the name of the exception it died of. The difference matters at the point of
+    use - Python raising `IsADirectoryError` on `a/..` is the filesystem
+    answering, not a policy refusing, and a column that flattened it to "unsafe"
+    would credit Python with a check it does not perform.
+
+    What each value means:
+
+      - `same` - the member's own name was created.
+      - `rewrite=<name>` - something else was created, and this is what. The
+        target is recorded rather than a bit because the targets are the finding:
+        unzip turns `..` into `__`, libarchive turns `C:\\Windows\\ghoti` into
+        `Windows/ghoti`, and neither is derivable from the other.
+      - `refused=<reason>` - the member was not created and the reference said
+        why. The reason is kept because not every refusal is about the name: a
+        member whose *method* a reference lacks is refused too, and a relation
+        about names has to be able to tell them apart.
+      - `-` - the reference could not open the archive at all. Not a verdict;
+        `openings.tsv` is where that is recorded.
+    """
+    comments, rows = verdict_rows(destination)
+    lines = [
+        "# What each reference DOES with each member's name, as opposed to what",
+        "# it reads there. Generated by tools/oracle/make_zip_corpus.py inside",
+        "# the pinned container; do not edit.",
+        "#",
+        "# **zip has no reference that states a name policy.** PEP 706 gave",
+        "# tarfile a data_filter whose verdict is a decision; zipfile has no",
+        "# equivalent. So every column here is an ACTION: same, rewrite=<name>,",
+        "# refused=<reason>, or - where the reference could not open the archive.",
+        "# A Python exception name is the filesystem answering, not a policy.",
+        "#",
+        "# The rewrite target is recorded rather than a bit, because the targets",
+        "# are the finding: unzip turns `..` into `__`, libarchive translates a",
+        "# zip member's backslashes to slashes and then refuses the result for",
+        "# containing '..', and neither is derivable from the other.",
+        "#",
+        "# These are the REFERENCES' decisions, not this library's. A row this",
+        "# library disagrees with is a finding either way round.",
+        "#",
+        "# " + "\t".join(VERDICT_COLUMNS),
+    ]
+    lines += comments
+    lines += ["\t".join(row) for row in rows]
+    with open(os.path.join(out or destination, "verdicts.tsv"), "w",
+            encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+DECRYPTED_COLUMNS = ("archive", "index", "name", "method", "scheme", "size",
+    "python", "unzip", "sevenzip", "plaintext")
+
+
+def decrypted(destination, out=None):
+    """The plaintext of every encrypted member, from three references.
+
+    **This is what makes a ZipCrypto reader measurable instead of
+    self-consistent.** A decryption that agrees with itself proves nothing; a
+    decryption that produces the same bytes three other programs produce from the
+    same archive and the same password is a cross-check. The plaintext is recorded
+    as a sha256 and a length rather than as bytes, because one of these members is
+    a kilobyte of repeated text and because a digest fails just as loudly.
+
+    The scheme column is mechanical, not a judgement: bit 0 of the general purpose
+    flags says a member is encrypted, and method 99 says WinZip AES rather than
+    the traditional cipher. It is here because it selects the rows.
+
+    **The AES rows are expected refusals, and that is the point of having them.**
+    Python's zipfile and unzip 6.00 both decline method 99; 7-Zip decrypts it. So
+    the row for `sevenzip-aes.zip` is a committed expectation for phase H -
+    written down now, while the archive is being refused, so that the phase that
+    implements it has something to be measured against that this library did not
+    write.
+
+    The cipher is deliberately **not** implemented here. An oracle that computed
+    the answer the same way the library does would be comparing one
+    implementation with itself; every column is a program decrypting the archive.
+    """
+    import zipfile
+
+    rows = []
+    for name in fixtures(destination):
+        path = os.path.join(destination, name)
+        try:
+            handle = zipfile.ZipFile(path)
+        except Exception:
+            continue
+        with handle:
+            for index, info in enumerate(handle.infolist()):
+                if not (info.flag_bits & 0x0001):
+                    continue
+                member = name_bytes(info)
+                scheme = "aes" if info.compress_type == 99 else "zipcrypto"
+
+                plain = b""
+                try:
+                    plain = handle.read(info, pwd=PASSWORD.encode("utf-8"))
+                    python = digest_of(plain)
+                except Exception as problem:
+                    python = "refused=%s" % type(problem).__name__
+
+                # unzip and 7-Zip are asked for one member on stdout. Every
+                # encrypted member in this corpus has an ordinary name, which is
+                # asserted rather than assumed: both of these take the argument as
+                # a *pattern*, so a name with a bracket in it would select
+                # something else or nothing.
+                if any(byte in member for byte in (b"*", b"?", b"[", b"]")):
+                    raise SystemExit("%s: %r cannot be named to unzip or 7-Zip "
+                        "as a literal" % (name, member))
+                text = member.decode("utf-8", "surrogateescape")
+
+                finished = subprocess.run(
+                    ["unzip", "-p", "-P", PASSWORD, path, text],
+                    capture_output=True, stdin=subprocess.DEVNULL)
+                unzip = (digest_of(finished.stdout) if finished.returncode == 0
+                    else "refused=%d" % finished.returncode)
+
+                finished = subprocess.run(
+                    ["7z", "x", "-so", "-bso0", "-bsp0", "-p" + PASSWORD,
+                        path, text],
+                    capture_output=True, stdin=subprocess.DEVNULL)
+                sevenzip = (digest_of(finished.stdout)
+                    if finished.returncode == 0
+                    else "refused=%d" % finished.returncode)
+
+                # **The bytes, and only where all three agree.** A digest says
+                # three programs produced the same thing; it does not say what,
+                # and a test comparing against one cannot say *where* a
+                # disagreement is. So the plaintext goes in as well, from Python,
+                # and the guard is that the other two produced the same digest -
+                # a column filled in from one reference while the others differed
+                # would be that reference's answer wearing three programs' names.
+                agreed = python == unzip == sevenzip and python.startswith(
+                    "sha256:")
+                rows.append((name, str(index), escape(member),
+                    str(info.compress_type), scheme, str(info.file_size),
+                    python, unzip, sevenzip,
+                    escape(plain) if agreed else "-"))
+
+    lines = [
+        "# The plaintext of every encrypted member, as three references decrypt",
+        "# it with the corpus password. Generated by",
+        "# tools/oracle/make_zip_corpus.py inside the pinned container; do not",
+        "# edit.",
+        "#",
+        "# A value is `sha256:<digest>/<bytes>` or `refused=<exception or exit",
+        "# status>`. The password is the one in PASSWORD in the generator.",
+        "#",
+        "# The last column is the plaintext itself, and it is filled in only",
+        "# where all three references produced the same digest - so a test can",
+        "# compare bytes rather than a digest and still be comparing against",
+        "# three programs rather than one.",
+        "#",
+        "# The AES rows are refusals from two of the three references, and they",
+        "# are here on purpose: they are a committed expectation for phase H,",
+        "# written while this library still refuses method 99, so that the phase",
+        "# which implements it is measured against something it did not write.",
+        "#",
+        "# The cipher is not implemented in this file. Every column is a program",
+        "# decrypting the archive, which is the only thing that makes this a",
+        "# cross-check rather than a second copy of the answer.",
+        "#",
+        "# " + "\t".join(DECRYPTED_COLUMNS),
+    ]
+    lines += ["\t".join(row) for row in rows]
+    with open(os.path.join(out or destination, "decrypted.tsv"), "w",
+            encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def digest_of(data):
+    """`sha256:<hex>/<length>`, which fails as loudly as the bytes would."""
+    return "sha256:%s/%d" % (hashlib.sha256(data).hexdigest(), len(data))
+
+
+# Every emitter above takes an `out` directory separately from the corpus
 # they read, which `check_zip_manifest.py` uses to re-derive them from the
 # *committed* bytes without writing over the committed readings. A checker that
 # re-implemented the questions would be comparing two implementations of them
 # rather than the references against the corpus.
-READINGS = ("manifest.tsv", "names.tsv", "openings.tsv")
+READINGS = ("manifest.tsv", "names.tsv", "openings.tsv", "verdicts.tsv",
+    "decrypted.tsv")
 
-# **Three fixtures are not a function of their inputs, and no flag makes them
+# **Four fixtures are not a function of their inputs, and no flag makes them
 # one.** Each is listed here with the reason, and each is hashed as `-` rather
 # than dropped: a fixture left out of the list would also be left out of the
 # denominator, and `check-corpus-hashes` would stop noticing it had gone.
 #
 # What checks them instead is `manifest.tsv`, which *is* hashed: every field the
-# references read out of these three - name, size, compressed size, CRC, method,
+# references read out of these four - name, size, compressed size, CRC, method,
 # flags, the extra field ids - is constant, because none of them is the byte that
-# moves. So a real change in what these archives contain fails the gate through
+# moves. `decrypted.tsv` covers the two encrypted ones twice over, because a
+# plaintext digest is a function of the member and not of the random header. So a real change in what these archives contain fails the gate through
 # the manifest, and only the salt, the encryption header and the ctime are
 # outside it.
 NOT_REPRODUCIBLE = {
     "infozip-crypto.zip":
         "ZipCrypto's 12-byte encryption header is random per member by design, "
         "and Info-ZIP seeds its generator from the clock and the pid",
+    "infozip-crypto-deflate.zip":
+        "the same random encryption header, per member, for the same reason as "
+        "infozip-crypto.zip",
     "sevenzip-aes.zip":
         "WinZip AES uses a random salt per member by design, which is the "
         "whole point of a salt",
@@ -823,6 +1509,8 @@ def main(argv):
         manifest(destination)
         names(destination)
         openings(destination)
+        verdicts(destination)
+        decrypted(destination)
         return 0
 
     sys.path.insert(0, HERE)

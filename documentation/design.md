@@ -986,6 +986,77 @@ The complement is hand-built, as everywhere else in this library: an empty name 
 a NUL inside one cannot be produced by any writer, because no filesystem can hold
 them.
 
+### The malicious zip corpus, and the three references that disagree
+
+The hostile zip fixtures are written by **Python's `zipfile`**, not by the tool
+that wrote most of the corpus. `zip` has no `--transform`: it resolves a path
+against the filesystem before storing it, so there is no way to ask it for
+`../../../tmp/x`. Python's module is the only one of the four that stores the name
+it is handed, which makes it the writer here - and means that for these fixtures
+**the writer is not one of the references that read them back**.
+
+The verdict file has three reference columns where tar's has two, and the first
+thing to say about it is what it is *not*:
+
+**zip has no reference that states a policy.** PEP 706 gave `tarfile` a
+`data_filter` whose verdict is a documented decision; `zipfile` has no equivalent
+and never did. So every column in `tests/data/zip/verdicts.tsv` is an *action* -
+`same`, `rewrite=<name>`, `refused=<reason>` - and a Python exception in it is the
+*filesystem* answering, not a check refusing. `a/..` raises `IsADirectoryError`
+because the name sanitises to `a`, which the previous member already made a
+directory; reading that as a safety verdict would credit Python with a check it
+does not perform. The rewrite *target* is recorded rather than a bit, because the
+targets are the finding and none is derivable from another.
+
+Three references, three different masks, each row measured:
+
+| | unzip 6.00 | libarchive 3.7.4 | Python 3.13.5 |
+| --- | --- | --- | --- |
+| `..` component | rewrites to `__` | refuses | resolves away |
+| `./` and `//` | drops | keeps | drops |
+| `..\..\..\x` | one filename | **translates, then refuses** | one filename |
+| `C:\x`, `\\s\h\x` | one filename | splits into directories | one filename |
+| a control byte | strips | keeps | keeps |
+| a name that is not UTF-8 | writes the bytes | writes the bytes | **re-encodes** |
+
+**libarchive answers differently for zip than for tar, at the same version.** For
+a tar member it created `Windows\ghoti` and `server\share\ghoti` - one filename
+each, backslashes intact - where for a zip member it created `Windows/ghoti` and
+`server/share/ghoti`. And for a tar it created both halves of the
+composed/decomposed `café` pair; for a zip it created one, silently, with exit 0:
+four members in, three files out. A mask written once for "libarchive" would be
+wrong for one of the two formats, which is why `test_zip_names.cpp` carries its own
+and says so.
+
+That last one is worth stating as a property of the corpus rather than of the
+library: `mal-collisions.zip` is in it because a collision is a property of a
+*pair* of names and no per-name check can see one - and one reference makes the
+collision real.
+
+Two fixtures differ only in general purpose flag bit 11, which is the whole of what
+a zip ever says about a name's encoding. With it clear the name is cp437 by
+specification and all four references read the archive; with it set the archive
+claims UTF-8 about bytes that are not, and Python and libarchive both refuse the
+whole file. So the second one contributes no rows to any per-member reading, and
+the claim it exists to support - that the finding comes from the bytes and not from
+the flag - is made by this library's own walk instead.
+
+One consequence for `manifest.tsv`: a member with bit 11 clear has its name
+re-encoded from cp437 rather than from UTF-8 before it is written to that file,
+because `zipfile` decodes such a name as cp437 and re-encoding it as UTF-8 would put
+a name in the manifest that is in no record of the archive. Every name in the corpus
+that is ASCII is unaffected, which is why this only had to be got right once there
+was a fixture that was not.
+
+A link target is the other half, and in zip it is the member's **data** rather than
+a header field - so it cannot be asked about until the member has been read, which
+is a different order of operations from tar. `mal-links.zip` holds an absolute
+target and one that climbs out of any root, and the finding is that **neither unzip
+nor libarchive objects to either of them**: both create the links without a word.
+For a zip link target there is no reference to agree with, which is the case where
+writing the corpus first mattered most - because it is the case where agreement
+would have been no evidence at all.
+
 ### Four gates, and what each cannot see
 
 | gate | needs a container | catches |
@@ -1002,6 +1073,18 @@ are not the same question: a tar release can change how a field is parsed withou
 changing any output, and a suite that only regenerated would call that a pass.
 `check-oracle` is also the only thing that catches a manifest edited *and*
 rehashed to make a failing test pass.
+
+The zip corpus has the same three gates under their own names -
+`check-corpus-hashes` covers both corpora, `check-zip-corpus` regenerates and
+`check-zip-oracle` re-reads - and five readings rather than three:
+`manifest.tsv`, `names.tsv`, `openings.tsv`, `verdicts.tsv` and `decrypted.tsv`.
+The last is the plaintext of every encrypted member as Python, unzip and 7-Zip
+decrypt it, and it is what makes a ZipCrypto reader measurable instead of
+self-consistent. `check-zip-oracle` is also the only gate that covers the four zip
+fixtures with no digest in `CORPUS-ZIP`: two random encryption headers, a random
+AES salt and an unsettable `st_ctime` mean their bytes move between runs, and what
+is compared instead is what the references read - and, for the encrypted two, what
+they decrypt, which is a function of the member and not of the random header.
 
 The fourth question is `verdicts.tsv`, which `check-oracle` re-derives along with
 the other two. It is the only file in the corpus recording a **decision** rather

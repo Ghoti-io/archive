@@ -26,6 +26,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -67,6 +68,22 @@ const std::vector<ZipOpeningRow> & openings() {
   static const std::vector<ZipOpeningRow> rows
       = zip_openings_load(data_path("openings.tsv"));
   return rows;
+}
+
+/**
+ * The name Python read for a member, or an empty result when it read none.
+ *
+ * Python's `zipfile` reports the name as the archive holds it, which is what makes
+ * it the reference for bytes. It is used below to tell a member whose name
+ * libarchive *translated* from one it merely read.
+ */
+std::pair<bool, std::string> python_name(
+    const std::string & archive, size_t index) {
+  const auto found = manifest().find(archive);
+  if (found == manifest().end() || index >= found->second.size()) {
+    return {false, std::string()};
+  }
+  return {true, found->second[index].name};
 }
 
 std::string member_name(const GARC_Member * member) {
@@ -153,13 +170,13 @@ TEST(ZipCorpus, TheManifestIsNotEmpty) {
   for (const auto & entry : manifest()) {
     rows += entry.second.size();
   }
-  EXPECT_EQ(rows, 45u) << "the manifest has moved; check-zip-corpus says whether "
+  EXPECT_EQ(rows, 75u) << "the manifest has moved; check-zip-corpus says whether "
                           "the references or the generator changed";
-  // 20 of the 23 fixtures appear: Python refuses two of them - the EOCD decoy
-  // pair - and python-empty.zip has no members to describe, so it contributes no
-  // rows and therefore no key. Spelled out because "20" on its own would be a
-  // number nobody could check.
-  EXPECT_EQ(manifest().size(), 20u);
+  // 25 of the 29 fixtures appear. Python refuses three - the EOCD decoy pair, and
+  // mal-utf8-lie.zip, whose names claim UTF-8 and are not - and python-empty.zip
+  // has no members to describe, so it contributes no rows and therefore no key.
+  // Spelled out because "25" on its own would be a number nobody could check.
+  EXPECT_EQ(manifest().size(), 25u);
 }
 
 TEST(ZipCorpus, EveryMemberAgreesWithPythonsZipfile) {
@@ -220,13 +237,15 @@ TEST(ZipCorpus, EveryMemberAgreesWithPythonsZipfile) {
     EXPECT_EQ(result, GARC_END) << name;
     EXPECT_EQ(index, rows.size()) << name << ": fewer members than the manifest";
   }
-  EXPECT_EQ(compared, 45u);
+  EXPECT_EQ(compared, 75u);
 }
 
 TEST(ZipCorpus, EveryTypeAndLinkAgreesWithLibarchive) {
   size_t compared = 0;
   size_t symlinks = 0;
   size_t directories = 0;
+  size_t named = 0;
+  size_t renamed = 0;
   for (const auto & entry : names()) {
     const std::string & name = entry.first;
     const std::vector<ZipNameRow> & rows = entry.second;
@@ -239,7 +258,24 @@ TEST(ZipCorpus, EveryTypeAndLinkAgreesWithLibarchive) {
       ASSERT_LT(index, rows.size()) << name;
       const ZipNameRow & row = rows[index];
       const std::string where = name + " member " + std::to_string(index);
-      EXPECT_EQ(member_name(member), row.name) << where;
+      // **libarchive's name column is a name it decided, not one it read.** For a
+      // zip member it translates backslashes to slashes and reports a decomposed
+      // name in composed form, so for five members of the malicious fixtures its
+      // name is not the archive's bytes. Python's is, so where the two references
+      // disagree the reader is held to Python's and the disagreement is counted -
+      // which is not the same as excusing it: a translation this test did not know
+      // about would move the count.
+      const std::pair<bool, std::string> theirs = python_name(name, index);
+      if (!theirs.first || theirs.second == row.name) {
+        EXPECT_EQ(member_name(member), row.name) << where;
+        ++named;
+      }
+      else {
+        EXPECT_EQ(member_name(member), theirs.second)
+            << where << ": the two references disagree about this name and we "
+               "match neither";
+        ++renamed;
+      }
       EXPECT_EQ(type_name(member->type), row.type) << where;
       // A symlink's target is the member's *data* in zip, so agreeing with
       // libarchive here means having read the data during the walk.
@@ -255,11 +291,18 @@ TEST(ZipCorpus, EveryTypeAndLinkAgreesWithLibarchive) {
     }
     EXPECT_EQ(index, rows.size()) << name;
   }
-  EXPECT_EQ(compared, 49u);
+  EXPECT_EQ(compared, 79u);
   // The corpus has to contain the types this comparison is about, or it would
   // pass by having nothing to disagree over.
   EXPECT_GE(symlinks, 1u);
   EXPECT_GE(directories, 2u);
+  EXPECT_EQ(named, 74u);
+  // And the conditional above has to be seen to take both arms, or a bug in it
+  // would make the name comparison silently vacuous. Five: one decomposed name,
+  // two backslash traversals, a drive letter and a UNC path.
+  EXPECT_EQ(renamed, 5u)
+      << "the two references no longer disagree about the five names they did, or "
+         "the condition that finds the disagreement has stopped working";
 }
 
 TEST(ZipCorpus, EverySourceOfTimeIsRepresented) {
@@ -293,7 +336,7 @@ TEST(ZipCorpus, ReadsTheArchivesSomeReferencesRefuse) {
       refusals[row.archive]++;
     }
   }
-  ASSERT_EQ(archives.size(), 23u) << "openings.tsv does not cover the corpus";
+  ASSERT_EQ(archives.size(), 29u) << "openings.tsv does not cover the corpus";
 
   // The two the corpus exists to record. Spelled out rather than counted, because
   // a count would still pass if the refusals moved to different archives.

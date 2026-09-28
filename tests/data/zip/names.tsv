@@ -17,6 +17,8 @@ bsdtar-descriptors.zip	0	file	-rw-r--r--	hello.txt
 bsdtar-descriptors.zip	1	file	-rw-r--r--	compressible.txt	
 bsdtar-descriptors.zip	2	file	-rw-r--r--	sizes/empty	
 bsdtar-descriptors.zip	3	directory	drwxr-xr-x	emptydir/	
+infozip-crypto-deflate.zip	0	file	-rw-r--r--	compressible.txt	
+infozip-crypto-deflate.zip	1	file	-rw-r--r--	hello.txt	
 infozip-crypto.zip	0	file	-rw-r--r--	hello.txt	
 infozip-crypto.zip	1	file	-rw-r--r--	sizes/one	
 infozip-deflate.zip	0	file	-rw-r--r--	hello.txt	
@@ -35,6 +37,34 @@ infozip-unix.zip	3	file	-rwsr-xr-x	modes/setuid
 infozip-unix.zip	4	file	-rw-r--r--	hello.txt	
 infozip-zip64.zip	0	file	-rw-r--r--	hello.txt	
 infozip-zip64.zip	1	file	-rw-r--r--	sizes/one	
+mal-collisions.zip	0	file	-rw-r--r--	A.txt	
+mal-collisions.zip	1	file	-rw-r--r--	a.txt	
+mal-collisions.zip	2	file	-rw-r--r--	caf\xC3\xA9	
+mal-collisions.zip	3	file	-rw-r--r--	caf\xC3\xA9	
+mal-encodings.zip	0	file	-rw-r--r--	bad\x80utf\xC0	
+mal-encodings.zip	1	file	-rw-r--r--	ordinary.txt	
+mal-links.zip	0	file	-rw-r--r--	sibling	
+mal-links.zip	1	symlink	lrwxrwxrwx	abs-target	/tmp/ghoti-escaped
+mal-links.zip	2	symlink	lrwxrwxrwx	up-target	../../..
+mal-links.zip	3	symlink	lrwxrwxrwx	dot-target	./sibling
+mal-paths.zip	0	file	-rw-r--r--	../../../tmp/ghoti-escaped	
+mal-paths.zip	1	file	-rw-r--r--	/tmp/ghoti-escaped	
+mal-paths.zip	2	file	-rw-r--r--	a/../../b	
+mal-paths.zip	3	file	-rw-r--r--	a/..	
+mal-paths.zip	4	file	-rw-r--r--	./x	
+mal-paths.zip	5	file	-rw-r--r--	a//b	
+mal-paths.zip	6	file	-rw-r--r--	../../../tmp/ghoti-esc-bs	
+mal-paths.zip	7	file	-rw-r--r--	a/../../b	
+mal-paths.zip	8	file	-rw-r--r--	C:/Windows/ghoti	
+mal-paths.zip	9	file	-rw-r--r--	//server/share/ghoti	
+mal-paths.zip	10	file	-rw-r--r--	..	
+mal-paths.zip	11	file	-rw-r--r--	CON	
+mal-paths.zip	12	file	-rw-r--r--	aux.txt	
+mal-paths.zip	13	file	-rw-r--r--	COM1	
+mal-paths.zip	14	file	-rw-r--r--	trailing.	
+mal-paths.zip	15	file	-rw-r--r--	trailing 	
+mal-paths.zip	16	file	-rw-r--r--	esc\x1B[31mred	
+mal-paths.zip	17	file	-rw-r--r--	a/b/../../../c	
 python-comments.zip	0	file	-rw-r--r--	hello.txt	
 python-comments.zip	1	file	-rw-r--r--	plain.txt	
 python-data-decoy.zip	0	file	-rw-r--r--	innocent.txt	

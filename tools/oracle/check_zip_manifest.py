@@ -24,11 +24,12 @@ a failing test pass. The digests in `containers/CORPUS-ZIP` cover the files as
 committed, so a reading edited *and* rehashed satisfies `check-corpus-hashes`.
 Asking the references again is the only thing that does not.
 
-**And it is the only gate that covers the three fixtures with no digest.** A
-random AES salt, a random ZipCrypto header and an unsettable ctime mean those
-three cannot be compared byte for byte; every field the references read out of
+**And it is the only gate that covers the four fixtures with no digest.** A
+random AES salt, two random ZipCrypto headers and an unsettable ctime mean those
+four cannot be compared byte for byte; every field the references read out of
 them is constant, and this is where that is checked against the committed
-readings rather than against a hash of bytes that were always going to move.
+readings rather than against a hash of bytes that were always going to move -
+including, for the encrypted two, the plaintext each reference decrypts.
 
 The questions are not asked again here. They are the same functions the generator
 uses, pointed at the committed corpus with an output directory of their own - a
@@ -71,12 +72,16 @@ def inner():
     make_zip_corpus.manifest(CORPUS, out=scratch)
     make_zip_corpus.names(CORPUS, out=scratch)
     make_zip_corpus.openings(CORPUS, out=scratch)
+    make_zip_corpus.verdicts(CORPUS, out=scratch)
+    make_zip_corpus.decrypted(CORPUS, out=scratch)
 
     failures = []
     counts = []
     for name, who in (("manifest.tsv", "zipfile"),
             ("names.tsv", "bsdtar"),
-            ("openings.tsv", "the references")):
+            ("openings.tsv", "the references"),
+            ("verdicts.tsv", "the extractors"),
+            ("decrypted.tsv", "the decryptors")):
         got = rows(os.path.join(scratch, name))
         want = rows(os.path.join(CORPUS, name))
         counts.append((name, len(got)))

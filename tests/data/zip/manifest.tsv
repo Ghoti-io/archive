@@ -20,6 +20,8 @@ bsdtar-descriptors.zip	0	hello.txt	15	17	8	512ed020	2001-09-09T01:46:40	0008	0	0
 bsdtar-descriptors.zip	1	compressible.txt	1160	39	8	4cc1f269	2001-09-09T01:46:40	0008	0	0100644	3	20	104		7875/11,5455/5
 bsdtar-descriptors.zip	2	sizes/empty	0	2	8	00000000	2001-09-09T01:46:40	0008	0	0100644	3	20	237		7875/11,5455/5
 bsdtar-descriptors.zip	3	emptydir/	0	0	0	00000000	2001-09-09T01:46:40	0000	0	040755	3	20	328		7875/11,5455/5
+infozip-crypto-deflate.zip	0	compressible.txt	1160	51	8	4cc1f269	2001-09-09T01:46:40	000b	0	0100644	3	20	0		
+infozip-crypto-deflate.zip	1	hello.txt	15	27	0	512ed020	2001-09-09T01:46:40	000b	0	0100644	3	10	113		
 infozip-crypto.zip	0	hello.txt	15	27	0	512ed020	2001-09-09T01:46:40	0009	0	0100644	3	10	0		
 infozip-crypto.zip	1	sizes/one	1	13	0	8cdc1683	2001-09-09T01:46:40	0009	0	0100644	3	10	82		
 infozip-deflate.zip	0	hello.txt	15	15	0	512ed020	2001-09-09T01:46:40	0002	0	0100644	3	10	0		
@@ -38,6 +40,34 @@ infozip-unix.zip	3	modes/setuid	5	5	0	ce787a16	2001-09-09T01:46:40	0000	0	010475
 infozip-unix.zip	4	hello.txt	15	15	0	512ed020	2001-09-09T01:46:40	0000	0	0100644	3	10	201		
 infozip-zip64.zip	0	hello.txt	15	15	0	512ed020	2001-09-09T01:46:40	0000	0	0100644	3	45	0		0001/8
 infozip-zip64.zip	1	sizes/one	1	1	0	8cdc1683	2001-09-09T01:46:40	0000	0	0100644	3	45	74		0001/8
+mal-collisions.zip	0	A.txt	8	8	0	94e3bcd9	2001-09-09T01:46:40	0000	0	0644	3	20	0		
+mal-collisions.zip	1	a.txt	8	8	0	94e3bcd9	2001-09-09T01:46:40	0000	0	0644	3	20	43		
+mal-collisions.zip	2	caf\xC3\xA9	8	8	0	94e3bcd9	2001-09-09T01:46:40	0800	1	0644	3	20	86		
+mal-collisions.zip	3	cafe\xCC\x81	8	8	0	94e3bcd9	2001-09-09T01:46:40	0800	1	0644	3	20	129		
+mal-encodings.zip	0	bad\x80utf\xC0	10	10	0	c6f646c2	2001-09-09T01:46:40	0000	0	0644	3	20	0		
+mal-encodings.zip	1	ordinary.txt	8	8	0	d33445a7	2001-09-09T01:46:40	0000	0	0644	3	20	48		
+mal-links.zip	0	sibling	7	7	0	869ad78b	2001-09-09T01:46:40	0000	0	0644	3	20	0		
+mal-links.zip	1	abs-target	18	18	0	8a4ef144	2001-09-09T01:46:40	0000	0	0120777	3	20	44		
+mal-links.zip	2	up-target	8	8	0	3a7a1679	2001-09-09T01:46:40	0000	0	0120777	3	20	102		
+mal-links.zip	3	dot-target	9	9	0	83bb87aa	2001-09-09T01:46:40	0000	0	0120777	3	20	149		
+mal-paths.zip	0	../../../tmp/ghoti-escaped	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	0		
+mal-paths.zip	1	/tmp/ghoti-escaped	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	64		
+mal-paths.zip	2	a/../../b	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	120		
+mal-paths.zip	3	a/..	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	167		
+mal-paths.zip	4	./x	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	209		
+mal-paths.zip	5	a//b	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	250		
+mal-paths.zip	6	..\\..\\..\\tmp\\ghoti-esc-bs	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	292		
+mal-paths.zip	7	a\\..\\..\\b	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	355		
+mal-paths.zip	8	C:\\Windows\\ghoti	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	402		
+mal-paths.zip	9	\\\\server\\share\\ghoti	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	456		
+mal-paths.zip	10	..	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	514		
+mal-paths.zip	11	CON	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	554		
+mal-paths.zip	12	aux.txt	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	595		
+mal-paths.zip	13	COM1	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	640		
+mal-paths.zip	14	trailing.	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	682		
+mal-paths.zip	15	trailing 	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	729		
+mal-paths.zip	16	esc\x1B[31mred	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	776		
+mal-paths.zip	17	a/b/../../../c	8	8	0	658a9d3a	2001-09-09T01:46:40	0000	0	0644	3	20	825		
 python-data-decoy.zip	0	innocent.txt	17	17	0	824e4a16	2001-09-09T01:46:40	0000	0	0644	3	20	0		
 python-data-decoy.zip	1	decoy-inside.bin	77	77	0	80f31271	2001-09-09T01:46:40	0000	0	0644	3	20	59		
 python-data-decoy.zip	2	after.txt	16	16	0	4c8cd8c0	2001-09-09T01:46:40	0000	0	0644	3	20	182		

@@ -21,6 +21,10 @@ bsdtar-descriptors.zip	unzip	accepted	0	No errors detected in compressed data of
 bsdtar-descriptors.zip	bsdtar	accepted	0	
 bsdtar-descriptors.zip	sevenzip	accepted	0	
 bsdtar-descriptors.zip	pyzipfile	accepted	0	
+infozip-crypto-deflate.zip	unzip	refused	5	skipping: compressible.txt unable to get password | skipping: hello.txt unable to get password | At least one error was detected in infozip-crypto-deflate.zip.
+infozip-crypto-deflate.zip	bsdtar	accepted	0	
+infozip-crypto-deflate.zip	sevenzip	accepted	0	
+infozip-crypto-deflate.zip	pyzipfile	accepted	0	
 infozip-crypto.zip	unzip	refused	5	skipping: hello.txt unable to get password | skipping: sizes/one unable to get password | At least one error was detected in infozip-crypto.zip.
 infozip-crypto.zip	bsdtar	accepted	0	
 infozip-crypto.zip	sevenzip	accepted	0	
@@ -45,6 +49,26 @@ infozip-zip64.zip	unzip	accepted	0	No errors detected in compressed data of info
 infozip-zip64.zip	bsdtar	accepted	0	
 infozip-zip64.zip	sevenzip	accepted	0	
 infozip-zip64.zip	pyzipfile	accepted	0	
+mal-collisions.zip	unzip	accepted	0	No errors detected in compressed data of mal-collisions.zip.
+mal-collisions.zip	bsdtar	accepted	0	
+mal-collisions.zip	sevenzip	accepted	0	
+mal-collisions.zip	pyzipfile	accepted	0	
+mal-encodings.zip	unzip	accepted	0	No errors detected in compressed data of mal-encodings.zip.
+mal-encodings.zip	bsdtar	accepted	0	
+mal-encodings.zip	sevenzip	accepted	0	
+mal-encodings.zip	pyzipfile	accepted	0	
+mal-links.zip	unzip	accepted	0	No errors detected in compressed data of mal-links.zip.
+mal-links.zip	bsdtar	accepted	0	
+mal-links.zip	sevenzip	accepted	0	
+mal-links.zip	pyzipfile	accepted	0	
+mal-paths.zip	unzip	accepted	0	No errors detected in compressed data of mal-paths.zip.
+mal-paths.zip	bsdtar	accepted	0	
+mal-paths.zip	sevenzip	accepted	0	
+mal-paths.zip	pyzipfile	accepted	0	
+mal-utf8-lie.zip	unzip	accepted	0	No errors detected in compressed data of mal-utf8-lie.zip.
+mal-utf8-lie.zip	bsdtar	refused	1	bsdtar: Pathname cannot be converted from UTF-8 to current locale. | bsdtar: Archive entry has empty or unreadable filename ... skipping. | bsdtar: Error exit delayed from previous errors.
+mal-utf8-lie.zip	sevenzip	accepted	0	
+mal-utf8-lie.zip	pyzipfile	refused	-	UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80 in position 3: invalid start byte
 python-comments.zip	unzip	accepted	0	No errors detected in compressed data of python-comments.zip.
 python-comments.zip	bsdtar	accepted	0	
 python-comments.zip	sevenzip	accepted	0	
