@@ -202,7 +202,7 @@ static GARC_Result tar_read_header(GARC_Archive * archive,
   memset(member, 0, sizeof(*member));
 
   const GARC_Tar_Variant variant = tar_variant_from_magic(block);
-  archive->tar_variant = variant;
+  archive->tar.variant = variant;
 
   // The name. ustar splits a long name across a 155-byte prefix and the
   // 100-byte name, joined with a '/'; v7 has no prefix field at all, and its
@@ -215,15 +215,15 @@ static GARC_Result tar_read_header(GARC_Archive * archive,
     size_t prefix_length = tar_copy_field(
         prefix, block + GARC_TAR_OFF_PREFIX, GARC_TAR_LEN_PREFIX);
     if (prefix_length) {
-      memcpy(archive->name_storage, prefix, prefix_length);
-      archive->name_storage[prefix_length] = '/';
+      memcpy(archive->tar.name_storage, prefix, prefix_length);
+      archive->tar.name_storage[prefix_length] = '/';
       name_length = prefix_length + 1u;
     }
   }
-  name_length += tar_copy_field(archive->name_storage + name_length,
+  name_length += tar_copy_field(archive->tar.name_storage + name_length,
       block + GARC_TAR_OFF_NAME, GARC_TAR_LEN_NAME);
 
-  member->name = archive->name_storage;
+  member->name = archive->tar.name_storage;
   member->name_length = name_length;
   // tar has never carried a statement about its names' encoding. pax's
   // `hdrcharset=` record is the only thing that does, and it arrives with pax.
@@ -232,10 +232,10 @@ static GARC_Result tar_read_header(GARC_Archive * archive,
   const uint8_t typeflag = block[GARC_TAR_OFF_TYPEFLAG];
   member->type = tar_type_from_flag(typeflag);
 
-  size_t link_length = tar_copy_field(archive->link_storage,
+  size_t link_length = tar_copy_field(archive->tar.link_storage,
       block + GARC_TAR_OFF_LINKNAME, GARC_TAR_LEN_LINKNAME);
   if (link_length) {
-    member->link_target = archive->link_storage;
+    member->link_target = archive->tar.link_storage;
     member->link_target_length = link_length;
   }
 
@@ -283,14 +283,14 @@ static GARC_Result tar_read_header(GARC_Archive * archive,
 
   if (variant != GARC_TAR_V7) {
     member->uname_length = tar_copy_field(
-        archive->uname_storage, block + GARC_TAR_OFF_UNAME, GARC_TAR_LEN_UNAME);
+        archive->tar.uname_storage, block + GARC_TAR_OFF_UNAME, GARC_TAR_LEN_UNAME);
     if (member->uname_length) {
-      member->uname = archive->uname_storage;
+      member->uname = archive->tar.uname_storage;
     }
     member->gname_length = tar_copy_field(
-        archive->gname_storage, block + GARC_TAR_OFF_GNAME, GARC_TAR_LEN_GNAME);
+        archive->tar.gname_storage, block + GARC_TAR_OFF_GNAME, GARC_TAR_LEN_GNAME);
     if (member->gname_length) {
-      member->gname = archive->gname_storage;
+      member->gname = archive->tar.gname_storage;
     }
   }
 
@@ -412,12 +412,12 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
   // applied, because the case that matters is the call that *failed* partway
   // through a carrier: without this, its name would be applied to whatever
   // header a caller reached next.
-  archive->have_long_name = 0;
-  archive->have_long_link = 0;
+  archive->tar.have_long_name = 0;
+  archive->tar.have_long_link = 0;
   // An `x` header's records are the next member's and nobody else's. The global
   // set is deliberately not reset: POSIX keeps those in force until a later
   // record replaces them.
-  garc_tar_pax_reset(&archive->pax_next);
+  garc_tar_pax_reset(&archive->tar.pax_next);
 
   // Where the member's first block is, which is a carrier's when there is one. A
   // caller re-reading a member from this offset has to get the same member, and
@@ -462,7 +462,7 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
       // A *partial* block after the marker is the normal shape of a truncated
       // tail, because writers pad the end of an archive to a record boundary
       // and some strip that padding. Before the marker it is damage.
-      if (archive->tar_saw_end_marker) {
+      if (archive->tar.saw_end_marker) {
         archive->at_end = 1;
         return GARC_END;
       }
@@ -475,7 +475,7 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
       // second rejects those - so the first is recorded and the end is decided
       // by what follows it. Two in a row, then the end of the stream, is the
       // clean case and arrives at the branch above.
-      archive->tar_saw_end_marker = 1;
+      archive->tar.saw_end_marker = 1;
       continue;
     }
 
@@ -492,7 +492,7 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
     // Which reading matched. The unsigned one is checked first because it is
     // what every writer in use produces; the signed one only matters for
     // archives old enough to have a non-ASCII byte in a header.
-    archive->tar_checksum_was_signed
+    archive->tar.checksum_was_signed
         = (declared != (uint64_t)sum_unsigned) ? 1 : 0;
 
     // GNU's 'L' and 'K' carry the next member's name and link target. They are
@@ -512,7 +512,7 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
       }
 
       const int is_name = (typeflag == 'L');
-      int * have = is_name ? &archive->have_long_name : &archive->have_long_link;
+      int * have = is_name ? &archive->tar.have_long_name : &archive->tar.have_long_link;
       if (*have) {
         // **Two carriers of the same kind for one member, refused.** Not a
         // stylistic objection: each one allocates its declared size, so a chain
@@ -524,7 +524,7 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
       }
 
       result = garc_tar_read_long_field(archive, declared,
-          is_name ? &archive->long_name : &archive->long_link);
+          is_name ? &archive->tar.long_name : &archive->tar.long_link);
       if (result != GARC_OK) {
         return result;
       }
@@ -588,15 +588,15 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
     // header's own field, which holds a truncated copy of it. The variant becomes
     // GNU whatever the magic said, because the carrier is GNU's construct and a
     // member read through one was not read as a ustar member.
-    if (archive->have_long_name) {
-      archive->member.name = archive->long_name.bytes;
-      archive->member.name_length = archive->long_name.length;
-      archive->tar_variant = GARC_TAR_GNU;
+    if (archive->tar.have_long_name) {
+      archive->member.name = archive->tar.long_name.bytes;
+      archive->member.name_length = archive->tar.long_name.length;
+      archive->tar.variant = GARC_TAR_GNU;
     }
-    if (archive->have_long_link) {
-      archive->member.link_target = archive->long_link.bytes;
-      archive->member.link_target_length = archive->long_link.length;
-      archive->tar_variant = GARC_TAR_GNU;
+    if (archive->tar.have_long_link) {
+      archive->member.link_target = archive->tar.long_link.bytes;
+      archive->member.link_target_length = archive->tar.long_link.length;
+      archive->tar.variant = GARC_TAR_GNU;
     }
 
     // pax last, so that a record beats a GNU carrier where an archive somehow has
@@ -623,7 +623,7 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
     // A header after the end marker means the marker was data, not an end. GNU
     // tar warns and continues, and so does this: the marker ends the archive
     // only if nothing follows it.
-    archive->tar_saw_end_marker = 0;
+    archive->tar.saw_end_marker = 0;
 
     return garc_reader_account(archive);
   }

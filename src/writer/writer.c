@@ -244,6 +244,6 @@ void garc_writer_destroy(GARC_Writer * writer) {
     return;
   }
   const GARC_Allocator * allocator = writer->allocator;
-  garc_tar_buffer_free(allocator, &writer->records);
+  garc_buffer_free(allocator, &writer->records);
   gcu_allocator_free(allocator, writer);
 }

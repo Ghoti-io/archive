@@ -34,6 +34,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "core/buffer_internal.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -47,7 +49,7 @@ extern "C" {
  * is what makes ::GARC_Member's borrowing worth having.
  *
  * A name GNU's `L` member or pax's `path=` record carries is unbounded in the
- * format and cannot live here. Those go in ::GARC_Tar_Buffer instead, so the
+ * format and cannot live here. Those go in ::GARC_Buffer instead, so the
  * allocation happens for the archives that need one and not for every archive.
  */
 #define GARC_TAR_NAME_STORAGE 257u
@@ -57,23 +59,6 @@ extern "C" {
 
 /** Storage for a user or group name: ustar's 32 bytes and a NUL. */
 #define GARC_TAR_OWNER_STORAGE 33u
-
-/**
- * A growable byte buffer for a string the header fields cannot bound.
- *
- * Bytes, a length and a capacity, rather than a C string: what it holds is a
- * member name, and a member name is attacker-controlled bytes that may contain
- * anything. A NUL is written one past @ref length as a convenience for a
- * debugger, and nothing reads it.
- */
-typedef struct {
-  /** The bytes, or NULL before the first use. */
-  char * bytes;
-  /** How many of them are in use. */
-  size_t length;
-  /** How many were allocated, which is at least @ref length + 1. */
-  size_t capacity;
-} GARC_Tar_Buffer;
 
 /**
  * The pax record keys this reader acts on.
@@ -113,7 +98,7 @@ typedef enum {
  */
 typedef struct {
   /** The raw record bytes, appended to and never rewound within a set. */
-  GARC_Tar_Buffer records;
+  GARC_Buffer records;
   /** Where each key's value starts in @ref records. */
   size_t offset[GARC_PAX_KEY_COUNT];
   /** How long each key's value is; zero means the key was deleted. */
@@ -121,6 +106,83 @@ typedef struct {
   /** Whether the key appeared at all. */
   int have[GARC_PAX_KEY_COUNT];
 } GARC_Tar_Pax;
+
+/**
+ * Everything in an archive that only the tar reader looks at.
+ *
+ * **Named rather than inlined, and not a union with zip's.** Inlined, the archive
+ * would hold two formats' worth of fields with nothing but a prefix saying which
+ * reader owns which - and a prefix is a convention, where a member is a type. A
+ * union would save the few hundred bytes the unused format costs and buy a way to
+ * lose: nothing in C stops a reader writing one arm and another reading the other,
+ * and the compiler cannot tell that apart from the intended use. So both formats
+ * have a member each, the cost is under a kilobyte per open archive, and a
+ * mis-dispatch reads its own zeroes rather than the other format's live state.
+ */
+typedef struct {
+  /** Which of tar's formats the current member's header was. */
+  GARC_Tar_Variant variant;
+  /** Non-zero when the signed reading of the header checksum was the match. */
+  int checksum_was_signed;
+  /** Non-zero once a zero block has been seen, which is the end marker. */
+  int saw_end_marker;
+
+  /**
+   * @name Where a member's strings live between calls
+   *
+   * A member's name is lent to the caller until the next ::garc_next(), so it
+   * has to outlive the header block it was read from. These are sized to the
+   * longest a ustar header can express - 100 plus a `/` plus 155 for a split
+   * name - so the common case allocates nothing; a longer one goes to the heap
+   * buffer below.
+   * @{
+   */
+  char name_storage[GARC_TAR_NAME_STORAGE];   ///< Name, plus its terminator.
+  char link_storage[GARC_TAR_LINK_STORAGE];   ///< Link target, plus terminator.
+  char uname_storage[GARC_TAR_OWNER_STORAGE]; ///< Owner name, plus terminator.
+  char gname_storage[GARC_TAR_OWNER_STORAGE]; ///< Group name, plus terminator.
+  /** @} */
+
+  /**
+   * A name carried in front of the header rather than in it.
+   *
+   * GNU writes an `L` member whose data is the next member's name; pax writes a
+   * `path=` record. Both are unbounded in the format, so this is where a name
+   * too long for @ref name_storage goes. Allocated on first use and **kept
+   * across members**, because an archive of long names would otherwise allocate
+   * and free once per member; freed by garc_tar_release().
+   */
+  GARC_Buffer long_name;
+  /** The same for a link target: GNU's `K` member, pax's `linkpath=`. */
+  GARC_Buffer long_link;
+  /**
+   * Non-zero when @ref long_name holds a name for the header being read.
+   *
+   * Cleared at the start of every garc_tar_next(), so a carrier member whose
+   * read failed cannot leave a name to be applied to some later header. The
+   * *storage* is not cleared with it; only the claim on it is.
+   */
+  int have_long_name;
+  /** The same for @ref long_link. */
+  int have_long_link;
+
+  /**
+   * Records from an `x` member, which apply to the next member only.
+   *
+   * Reset at the start of every garc_tar_next(), for the same reason
+   * @ref have_long_name is: a set left behind by a failed step would otherwise be
+   * applied to whatever header a caller reached next.
+   */
+  GARC_Tar_Pax pax_next;
+  /**
+   * Records from `g` members, which apply until a later record replaces them.
+   *
+   * Not reset per member, and appended to rather than replaced, because POSIX
+   * overrides a global record **per key**: a second `g` naming `mtime` does not
+   * clear a first one's `path`.
+   */
+  GARC_Tar_Pax pax_global;
+} GARC_Tar_State;
 
 /**
  * An archive being read.
@@ -165,13 +227,6 @@ struct GARC_Archive {
   /** Bytes of padding after the current member's data. */
   uint64_t data_padding;
 
-  /** Which of tar's formats the current member's header was. */
-  GARC_Tar_Variant tar_variant;
-  /** Non-zero when the signed reading of the header checksum was the match. */
-  int tar_checksum_was_signed;
-  /** Non-zero once a zero block has been seen, which is the end marker. */
-  int tar_saw_end_marker;
-
   /**
    * Bytes read by identification and not yet consumed by the format reader.
    *
@@ -194,61 +249,8 @@ struct GARC_Archive {
   /** How many of @ref peek have been consumed. */
   size_t peek_consumed;
 
-  /**
-   * @name Where a member's strings live between calls
-   *
-   * A member's name is lent to the caller until the next ::garc_next(), so it
-   * has to outlive the header block it was read from. These are sized to the
-   * longest a ustar header can express - 100 plus a `/` plus 155 for a split
-   * name - so the common case allocates nothing; a longer one goes to the heap
-   * buffer below.
-   * @{
-   */
-  char name_storage[GARC_TAR_NAME_STORAGE];   ///< Name, plus its terminator.
-  char link_storage[GARC_TAR_LINK_STORAGE];   ///< Link target, plus terminator.
-  char uname_storage[GARC_TAR_OWNER_STORAGE]; ///< Owner name, plus terminator.
-  char gname_storage[GARC_TAR_OWNER_STORAGE]; ///< Group name, plus terminator.
-  /** @} */
-
-  /**
-   * A name carried in front of the header rather than in it.
-   *
-   * GNU writes an `L` member whose data is the next member's name; pax writes a
-   * `path=` record. Both are unbounded in the format, so this is where a name
-   * too long for @ref name_storage goes. Allocated on first use and **kept
-   * across members**, because an archive of long names would otherwise allocate
-   * and free once per member; freed by garc_tar_release().
-   */
-  GARC_Tar_Buffer long_name;
-  /** The same for a link target: GNU's `K` member, pax's `linkpath=`. */
-  GARC_Tar_Buffer long_link;
-  /**
-   * Non-zero when @ref long_name holds a name for the header being read.
-   *
-   * Cleared at the start of every garc_tar_next(), so a carrier member whose
-   * read failed cannot leave a name to be applied to some later header. The
-   * *storage* is not cleared with it; only the claim on it is.
-   */
-  int have_long_name;
-  /** The same for @ref long_link. */
-  int have_long_link;
-
-  /**
-   * Records from an `x` member, which apply to the next member only.
-   *
-   * Reset at the start of every garc_tar_next(), for the same reason
-   * @ref have_long_name is: a set left behind by a failed step would otherwise be
-   * applied to whatever header a caller reached next.
-   */
-  GARC_Tar_Pax pax_next;
-  /**
-   * Records from `g` members, which apply until a later record replaces them.
-   *
-   * Not reset per member, and appended to rather than replaced, because POSIX
-   * overrides a global record **per key**: a second `g` naming `mtime` does not
-   * clear a first one's `path`.
-   */
-  GARC_Tar_Pax pax_global;
+  /** What only the tar reader looks at. Meaningless for any other format. */
+  GARC_Tar_State tar;
 };
 
 /**

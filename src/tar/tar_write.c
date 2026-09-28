@@ -123,7 +123,7 @@ static GARC_Result tar_record_append(GARC_Writer * writer, GARC_Pax_Key key,
   }
   const size_t total = body + digits;
 
-  GARC_Result result = garc_tar_buffer_grow(
+  GARC_Result result = garc_buffer_grow(
       writer->allocator, &writer->records, writer->records.length + total);
   if (result != GARC_OK) {
     return result;

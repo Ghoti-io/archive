@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "core/buffer_internal.h"
 #include "reader/reader_internal.h"
 
 #ifdef __cplusplus
@@ -81,7 +82,7 @@ struct GARC_Writer {
    * at the start of every member, so nothing a previous member needed can leak
    * into the next one's header - the same reason the reader resets its `x` set.
    */
-  GARC_Tar_Buffer records;
+  GARC_Buffer records;
 };
 
 /**

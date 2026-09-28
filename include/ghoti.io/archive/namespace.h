@@ -141,10 +141,10 @@
 
 // Internal names. Hidden by -fvisibility=hidden and so unable to collide, but
 // renamed anyway so that there is one rule rather than two.
+#define garc_buffer_free GHOTIIO_ARCHIVE(garc_buffer_free)
+#define garc_buffer_grow GHOTIIO_ARCHIVE(garc_buffer_grow)
 #define garc_reader_account GHOTIIO_ARCHIVE(garc_reader_account)
 #define garc_tar_block_is_header GHOTIIO_ARCHIVE(garc_tar_block_is_header)
-#define garc_tar_buffer_free GHOTIIO_ARCHIVE(garc_tar_buffer_free)
-#define garc_tar_buffer_grow GHOTIIO_ARCHIVE(garc_tar_buffer_grow)
 #define garc_tar_format_int GHOTIIO_ARCHIVE(garc_tar_format_int)
 #define garc_tar_format_uint GHOTIIO_ARCHIVE(garc_tar_format_uint)
 #define garc_tar_identify GHOTIIO_ARCHIVE(garc_tar_identify)

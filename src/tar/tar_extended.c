@@ -59,7 +59,7 @@
  * @return GARC_OK, or GARC_ERR_OOM.
  */
 static GARC_Result tar_buffer_reserve(
-    GARC_Archive * archive, GARC_Tar_Buffer * buffer, size_t wanted) {
+    GARC_Archive * archive, GARC_Buffer * buffer, size_t wanted) {
   if (buffer->capacity >= wanted + 1u) {
     return GARC_OK;
   }
@@ -72,7 +72,7 @@ static GARC_Result tar_buffer_reserve(
   // copying it across would be work for nobody, and a realloc that failed would
   // take the old block with it.
   //
-  // What bounds a read is @ref GARC_Tar_Buffer.length, not the allocation - so a
+  // What bounds a read is @ref GARC_Buffer.length, not the allocation - so a
   // shorter payload written into a buffer that still holds a longer one is
   // correct by that and by nothing else, which is why there is a test for it.
   gcu_allocator_free(archive->allocator, buffer->bytes);
@@ -83,19 +83,19 @@ static GARC_Result tar_buffer_reserve(
 }
 
 void garc_tar_release(GARC_Archive * archive) {
-  GARC_Tar_Buffer * const buffers[4] = {
-    &archive->long_name,
-    &archive->long_link,
-    &archive->pax_next.records,
-    &archive->pax_global.records,
+  GARC_Buffer * const buffers[4] = {
+    &archive->tar.long_name,
+    &archive->tar.long_link,
+    &archive->tar.pax_next.records,
+    &archive->tar.pax_global.records,
   };
   for (size_t i = 0; i < 4u; ++i) {
-    garc_tar_buffer_free(archive->allocator, buffers[i]);
+    garc_buffer_free(archive->allocator, buffers[i]);
   }
 }
 
 GARC_Result garc_tar_read_long_field(
-    GARC_Archive * archive, uint64_t declared, GARC_Tar_Buffer * buffer) {
+    GARC_Archive * archive, uint64_t declared, GARC_Buffer * buffer) {
   if (!declared) {
     // A carrier that carries nothing. Not harmless: the header behind it would
     // then be read with the truncated name in its own field, so the archive
@@ -193,31 +193,6 @@ GARC_Result garc_tar_read_long_field(
 //-----------------------------------------------------------------------------
 // pax: `len key=value\n` records in an `x` or `g` member
 //-----------------------------------------------------------------------------
-
-GARC_Result garc_tar_buffer_grow(const GARC_Allocator * allocator,
-    GARC_Tar_Buffer * buffer, size_t wanted) {
-  if (buffer->capacity >= wanted + 1u) {
-    return GARC_OK;
-  }
-  // realloc rather than malloc-and-copy: it returns NULL without freeing the old
-  // block, so a failure here leaves the set that was already parsed readable.
-  char * bytes
-      = (char *)gcu_allocator_realloc(allocator, buffer->bytes, wanted + 1u);
-  if (!bytes) {
-    return GARC_ERR_OOM;
-  }
-  buffer->bytes = bytes;
-  buffer->capacity = wanted + 1u;
-  return GARC_OK;
-}
-
-void garc_tar_buffer_free(
-    const GARC_Allocator * allocator, GARC_Tar_Buffer * buffer) {
-  gcu_allocator_free(allocator, buffer->bytes);
-  buffer->bytes = NULL;
-  buffer->capacity = 0;
-  buffer->length = 0;
-}
 
 void garc_tar_pax_reset(GARC_Tar_Pax * pax) {
   pax->records.length = 0;
@@ -364,7 +339,7 @@ static GARC_Result tar_pax_parse(
 
 GARC_Result garc_tar_read_pax_records(
     GARC_Archive * archive, uint64_t declared, int global) {
-  GARC_Tar_Pax * pax = global ? &archive->pax_global : &archive->pax_next;
+  GARC_Tar_Pax * pax = global ? &archive->tar.pax_global : &archive->tar.pax_next;
 
   if (!declared) {
     // An `x` or `g` member with no records. Unlike an empty GNU carrier this says
@@ -382,8 +357,8 @@ GARC_Result garc_tar_read_pax_records(
   //
   // Checked against the declaration, before the allocation, for the reason
   // garc_tar_read_long_field() gives.
-  const uint64_t held = (uint64_t)archive->pax_global.records.length
-      + (uint64_t)archive->pax_next.records.length;
+  const uint64_t held = (uint64_t)archive->tar.pax_global.records.length
+      + (uint64_t)archive->tar.pax_next.records.length;
   const uint64_t cap = archive->limits.max_extra_bytes;
   if (cap && (declared > cap || held > cap - declared)) {
     return GARC_ERR_LIMIT_EXTRA_BYTES;
@@ -398,7 +373,7 @@ GARC_Result garc_tar_read_pax_records(
   const size_t from = pax->records.length;
   const size_t wanted = from + (size_t)declared;
   GARC_Result result
-      = garc_tar_buffer_grow(archive->allocator, &pax->records, wanted);
+      = garc_buffer_grow(archive->allocator, &pax->records, wanted);
   if (result != GARC_OK) {
     return result;
   }
@@ -439,7 +414,7 @@ GARC_Result garc_tar_read_pax_records(
  */
 static int tar_pax_value(const GARC_Archive * archive, GARC_Pax_Key which,
     const char ** out_bytes, size_t * out_length) {
-  const GARC_Tar_Pax * const sets[2] = {&archive->pax_next, &archive->pax_global};
+  const GARC_Tar_Pax * const sets[2] = {&archive->tar.pax_next, &archive->tar.pax_global};
   for (size_t i = 0; i < 2u; ++i) {
     if (!sets[i]->have[which]) {
       continue;
@@ -457,7 +432,7 @@ static int tar_pax_value(const GARC_Archive * archive, GARC_Pax_Key which,
 /** Whether any record at all is in force, which is what makes a member pax. */
 static int tar_pax_any(const GARC_Archive * archive) {
   for (size_t i = 0; i < (size_t)GARC_PAX_KEY_COUNT; ++i) {
-    if (archive->pax_next.have[i] || archive->pax_global.have[i]) {
+    if (archive->tar.pax_next.have[i] || archive->tar.pax_global.have[i]) {
       return 1;
     }
   }
@@ -711,6 +686,6 @@ GARC_Result garc_tar_apply_pax(GARC_Archive * archive) {
   // A member any record was in force for was not read as a ustar member, even
   // when the record changed no field it reports - an inherited `hdrcharset` is
   // still a statement about how this member's name is to be read.
-  archive->tar_variant = GARC_TAR_PAX;
+  archive->tar.variant = GARC_TAR_PAX;
   return GARC_OK;
 }

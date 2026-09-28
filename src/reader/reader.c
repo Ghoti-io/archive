@@ -276,7 +276,7 @@ static GARC_Result reader_rewind(GARC_Archive * archive) {
   archive->at_end = 0;
   archive->data_remaining = 0;
   archive->data_padding = 0;
-  garc_tar_pax_reset(&archive->pax_global);
+  garc_tar_pax_reset(&archive->tar.pax_global);
 
   // The caps count a walk, and this is a new one. Carrying the counts forward
   // would make garc_find() fail with GARC_ERR_LIMIT_MEMBERS on an archive whose
@@ -397,11 +397,11 @@ GARC_Tar_Variant garc_tar_member_variant(const GARC_Archive * archive) {
   if (!archive || archive->format != GARC_FORMAT_TAR) {
     return GARC_TAR_NONE;
   }
-  return archive->tar_variant;
+  return archive->tar.variant;
 }
 
 int garc_tar_member_checksum_was_signed(const GARC_Archive * archive) {
-  return archive ? archive->tar_checksum_was_signed : 0;
+  return archive ? archive->tar.checksum_was_signed : 0;
 }
 
 void garc_archive_dump(const GARC_Archive * archive, FILE * out) {
@@ -416,8 +416,8 @@ void garc_archive_dump(const GARC_Archive * archive, FILE * out) {
   fprintf(out, "archive: format=%s\n", garc_format_string(archive->format));
   if (archive->format == GARC_FORMAT_TAR) {
     fprintf(out, "  tar variant: %s (checksum read as %s)\n",
-        garc_tar_variant_string(archive->tar_variant),
-        archive->tar_checksum_was_signed ? "signed" : "unsigned");
+        garc_tar_variant_string(archive->tar.variant),
+        archive->tar.checksum_was_signed ? "signed" : "unsigned");
   }
   fprintf(out, "  members: %llu\n", (unsigned long long)archive->member_count);
   fprintf(out, "  declared bytes: %llu\n",

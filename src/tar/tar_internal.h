@@ -183,7 +183,7 @@ uint64_t garc_tar_offset(const GARC_Archive * archive);
  *   GARC_ERR_CORRUPT for a payload that is not a string, or GARC_ERR_OOM.
  */
 GARC_Result garc_tar_read_long_field(
-    GARC_Archive * archive, uint64_t declared, GARC_Tar_Buffer * buffer);
+    GARC_Archive * archive, uint64_t declared, GARC_Buffer * buffer);
 
 /**
  * Whether a member of this type carries data after its header.
@@ -261,33 +261,6 @@ void garc_tar_release(GARC_Archive * archive);
  * @return A static string, never NULL.
  */
 const char * garc_tar_pax_key_name(GARC_Pax_Key key);
-
-/**
- * Make sure a buffer can hold @p wanted bytes and a terminator, keeping what it
- * already holds.
- *
- * Used by the reader for a record set, which is *appended* to - a second `x`
- * header for one member adds to it, and a second `g` overrides individual keys -
- * and by the writer for the record set it builds. It takes an allocator rather
- * than an archive because the writer has no archive; that is also what makes it
- * the one growable buffer in the tar code rather than two.
- *
- * @param allocator The allocator.
- * @param buffer The buffer.
- * @param wanted How many bytes have to fit.
- * @return GARC_OK, or GARC_ERR_OOM with the old contents intact.
- */
-GARC_Result garc_tar_buffer_grow(const GARC_Allocator * allocator,
-    GARC_Tar_Buffer * buffer, size_t wanted);
-
-/**
- * Free a buffer and leave it in its unused state.
- *
- * @param allocator The allocator it was grown through.
- * @param buffer The buffer.
- */
-void garc_tar_buffer_free(
-    const GARC_Allocator * allocator, GARC_Tar_Buffer * buffer);
 
 /**
  * Which encoding a numeric field was written in.
