@@ -53,6 +53,15 @@ struct GARC_Stream {
   const GARC_Allocator * allocator; ///< Allocator for the stream itself.
   const uint8_t * mem_data; ///< Borrowed buffer, for a memory stream.
   size_t mem_size;          ///< Its length.
+  /**
+   * How to tear down `cb.ctx`, or NULL when it is borrowed.
+   *
+   * A caller's `ctx` is theirs. A `ctx` this library allocated - the decoder
+   * and staging buffer of a decompressing stream - is freed through this, so
+   * that ::garc_stream_destroy() stays one function that frees what the stream
+   * owns without knowing what kind of stream it is.
+   */
+  void (*owned_destroy)(GARC_Stream * stream);
 };
 
 #ifdef __cplusplus

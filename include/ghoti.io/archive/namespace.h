@@ -92,6 +92,9 @@
 #define garc_result_is_limit GHOTIIO_ARCHIVE(garc_result_is_limit)
 #define garc_result_string GHOTIIO_ARCHIVE(garc_result_string)
 #define garc_sink_create_callback GHOTIIO_ARCHIVE(garc_sink_create_callback)
+#define garc_sink_create_compress GHOTIIO_ARCHIVE(garc_sink_create_compress)
+#define garc_sink_create_compress_with_allocator                              \
+  GHOTIIO_ARCHIVE(garc_sink_create_compress_with_allocator)
 #define garc_sink_create_callback_with_allocator                               \
   GHOTIIO_ARCHIVE(garc_sink_create_callback_with_allocator)
 #define garc_sink_create_memory GHOTIIO_ARCHIVE(garc_sink_create_memory)
@@ -99,12 +102,17 @@
   GHOTIIO_ARCHIVE(garc_sink_create_memory_with_allocator)
 #define garc_sink_data GHOTIIO_ARCHIVE(garc_sink_data)
 #define garc_sink_destroy GHOTIIO_ARCHIVE(garc_sink_destroy)
+#define garc_sink_finish GHOTIIO_ARCHIVE(garc_sink_finish)
 #define garc_sink_fill GHOTIIO_ARCHIVE(garc_sink_fill)
 #define garc_sink_tell GHOTIIO_ARCHIVE(garc_sink_tell)
 #define garc_sink_write GHOTIIO_ARCHIVE(garc_sink_write)
 #define garc_stream_create_callback GHOTIIO_ARCHIVE(garc_stream_create_callback)
 #define garc_stream_create_callback_with_allocator                             \
   GHOTIIO_ARCHIVE(garc_stream_create_callback_with_allocator)
+#define garc_stream_create_decompress                                         \
+  GHOTIIO_ARCHIVE(garc_stream_create_decompress)
+#define garc_stream_create_decompress_with_allocator                          \
+  GHOTIIO_ARCHIVE(garc_stream_create_decompress_with_allocator)
 #define garc_stream_create_memory GHOTIIO_ARCHIVE(garc_stream_create_memory)
 #define garc_stream_create_memory_with_allocator                               \
   GHOTIIO_ARCHIVE(garc_stream_create_memory_with_allocator)

@@ -54,6 +54,24 @@ struct GARC_Sink {
   uint8_t * mem_bytes;              ///< Owned buffer, for a memory sink.
   size_t mem_length;                ///< How many of them are in use.
   size_t mem_capacity;              ///< How many were allocated.
+  /**
+   * End-of-stream work for a sink this library wrapped, or NULL.
+   *
+   * ::garc_sink_finish() is this, and it is NULL for a memory sink and for a
+   * caller's callback sink because neither has anything to end. A compressing
+   * sink does: the codec's trailer is written here, and it can fail, which is
+   * why it is not done in destroy.
+   */
+  GARC_Result (*owned_finish)(GARC_Sink * sink);
+  /**
+   * How to tear down `cb.ctx`, or NULL when it is borrowed.
+   *
+   * A caller's `ctx` is theirs and is never freed here. A `ctx` this library
+   * allocated - a codec wrapper's state - is freed through this, so that
+   * ::garc_sink_destroy() stays one function that frees what the sink owns
+   * without knowing what kind of sink it is.
+   */
+  void (*owned_destroy)(GARC_Sink * sink);
 };
 
 #ifdef __cplusplus

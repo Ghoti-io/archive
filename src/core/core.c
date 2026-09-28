@@ -48,7 +48,7 @@ const char * garc_result_string(GARC_Result result) {
       return "Invalid argument";
     case GARC_ERR_INTERNAL:
       return "Internal error";
-    // Each cap says which cap. A shared string would undo half of what five
+    // Each cap says which cap. A shared string would undo half of what six
     // separate constants buy, since a message is what a caller prints.
     case GARC_ERR_LIMIT_MEMBERS:
       return "Limit exceeded: too many members";
@@ -60,6 +60,11 @@ const char * garc_result_string(GARC_Result result) {
       return "Limit exceeded: member name too long";
     case GARC_ERR_LIMIT_EXTRA_BYTES:
       return "Limit exceeded: member extra fields too large";
+    // Says whose cap, not just which, because this is the one that is not ours:
+    // a caller who reads "limit exceeded" and goes looking through GARC_Limits
+    // for the field to raise will not find it.
+    case GARC_ERR_LIMIT_CODEC_BYTES:
+      return "Limit exceeded: the codec's output cap, in its own options";
     case GARC_RESULT_COUNT:
     default:
       return "Unknown error";
@@ -77,6 +82,7 @@ int garc_result_is_limit(GARC_Result result) {
     case GARC_ERR_LIMIT_TOTAL_BYTES:
     case GARC_ERR_LIMIT_NAME_BYTES:
     case GARC_ERR_LIMIT_EXTRA_BYTES:
+    case GARC_ERR_LIMIT_CODEC_BYTES:
       return 1;
     default:
       return 0;

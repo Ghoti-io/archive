@@ -294,5 +294,9 @@ void garc_stream_destroy(GARC_Stream * stream) {
   if (!stream) {
     return;
   }
+  // Before the stream itself, because the hook reads fields of it.
+  if (stream->owned_destroy) {
+    stream->owned_destroy(stream);
+  }
   gcu_allocator_free(stream->allocator, stream);
 }

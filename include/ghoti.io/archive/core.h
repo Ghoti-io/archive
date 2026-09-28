@@ -52,9 +52,12 @@ extern "C" {
  * A single code for every cap cannot distinguish an absent cap from a
  * defeated one, and cannot tell a test which cap fired - which makes the
  * limits untestable in exactly the way `notes/compress` records under
- * "absent cap and defeated cap return the same code". The cost is five
+ * "absent cap and defeated cap return the same code". The cost is six
  * constants where the convention has one; the benefit is that a test can
- * assert *which*.
+ * assert *which*. Five of the six are ::GARC_Limits fields and the sixth,
+ * ::GARC_ERR_LIMIT_CODEC_BYTES, is a cap held by `compress` - which is exactly
+ * the case a shared code would have made indistinguishable, since raising a
+ * cap in the wrong library changes nothing.
  *
  * A status is added by the phase that can return it. Phase A returns only
  * what is listed here, so every value below is reachable and every row of
@@ -76,6 +79,18 @@ typedef enum {
   GARC_ERR_LIMIT_TOTAL_BYTES,  ///< ::GARC_Limits.max_total_bytes exceeded.
   GARC_ERR_LIMIT_NAME_BYTES,   ///< ::GARC_Limits.max_name_bytes exceeded.
   GARC_ERR_LIMIT_EXTRA_BYTES,  ///< ::GARC_Limits.max_extra_bytes exceeded.
+  /**
+   * A cap in the *codec's* options stopped a decompressing stream.
+   *
+   * The only one of these that is not a ::GARC_Limits field, because the cap is
+   * not this library's: `compress`'s decoder options carry a maximum output size
+   * (512 MiB by default, so a decompression bomb is refused whether or not the
+   * caller thought about it), and this is what that refusal arrives as. Kept
+   * distinct from ::GARC_ERR_LIMIT_TOTAL_BYTES because the two name different
+   * caps in different libraries, and a caller raising the wrong one would get
+   * the same failure again.
+   */
+  GARC_ERR_LIMIT_CODEC_BYTES,
 
   GARC_RESULT_COUNT
 } GARC_Result;
@@ -105,11 +120,14 @@ GARC_API int garc_result_is_error(GARC_Result result);
 /**
  * @brief Whether a result names one of the ::GARC_Limits caps.
  *
- * True for the five `GARC_ERR_LIMIT_*` codes and false for everything else.
+ * True for the six `GARC_ERR_LIMIT_*` codes and false for everything else.
+ * Five of them name a ::GARC_Limits field and ::GARC_ERR_LIMIT_CODEC_BYTES
+ * names one in the codec's options, which is the same question to a caller
+ * asking "was I stopped by a cap I could raise" and a different one to a caller
+ * asking *which* - so this is for the first, and tests name the constant.
  * A caller that wants to raise a cap and retry needs to know that a cap is
  * what stopped it without enumerating them, and a test that asserts "some
- * limit fired" is weaker than one that asserts which - so this is for the
- * caller, and tests name the constant.
+ * limit fired" is weaker than one that asserts which.
  *
  * @param result The result code.
  * @return Non-zero when @p result reports an exceeded limit.

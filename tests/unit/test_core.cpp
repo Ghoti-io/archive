@@ -38,7 +38,7 @@ TEST(Result, StringForAValueOutsideTheEnumIsTheUnknownArm) {
 }
 
 TEST(Result, EveryLimitStringNamesWhichLimit) {
-  // Five constants buy nothing if the message a caller prints is the same for
+  // Six constants buy nothing if the message a caller prints is the same for
   // all of them.
   const GARC_Result limits[] = {
     GARC_ERR_LIMIT_MEMBERS,
@@ -46,6 +46,7 @@ TEST(Result, EveryLimitStringNamesWhichLimit) {
     GARC_ERR_LIMIT_TOTAL_BYTES,
     GARC_ERR_LIMIT_NAME_BYTES,
     GARC_ERR_LIMIT_EXTRA_BYTES,
+    GARC_ERR_LIMIT_CODEC_BYTES,
   };
   for (GARC_Result result : limits) {
     std::string text = garc_result_string(result);
@@ -66,7 +67,10 @@ TEST(Result, IsErrorIsFalseForExactlyOkAndEnd) {
   }
 }
 
-TEST(Result, IsLimitIsTrueForExactlyTheFiveLimitCodes) {
+TEST(Result, IsLimitIsTrueForExactlyTheSixLimitCodes) {
+  // The count is asserted rather than the membership, and it is what caught the
+  // sixth code being added: a predicate that grew without this test being looked
+  // at would have been a predicate nobody had decided about.
   int limit_count = 0;
   for (int i = 0; i < GARC_RESULT_COUNT; ++i) {
     GARC_Result result = static_cast<GARC_Result>(i);
@@ -78,7 +82,7 @@ TEST(Result, IsLimitIsTrueForExactlyTheFiveLimitCodes) {
           << garc_result_string(result) << " is a limit but not an error";
     }
   }
-  EXPECT_EQ(limit_count, 5);
+  EXPECT_EQ(limit_count, 6);
   EXPECT_FALSE(garc_result_is_limit(GARC_OK));
   EXPECT_FALSE(garc_result_is_limit(GARC_ERR_CORRUPT));
   EXPECT_FALSE(garc_result_is_limit(GARC_RESULT_COUNT));

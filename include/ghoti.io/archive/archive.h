@@ -28,6 +28,7 @@
 #define GHOTI_IO_GARC_ARCHIVE_H
 
 #include <ghoti.io/archive/allocator.h>
+#include <ghoti.io/archive/codec.h>
 #include <ghoti.io/archive/core.h>
 #include <ghoti.io/archive/macros.h>
 #include <ghoti.io/archive/member.h>

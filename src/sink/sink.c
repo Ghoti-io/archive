@@ -249,9 +249,30 @@ GARC_Result garc_sink_data(
   return GARC_OK;
 }
 
+GARC_Result garc_sink_finish(GARC_Sink * sink) {
+  if (!sink) {
+    return GARC_ERR_INVALID;
+  }
+  // A memory sink and a caller's callback sink have no end-of-stream work, and
+  // answering GARC_OK rather than GARC_ERR_UNSUPPORTED is deliberate: a caller
+  // that writes an archive through whichever sink it was handed should be able
+  // to end it the same way every time, and a status that meant "this kind of
+  // sink does not need finishing" would have to be distinguished from a real
+  // failure at every call site.
+  if (!sink->owned_finish) {
+    return GARC_OK;
+  }
+  return sink->owned_finish(sink);
+}
+
 void garc_sink_destroy(GARC_Sink * sink) {
   if (!sink) {
     return;
+  }
+  // Before the sink itself, because the hook reads fields of it. Note that this
+  // does *not* finish an unfinished stream: see garc_sink_finish().
+  if (sink->owned_destroy) {
+    sink->owned_destroy(sink);
   }
   const GARC_Allocator * allocator = sink->allocator;
   gcu_allocator_free(allocator, sink->mem_bytes);

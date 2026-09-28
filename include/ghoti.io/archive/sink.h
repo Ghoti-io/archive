@@ -52,7 +52,7 @@
  * append-only: every byte is written once, in order, and nothing is patched
  * afterwards. zip is not - a streamed local header carries zeros where the sizes
  * go and either a data descriptor after the data or a seek back to fill them in -
- * so a `seek` callback and a ::garc_sink_is_seekable() to go with it arrive with
+ * so a `seek` callback and a `garc_sink_is_seekable()` to go with it arrive with
  * the writer that reads them. A field nothing reads is worse than an absent one,
  * because it reads as a promise.
  */
@@ -220,11 +220,39 @@ GARC_API GARC_Result garc_sink_data(
     const GARC_Sink * sink, const void ** out_data, size_t * out_size);
 
 /**
+ * @brief End whatever this sink has to end.
+ *
+ * A memory sink and a callback sink have nothing to end and return ::GARC_OK, so
+ * a caller can call this unconditionally after the last write and does not have
+ * to know which kind of sink it was handed. **A compressing sink writes its
+ * codec's trailer here** - see codec.h - and without this call the inner sink
+ * holds a truncated stream that some decoders accept and others reject.
+ *
+ * Not folded into ::garc_sink_destroy() on purpose: that returns `void`, and a
+ * failure it had to swallow would turn a failed write of the last few bytes into
+ * an archive that looks finished.
+ *
+ * Not folded into ::garc_writer_finish() either. A writer ends the *archive*,
+ * which is the end-of-archive marker and its padding; the sink is borrowed, and
+ * a writer that finished a sink it did not create would be ending something its
+ * caller may still want to write to.
+ *
+ * Idempotent where it does anything: calling it twice is safe.
+ *
+ * @param sink The sink.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID when @p sink is NULL, or whatever the
+ *   underlying write or codec reported.
+ */
+GARC_API GARC_Result garc_sink_finish(GARC_Sink * sink);
+
+/**
  * @brief Destroy a sink. NULL is ignored.
  *
  * Frees a memory sink's buffer. A callback sink's `ctx` is not touched; closing
  * whatever it wraps is the caller's, and a sink that closed a caller's file
  * descriptor would be a sink that cannot be used twice.
+ *
+ * Does **not** finish an unfinished sink; see ::garc_sink_finish() for why.
  *
  * @param sink The sink.
  */
