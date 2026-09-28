@@ -1,0 +1,7 @@
+#!/bin/sh
+# Info-ZIP's writer. `zip -v` prints a banner, a compilation-options block and a
+# usage summary; the version is on the line that starts "This is Zip", which is
+# what this extracts. Grepping for "Zip 3.0" would also match the copyright
+# line, and a version check that can be satisfied by a copyright notice is not
+# a check.
+exec zip -v 2>/dev/null | sed -n 's/^This is \(Zip [0-9][^,]*\),.*/\1/p;' | head -1

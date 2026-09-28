@@ -49,6 +49,18 @@ writes the same headers and *refuses*, by name, anything that would need a recor
 a caller who needs an archive a 1988 reader can read wants to be told rather than
 handed one with records in it. No zip either way yet, and no filesystem layer.
 
+**The zip corpus is in before the zip reader**, which is the order that makes the
+reader measurable: 23 archives from four writers - Info-ZIP's `zip`, libarchive's
+`bsdtar`, 7-Zip and Python's `zipfile` - with what `zipfile` and `bsdtar` read out
+of them, and what all four references *do* when handed one. They disagree already:
+an archive comment holding the bytes `PK\x05\x06` is read correctly by three of
+them and refused by Python, a zip behind a self-extracting stub is read by bsdtar
+and Python and refused by unzip and 7-Zip, and libarchive writes a data descriptor
+for every member so its local headers say a size of zero where its central
+directory says the truth. The
+references being pinned is what makes each of those a fact to read rather than a
+surprise to discover later.
+
 **Reads and writes `tar.gz`, `tar.zst` and `tar.lz4`, with no format code for
 any of them.** A codec wraps the stream or the sink, the tar reader and writer
 see the same interface they always saw, and the codec is named by a **string**

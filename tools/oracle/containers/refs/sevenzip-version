@@ -1,0 +1,11 @@
+#!/bin/sh
+# 7-Zip. Debian's `7zip` package installs it as **7z**, not as upstream's `7zz`
+# name - and p7zip, the older fork that also owned the name `7z`, is a
+# transitional package now.
+#
+# The first line of the banner carries the version. The *second* must not be
+# read: it says `locale=... Threads:12 OPEN_MAX:4096`, and the thread count is
+# the host's core count, so a version check over both lines would answer
+# differently on two machines. It is also the reason every 7z invocation in the
+# corpus generator passes -mmt=1.
+exec 7z 2>/dev/null | sed -n '/^7-Zip/p' | head -1

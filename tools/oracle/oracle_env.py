@@ -18,13 +18,19 @@ text - an oracle that accepts a crashed probe because the banner looked right is
 not a pin. What changed here is the probe table.
 
 `command("tar")` returns the argv prefix that runs the reference, which is
-`docker run` into the image built by `containers/tars/Containerfile`.
+`docker run` into the image built by `containers/refs/Containerfile`.
 
-One thing is different here and worth saying: the three references share one
-image, so `command()` returns the same `docker run` for all three - the name
-selects the *program*, not the image. That is deliberate (containers/IMAGES),
-and it is what makes a disagreement between two of them a fact about the two
+One thing is different here and worth saying: every reference shares one image,
+so `command()` returns the same `docker run` for all of them - the name selects
+the *program*, not the image. That is deliberate (containers/IMAGES), and it is
+what makes a disagreement between two of them a fact about the two
 implementations rather than about two container builds.
+
+Two of the names are not programs. `pytarfile` and `pyzipfile` are both
+`python3`, and they are two entries rather than one because they answer about two
+formats: a pin that said "python3 3.13.5" would be one fact where the corpus asks
+two questions, and BINARY below is what maps a question back to a binary for host
+mode.
 
 Modes, from GHOTI_ORACLE_MODE:
 
@@ -57,6 +63,12 @@ PROBE = {
     "tar": (["tar-version"], "tar (GNU tar) 1.35"),
     "bsdtar": (["bsdtar-version"], "libarchive 3.7.4"),
     "pytarfile": (["pytarfile-version"], "Python 3.13.5 tarfile"),
+    "zip": (["zip-version"], "Zip 3.0"),
+    "unzip": (["unzip-version"], "UnZip 6.00"),
+    # "7-Zip 25.01" and not the whole banner line: the rest of it is
+    # "(x64) : Copyright ... : 2025-08-03", and the architecture is the host's.
+    "sevenzip": (["sevenzip-version"], "7-Zip 25.01"),
+    "pyzipfile": (["pyzipfile-version"], "Python 3.13.5 zipfile"),
 }
 
 # The program each reference is invoked as, where it differs from the name.
@@ -65,6 +77,11 @@ PROBE = {
 # which means it has to know which binary.
 BINARY = {
     "pytarfile": "python3",
+    "pyzipfile": "python3",
+    # Debian's `7zip` package installs 7-Zip as `7z`. Upstream's own name is
+    # `7zz`, and p7zip - the fork that used to own the name `7z` - is a
+    # transitional package now, so on this base the name and the binary differ.
+    "sevenzip": "7z",
 }
 
 _pins = None

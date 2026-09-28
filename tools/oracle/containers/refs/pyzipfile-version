@@ -1,0 +1,7 @@
+#!/bin/sh
+# The interpreter version, which is what pins zipfile: it is a stdlib module
+# with no version of its own, and what it does has changed between releases -
+# 3.11 added Path.stat, 3.14 adds ZIP_ZSTANDARD as a method it can write. So the
+# interpreter's version is the module's, the same argument pytarfile-version
+# makes for tarfile.
+exec python3 -c 'import sys, zipfile; print("Python %s zipfile" % sys.version.split()[0])'

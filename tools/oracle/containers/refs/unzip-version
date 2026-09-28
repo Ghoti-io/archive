@@ -1,0 +1,5 @@
+#!/bin/sh
+# Info-ZIP's reader, which is a separate program from zip with a separate
+# version - 6.00 against zip's 3.0 - and separately packaged. `unzip -v` puts
+# its version on the first line.
+exec unzip -v 2>/dev/null | head -1

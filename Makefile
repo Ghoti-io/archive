@@ -327,6 +327,7 @@ INCLUDE := -I include/ -I src/ -I $(GEN_DIR)/
 # it reached a container - was the reason this list grew.
 DEPLESS_GOALS := docs docs-pdf check-docs clean fuzz-clean cloc help \
 	corpus check-corpus check-corpus-hashes check-oracle \
+	zip-corpus check-zip-corpus check-zip-oracle \
 	oracle-build oracle-version
 ifeq ($(filter-out $(DEPLESS_GOALS),$(or $(MAKECMDGOALS),all)),)
 SKIP_DEP_CHECK := 1
@@ -600,6 +601,7 @@ $(WRITER_PROBE): tools/oracle/writer_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 # General commands
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-corpus-hashes check-corpus corpus oracle-build oracle-version
+.PHONY: zip-corpus check-zip-corpus check-zip-oracle
 .PHONY: check-oracle check-writer
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
@@ -1237,17 +1239,22 @@ fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 
 ORACLE := tools/oracle
 ORACLE_RUN := python3 $(ORACLE)/oracle_run.py
-ORACLE_IMAGE := localhost/ghoti-archive-oracle-tars:deb13
+ORACLE_IMAGE := localhost/ghoti-archive-oracle-refs:deb13
 
-oracle-build: ## Build the pinned tar, bsdtar and python3 image
+# Every reference, in the order containers/IMAGES lists them. One list rather
+# than one per gate, because they are one image: a gate that named a subset would
+# pass on a machine where the image was built without the rest of them.
+ORACLE_REFS := tar,bsdtar,pytarfile,zip,unzip,sevenzip,pyzipfile
+
+oracle-build: ## Build the pinned tar, zip, 7-Zip and python3 image
 	docker build -t $(ORACLE_IMAGE) \
-		-f $(ORACLE)/containers/tars/Containerfile \
-		$(ORACLE)/containers/tars
+		-f $(ORACLE)/containers/refs/Containerfile \
+		$(ORACLE)/containers/refs
 
 oracle-version: ## Print which references would answer, and fail if none would
-	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- true
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) $(ORACLE_REFS) -- true
 
-check-corpus-hashes: ## Fail if a committed fixture is not what CORPUS names
+check-corpus-hashes: ## Fail if a committed fixture is not what its hash list names
 	@python3 tools/check_corpus.py
 
 check-fixtures: ## Fail if a test input is excluded from the repository
@@ -1264,9 +1271,28 @@ check-corpus: ## Fail if the pinned references no longer produce the corpus
 	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- \
 		python3 $(ORACLE)/make_corpus.py --check
 
+zip-corpus: ## Regenerate tests/data/zip/ and containers/CORPUS-ZIP in the container
+# A separate generator and a separate hash list from the tar corpus, because each
+# rewrites its whole list from what it produced: one shared list would have to be
+# merged, and a generator that preserves lines it did not write cannot tell a
+# dropped fixture from one it was not asked for.
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) zip,unzip,sevenzip,pyzipfile,bsdtar -- \
+		python3 $(ORACLE)/make_zip_corpus.py
+
+check-zip-corpus: ## Fail if the pinned references no longer produce the zip corpus
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) zip,unzip,sevenzip,pyzipfile,bsdtar -- \
+		python3 $(ORACLE)/make_zip_corpus.py --check
+
 check-oracle: ## Fail if the live references disagree with the committed manifest
 	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- \
 		python3 $(ORACLE)/check_manifest.py
+
+check-zip-oracle: ## Fail if the live references read the zip corpus differently
+# The only gate that covers the three zip fixtures with no digest in CORPUS-ZIP: a
+# random salt, a random encryption header and an unsettable ctime mean their bytes
+# move, and this compares what the references read out of them instead.
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) unzip,sevenzip,pyzipfile,bsdtar -- \
+		python3 $(ORACLE)/check_zip_manifest.py
 
 check-writer: ## Fail if the references disagree with what the writer produces
 # **The one gate here whose subject is this library rather than a reference.**
