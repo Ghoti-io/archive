@@ -53,6 +53,8 @@ void garc_writer_options_default(GARC_Writer_Options * options) {
   // Off, because a zip64 field on a member that does not need one is refused by
   // some old readers. GARC_Writer_Options says why the knob exists at all.
   options->zip_force_zip64 = 0;
+  // Stored, which is also this field's zero. GARC_Writer_Options argues it.
+  options->zip_method = GARC_ZIP_METHOD_STORED;
   // No record padding. bsdtar's answer rather than GNU tar's: 10240 bytes was a
   // tape record, every reader accepts either, and this library's archives are
   // built in memory and handed to a caller far more often than they are written
@@ -146,6 +148,17 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
         break;
       default:
         return GARC_ERR_INVALID;
+    }
+    switch (resolved.zip_method) {
+      case GARC_ZIP_METHOD_STORED:
+      case GARC_ZIP_METHOD_DEFLATE:
+        break;
+      default:
+        // Every other value, the readable ones included. Refused here rather than
+        // at the first member, for the same reason the sizes are: the answer is
+        // known before a byte is written, and a refusal afterwards would leave a
+        // truncated archive behind it.
+        return GARC_ERR_UNSUPPORTED;
     }
     // zip has no variants and tar_variant is meaningless here, so it is not
     // checked: a caller copying an archive from tar to zip should not have to
@@ -267,8 +280,9 @@ void garc_writer_dump(const GARC_Writer * writer, FILE * out) {
     return;
   }
   if (writer->format == GARC_FORMAT_ZIP) {
-    fprintf(out, "GARC_Writer: format=zip sizes=%s%s\n",
+    fprintf(out, "GARC_Writer: format=zip sizes=%s method=%s%s\n",
         garc_zip_sizes_string(writer->options.zip_sizes),
+        garc_zip_method_string(writer->options.zip_method),
         writer->options.zip_force_zip64 ? " zip64=forced" : "");
     fprintf(out, "  directory: %llu entries, %llu bytes\n",
         (unsigned long long)writer->zip.entries,

@@ -42,7 +42,13 @@
  * member. That is what lets a program copy an archive from tar to zip without
  * knowing which it is writing.
  *
- * Usage: zip_write <path.zip> [--stream]
+ * **And nothing is compressed unless you ask.** The default method is stored,
+ * which is also the zero of the option, so a caller who memset their options gets
+ * what NULL would have given them. `--deflate` is the one assignment that changes
+ * it, and the report at the end prints both totals so the difference is visible
+ * rather than asserted.
+ *
+ * Usage: zip_write <path.zip> [--stream] [--deflate]
  */
 
 #include <inttypes.h>
@@ -122,11 +128,21 @@ static const Entry ENTRIES[] = {
  */
 int main(int argc, char ** argv) {
   int stream = 0;
-  if (argc == 3 && strcmp(argv[2], "--stream") == 0) {
-    stream = 1;
+  int deflate = 0;
+  for (int i = 2; i < argc; ++i) {
+    if (strcmp(argv[i], "--stream") == 0) {
+      stream = 1;
+    }
+    else if (strcmp(argv[i], "--deflate") == 0) {
+      deflate = 1;
+    }
+    else {
+      fprintf(stderr, "usage: %s <path.zip> [--stream] [--deflate]\n", argv[0]);
+      return 2;
+    }
   }
-  else if (argc != 2) {
-    fprintf(stderr, "usage: %s <path.zip> [--stream]\n", argv[0]);
+  if (argc < 2) {
+    fprintf(stderr, "usage: %s <path.zip> [--stream] [--deflate]\n", argv[0]);
     return 2;
   }
 
@@ -155,10 +171,16 @@ int main(int argc, char ** argv) {
   }
 
   GARC_Writer * writer = NULL;
-  // NULL options: GARC_ZIP_SIZES_AUTO, which asks the sink. Asking for
-  // GARC_ZIP_SIZES_LOCAL with no `patch` would be GARC_ERR_NOT_SEEKABLE here,
-  // which is the refusal a caller wants when the form matters to them.
-  result = garc_writer_create(sink, GARC_FORMAT_ZIP, NULL, &writer);
+  // The defaults are GARC_ZIP_SIZES_AUTO, which asks the sink, and
+  // GARC_ZIP_METHOD_STORED. Asking for GARC_ZIP_SIZES_LOCAL with no `patch` would
+  // be GARC_ERR_NOT_SEEKABLE here, which is the refusal a caller wants when the
+  // form matters to them.
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  if (deflate) {
+    options.zip_method = GARC_ZIP_METHOD_DEFLATE;
+  }
+  result = garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer);
   if (result != GARC_OK) {
     fprintf(stderr, "writer: %s\n", garc_result_string(result));
     garc_sink_destroy(sink);
@@ -223,8 +245,9 @@ int main(int argc, char ** argv) {
     return 1;
   }
 
-  printf("%s: %" PRIu64 " members, %" PRIu64 " bytes, sizes in the %s\n",
-      argv[1], members, written,
+  printf("%s: %" PRIu64 " members, %" PRIu64 " bytes, method %s, sizes in "
+      "the %s\n",
+      argv[1], members, written, deflate ? "deflate" : "stored",
       stream ? "data descriptors (the sink could not go back)"
              : "local headers (the sink could be patched)");
   return 0;

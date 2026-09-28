@@ -47,7 +47,7 @@ record only for what ustar cannot say, so a reader that knows only POSIX.1-1988
 gets a correct answer wherever one exists in its vocabulary. `GARC_TAR_USTAR`
 writes the same headers and *refuses*, by name, anything that would need a record:
 a caller who needs an archive a 1988 reader can read wants to be told rather than
-handed one with records in it. No zip writer yet, and no filesystem layer.
+handed one with records in it. No filesystem layer yet; that is phase F.
 
 **Reads zip, backwards, from the central directory.** The end record is found by
 scanning back from the end of the stream - at most 65,557 bytes, with every
@@ -137,18 +137,18 @@ the digits in a numeric field, whether to use the ustar name split, what the
 extended header is called — so each was measured and each choice is argued in
 `documentation/design.md` rather than copied.
 
-Build clean under GCC 14 with `-Werror`; 536 tests; 99.3% line coverage of 2,945
-lines; the twenty-one uncovered are four `default:` arms no input can reach - kept
-so that a third format added to an enum and not to a switch is a named internal
-error rather than a silent fall-through - thirteen arms reachable only if a codec or
-`compress`'s own allocator broke its contract, and the four this library has always
-had, three of which are live only where `size_t` is 32 bits. Clean under Valgrind
-and under ASan+UBSan; `check-symbols`, `check-aliasing`, `check-corpus-hashes`,
-`check-fixtures` and `check-docs` green, the last at zero Doxygen warnings; six
-fuzz harnesses, the newest of which found a defect in its first two minutes; and
-seven oracle gates, of which two hand this library's *own output* to the pinned
-references - `check-zip-writer` found a defect on its first run that nothing
-inside this process could have seen.
+Build clean under GCC 14 with `-Werror`; 579 tests; 99.3% line coverage of 3,401
+lines; the twenty-five uncovered are two `default:` arms no input can reach and
+their bodies - kept so that a third format added to an enum and not to a switch is
+a named internal error rather than a silent fall-through - eighteen arms reachable
+only if a codec or `compress`'s own allocator broke its contract, and three this
+library has always had, one of which is live only where `size_t` is 32 bits. Clean
+under Valgrind and under ASan+UBSan; `check-symbols`, `check-aliasing`,
+`check-corpus-hashes`, `check-fixtures` and `check-docs` green, the last at zero
+Doxygen warnings; six fuzz harnesses, the newest of which found a defect in its
+first two minutes; and seven oracle gates, of which two hand this library's *own
+output* to the pinned references - `check-zip-writer` found a defect on its first
+run that nothing inside this process could have seen.
 
 ## A minimal complete program
 
@@ -360,6 +360,21 @@ composes the type bits from `GARC_Member.type` and takes only the permissions fr
 `mode` — a caller copying a symlink out of a *tar* has no type bits to give it. And
 a zip symlink's target *is* its data, so the writer puts it there and the caller
 writes nothing, exactly as for a tar.
+
+**Stored or deflate, and nothing else.** `GARC_Writer_Options.zip_method` takes
+those two and refuses every other value at create — including the ones this library
+can *read*, because reading a method means owning a decoder and writing one means
+choosing to produce it. Stored is the default, and the reason is the zero: every
+field in that struct is written so a zero-filled copy behaves like the defaults or
+is refused, and `GARC_ZIP_METHOD_STORED` is 0. A member with no data is stored
+whatever the option says, and so is a symlink — its target is a path, and every
+symlink every reference in the corpus wrote is stored. A member whose data does not
+compress is still deflated: the method is in a header written before the first byte
+arrives, so there is no point at which it could be taken back, which is what `zip`
+can do only because it has the whole file on disk first. And zip64's threshold is
+`gcomp_encode_bound()` rather than the declared size, because deflate can make a
+member *larger* and a compressed size that crossed 4 GiB afterwards would have
+nowhere to go.
 
 `garc_writer_finish()` is not called by `garc_writer_destroy()`, on purpose:
 finishing can fail, a destructor cannot report it, and a destructor that finished

@@ -332,6 +332,29 @@ GARC_Result garc_zip_skip(GARC_Archive * archive);
 GARC_Result garc_zip_next(GARC_Archive * archive);
 
 /**
+ * The most bytes deflate can turn @p size bytes into.
+ *
+ * `gcomp_encode_bound()` for the deflate method, with its three failure modes
+ * collapsed into `UINT64_MAX` - the answer that is safe for all of them, since the
+ * one caller is asking whether a 32-bit field can be promised to hold the result.
+ *
+ * **The zip writer decides a member's zip64 fields on this rather than on the
+ * declared size**, because the local header is written before the data and a
+ * compressed size that crossed 4 GiB afterwards would have nowhere to go.
+ *
+ * Asked of `compress` rather than spelled here, and the first version did spell it:
+ * RFC 1951's own worst case is five bytes per 65535-byte stored block, and
+ * compress's encoder reserves rather more than that. A remembered constant was
+ * below the implementation's real bound for every size over 65534, which a test
+ * comparing the two found immediately - and which is exactly the shape of failure
+ * that makes a bound worth asking for rather than deriving.
+ *
+ * @param size The uncompressed size.
+ * @return The bound, saturating at `UINT64_MAX`.
+ */
+uint64_t garc_zip_deflate_bound(uint64_t size);
+
+/**
  * Put the walk back to the first entry, leaving what open discovered alone.
  *
  * @param archive The archive.

@@ -38,7 +38,10 @@
 
 #include <gtest/gtest.h>
 
+#include <ghoti.io/compress/compress.h>
+
 #include "test_helpers.h"
+#include "zip/zip_internal.h"
 
 using garctest::BufferDrain;
 using garctest::BufferSource;
@@ -86,7 +89,8 @@ GARC_Member member_of(const Spec & spec) {
 class Built {
 public:
   explicit Built(GARC_Zip_Sizes sizes = GARC_ZIP_SIZES_AUTO,
-      bool force_zip64 = false) {
+      bool force_zip64 = false,
+      GARC_Zip_Method method = GARC_ZIP_METHOD_STORED) {
     if (garc_sink_create_memory(&sink_) != GARC_OK) {
       return;
     }
@@ -94,6 +98,7 @@ public:
     garc_writer_options_default(&options);
     options.zip_sizes = sizes;
     options.zip_force_zip64 = force_zip64 ? 1 : 0;
+    options.zip_method = method;
     create_result_
         = garc_writer_create(sink_, GARC_FORMAT_ZIP, &options, &writer_);
   }
@@ -303,6 +308,34 @@ bool holds(const std::vector<uint8_t> & bytes, const char * signature) {
   return false;
 }
 
+/**
+ * Bytes deflate cannot shrink.
+ *
+ * A linear congruential generator rather than `rand()`, so the same bytes come out
+ * on every host and in every order the tests run in: a compressed size asserted
+ * against is only meaningful if the input is fixed. The sequence is not
+ * cryptographic and does not need to be - it needs to have no runs and no skewed
+ * byte frequency, which is what defeats both halves of deflate.
+ */
+std::string incompressible(size_t length) {
+  std::string out;
+  out.reserve(length);
+  uint32_t state = 0x13579BDFu;
+  for (size_t i = 0; i < length; ++i) {
+    state = state * 1103515245u + 12345u;
+    out.push_back((char)(uint8_t)(state >> 16));
+  }
+  return out;
+}
+
+/** Both methods, named, so a sweep says which one failed. */
+std::vector<std::pair<const char *, GARC_Zip_Method>> methods() {
+  return {
+    {"stored", GARC_ZIP_METHOD_STORED},
+    {"deflate", GARC_ZIP_METHOD_DEFLATE},
+  };
+}
+
 /** Every discipline, named, so a sweep says which one failed. */
 std::vector<std::pair<const char *, GARC_Zip_Sizes>> disciplines() {
   return {
@@ -325,8 +358,10 @@ TEST(ZipWrite, EveryMemberSurvivesEveryDiscipline) {
   // either way has to come back the same. A reader that believed the local header
   // instead of the central directory would pass this for two of the three.
   for (const auto & discipline : disciplines()) {
+  for (const auto & method : methods()) {
     SCOPED_TRACE(discipline.first);
-    Built built(discipline.second);
+    SCOPED_TRACE(method.first);
+    Built built(discipline.second, false, method.second);
     ASSERT_EQ(built.create_result(), GARC_OK);
     const std::vector<Spec> specs = corpus();
     for (const Spec & spec : specs) {
@@ -348,10 +383,20 @@ TEST(ZipWrite, EveryMemberSurvivesEveryDiscipline) {
       EXPECT_EQ(seen.name, spec.name);
       EXPECT_EQ(seen.type, spec.type);
       EXPECT_EQ(seen.read_result, GARC_OK) << garc_result_string(seen.read_result);
-      EXPECT_EQ(seen.method, GARC_ZIP_METHOD_STORED);
-      // Stored, so the two sizes are one number - and for a symlink that number is
-      // the length of the target this writer put there on the caller's behalf.
-      EXPECT_EQ(seen.size, seen.compressed_size);
+      // **The method is the option's, except where the member has no data**, which
+      // is the one rule the writer applies over the caller's choice: deflating
+      // nothing costs two bytes and buys nothing, and every reference stores it.
+      // A directory reaches that by having no data at all.
+      const bool deflatable = spec.type == GARC_MEMBER_FILE
+          && !spec.data.empty();
+      const uint16_t expected_method
+          = deflatable ? method.second : GARC_ZIP_METHOD_STORED;
+      EXPECT_EQ(seen.method, expected_method);
+      if (expected_method == GARC_ZIP_METHOD_STORED) {
+        // Stored, so the two sizes are one number - and for a symlink that number
+        // is the length of the target this writer put there on the caller's behalf.
+        EXPECT_EQ(seen.size, seen.compressed_size);
+      }
 
       if (spec.type == GARC_MEMBER_SYMLINK) {
         EXPECT_EQ(seen.link, spec.link);
@@ -379,6 +424,7 @@ TEST(ZipWrite, EveryMemberSurvivesEveryDiscipline) {
       EXPECT_EQ(seen.mtime, spec.mtime);
       EXPECT_EQ(seen.mtime_source, GARC_TIME_ZIP_DOS);
     }
+  }
   }
 }
 
@@ -985,10 +1031,391 @@ TEST(ZipWrite, TheDumpNamesTheDisciplineAndTheDirectory) {
 
   EXPECT_NE(text.find("format=zip"), std::string::npos) << text;
   EXPECT_NE(text.find("sizes=data descriptor"), std::string::npos) << text;
+  EXPECT_NE(text.find("method=stored"), std::string::npos) << text;
   EXPECT_NE(text.find("directory:"), std::string::npos) << text;
   EXPECT_STREQ(garc_zip_sizes_string(GARC_ZIP_SIZES_AUTO), "auto");
   EXPECT_STREQ(garc_zip_sizes_string(GARC_ZIP_SIZES_LOCAL), "local header");
   EXPECT_STREQ(garc_zip_sizes_string(GARC_ZIP_SIZES_COUNT), "unknown");
+}
+
+//-----------------------------------------------------------------------------
+// Deflate
+//-----------------------------------------------------------------------------
+
+TEST(ZipWrite, DeflateShrinksACompressibleMemberAndTheBytesComeBack) {
+  // The claim the round-trip sweep above cannot make, because it compares a
+  // member against its Spec and a member that was stored satisfies that too: the
+  // archive has to be *smaller* than the data in it. Without this, a writer that
+  // set method 8 in the header and then stored the bytes would pass every
+  // assertion in this file - our own reader would inflate nothing and get the
+  // right answer, because a stored byte run is not a valid deflate stream and the
+  // reader would refuse it... which is exactly why the size is asserted rather
+  // than the reading.
+  Built built(GARC_ZIP_SIZES_LOCAL, false, GARC_ZIP_METHOD_DEFLATE);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  Spec spec;
+  spec.name = "compressible.txt";
+  spec.data = std::string(4000u, 'a') + std::string(4000u, 'b');
+  ASSERT_EQ(built.add(spec), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+
+  Roundtrip trip(built.bytes());
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.members().size(), 1u);
+  const ReadBack & seen = trip.members()[0];
+  EXPECT_EQ(seen.method, GARC_ZIP_METHOD_DEFLATE);
+  EXPECT_EQ(seen.data, spec.data);
+  EXPECT_EQ(seen.size, spec.data.size());
+  EXPECT_LT(seen.compressed_size, seen.size);
+  // And the whole archive is smaller than the member's data, which no amount of
+  // header arithmetic can fake.
+  EXPECT_LT(built.bytes().size(), spec.data.size());
+}
+
+TEST(ZipWrite, DataThatDoesNotCompressStillComesBackByteForByte) {
+  // The other end of the same path, and the one that exercises the drain loop:
+  // 64 KiB of bytes with no structure produce more than one buffer's worth of
+  // output from a single garc_writer_write(), so the encoder has to be emptied
+  // more than once for one call. A loop that assumed one pass would truncate the
+  // member, and the CRC is what would catch it.
+  Built built(GARC_ZIP_SIZES_DESCRIPTOR, false, GARC_ZIP_METHOD_DEFLATE);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  Spec spec;
+  spec.name = "noise.bin";
+  spec.data = incompressible(65536u);
+  ASSERT_EQ(built.add(spec), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+
+  Roundtrip trip(built.bytes());
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.members().size(), 1u);
+  const ReadBack & seen = trip.members()[0];
+  EXPECT_EQ(seen.method, GARC_ZIP_METHOD_DEFLATE);
+  EXPECT_EQ(seen.read_result, GARC_OK) << "the CRC is the verdict on the bytes";
+  EXPECT_EQ(seen.data, spec.data);
+  // Larger than it went in, which is deflate's stored-block overhead and is the
+  // case writer.h says this writer does not fall back from. Asserted rather than
+  // tolerated, because it is the reason garc_zip_deflate_bound() exists.
+  EXPECT_GT(seen.compressed_size, seen.size);
+  EXPECT_LE(seen.compressed_size, garc_zip_deflate_bound(seen.size));
+}
+
+TEST(ZipWrite, ADeflatedMemberWrittenInPiecesIsOneStream) {
+  // A caller writes a member in whatever sized pieces it has, and every piece
+  // goes into one deflate stream rather than one per call. A writer that finished
+  // the stream per write would produce a member every reader refuses after the
+  // first block, and a writer that reset the encoder per write would produce
+  // plausible bytes that decode to the wrong thing.
+  Built built(GARC_ZIP_SIZES_LOCAL, false, GARC_ZIP_METHOD_DEFLATE);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  const std::string whole = std::string(500u, 'x') + incompressible(500u)
+      + std::string(500u, 'y');
+  Spec spec;
+  spec.name = "pieces.bin";
+  spec.data = whole;
+  const GARC_Member member = member_of(spec);
+  ASSERT_EQ(garc_writer_add(built.writer(), &member), GARC_OK);
+  // Deliberately uneven, including a zero-length write, which a caller reading
+  // from a socket will make sooner or later.
+  const size_t cuts[] = {1u, 0u, 13u, 486u, 1000u};
+  size_t at = 0;
+  for (size_t take : cuts) {
+    ASSERT_EQ(garc_writer_write(built.writer(), whole.data() + at, take),
+        GARC_OK);
+    at += take;
+  }
+  ASSERT_EQ(at, whole.size());
+  ASSERT_EQ(built.finish(), GARC_OK);
+
+  Roundtrip trip(built.bytes());
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.members().size(), 1u);
+  EXPECT_EQ(trip.members()[0].data, whole);
+  EXPECT_EQ(trip.members()[0].read_result, GARC_OK);
+}
+
+TEST(ZipWrite, TwoDeflatedMembersAreTwoIndependentStreams) {
+  // One encoder, reset between members - which is what makes this worth a test of
+  // its own. An encoder carried over would leave the second member's stream
+  // continuing the first's, and the second member would decode to nothing or to
+  // rubbish depending on where the window happened to point.
+  Built built(GARC_ZIP_SIZES_LOCAL, false, GARC_ZIP_METHOD_DEFLATE);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  Spec first;
+  first.name = "first.txt";
+  first.data = std::string(3000u, 'p');
+  Spec second;
+  second.name = "second.txt";
+  // The same bytes, so a member that borrowed the first one's window would come
+  // out *shorter* than the first - which is the shape of the bug, and is what the
+  // size comparison below refuses.
+  second.data = first.data;
+  ASSERT_EQ(built.add(first), GARC_OK);
+  ASSERT_EQ(built.add(second), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+
+  Roundtrip trip(built.bytes());
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.members().size(), 2u);
+  EXPECT_EQ(trip.members()[0].data, first.data);
+  EXPECT_EQ(trip.members()[1].data, second.data);
+  EXPECT_EQ(trip.members()[0].crc, trip.members()[1].crc);
+  EXPECT_EQ(trip.members()[0].compressed_size,
+      trip.members()[1].compressed_size)
+      << "the same bytes twice must compress to the same size twice";
+}
+
+TEST(ZipWrite, DeflateAndStoredAreDifferentBytesAndTheSameArchive) {
+  // The option has to reach the bytes. Both archives hold the same member with
+  // the same name, time, mode and CRC, and differ in their method, their
+  // compressed size, and their length.
+  std::vector<std::vector<uint8_t>> written;
+  std::vector<uint32_t> crcs;
+  for (const auto & method : methods()) {
+    Built built(GARC_ZIP_SIZES_LOCAL, false, method.second);
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    Spec spec;
+    spec.name = "same.txt";
+    spec.data = std::string(2048u, 'z');
+    ASSERT_EQ(built.add(spec), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+    written.push_back(built.bytes());
+    Roundtrip trip(built.bytes());
+    ASSERT_EQ(trip.open_result(), GARC_OK);
+    ASSERT_EQ(trip.members().size(), 1u);
+    EXPECT_EQ(trip.members()[0].method, method.second);
+    EXPECT_EQ(trip.members()[0].data, spec.data);
+    crcs.push_back(trip.members()[0].crc);
+  }
+  EXPECT_NE(written[0], written[1]);
+  EXPECT_LT(written[1].size(), written[0].size());
+  // **The CRC is of the uncompressed bytes in both**, which is the one field a
+  // writer that checksummed its own output would get wrong - and every reader
+  // would then reject the deflated member while accepting the stored one.
+  EXPECT_EQ(crcs[0], crcs[1]);
+}
+
+TEST(ZipWrite, AMemberWithNoDataIsStoredHoweverTheOptionReads) {
+  // Stated on its own as well as inside the sweep, because it is a rule this
+  // writer applies over the caller's choice and the sweep would still pass if it
+  // were dropped for one type.
+  Built built(GARC_ZIP_SIZES_LOCAL, false, GARC_ZIP_METHOD_DEFLATE);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  Spec empty;
+  empty.name = "empty";
+  Spec directory;
+  directory.name = "dir/";
+  directory.type = GARC_MEMBER_DIRECTORY;
+  Spec file;
+  file.name = "full.txt";
+  file.data = "something\n";
+  ASSERT_EQ(built.add(empty), GARC_OK);
+  ASSERT_EQ(built.add(directory), GARC_OK);
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+
+  Roundtrip trip(built.bytes());
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.members().size(), 3u);
+  EXPECT_EQ(trip.members()[0].method, GARC_ZIP_METHOD_STORED);
+  EXPECT_EQ(trip.members()[0].compressed_size, 0u);
+  EXPECT_EQ(trip.members()[1].method, GARC_ZIP_METHOD_STORED);
+  EXPECT_EQ(trip.members()[1].compressed_size, 0u);
+  EXPECT_EQ(trip.members()[2].method, GARC_ZIP_METHOD_DEFLATE);
+}
+
+TEST(ZipWrite, ASymlinkTargetIsStoredEvenWhenEverythingElseIsDeflated) {
+  // **A finding this test is the record of.** The first version of this writer
+  // deflated a symlink's target along with everything else - consistently, since a
+  // zip symlink's target *is* its data - and the target then came back empty from
+  // this library's own reader, which reads one eagerly only when it is stored.
+  // That limit is deliberate and argued where it is written; what was wrong was
+  // the writer producing an archive that ran into it.
+  //
+  // Checking the corpus settled which side to fix: every symlink in it is stored,
+  // including the ones Info-ZIP wrote and the ones in the malicious fixtures. A
+  // target is a path, so deflate rarely helps and every reader wants to read it.
+  Built built(GARC_ZIP_SIZES_LOCAL, false, GARC_ZIP_METHOD_DEFLATE);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  Spec link;
+  link.name = "link";
+  link.type = GARC_MEMBER_SYMLINK;
+  // Long and repetitive, so deflate would unambiguously have shrunk it: a writer
+  // that stored it only because the target was too short to compress would pass a
+  // weaker version of this test.
+  link.link = std::string(200u, 'd') + "/target";
+  link.mode = 0777;
+  Spec file;
+  file.name = "beside.txt";
+  file.data = std::string(2000u, 'e');
+  ASSERT_EQ(built.add(link), GARC_OK);
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+
+  Roundtrip trip(built.bytes());
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.members().size(), 2u);
+  const ReadBack & seen = trip.members()[0];
+  EXPECT_EQ(seen.type, GARC_MEMBER_SYMLINK);
+  EXPECT_EQ(seen.method, GARC_ZIP_METHOD_STORED);
+  EXPECT_EQ(seen.link, link.link) << "a stored target is read eagerly";
+  EXPECT_EQ(seen.data, link.link);
+  EXPECT_EQ(seen.compressed_size, seen.size);
+  // And the member beside it is deflated, so this is the symlink's rule rather
+  // than the option failing to arrive.
+  EXPECT_EQ(trip.members()[1].method, GARC_ZIP_METHOD_DEFLATE);
+  EXPECT_LT(trip.members()[1].compressed_size, trip.members()[1].size);
+}
+
+TEST(ZipWrite, ADeflatedMemberFillsTheSizeFieldsOfEveryDiscipline) {
+  // The bytes, not the reading: a descriptor's compressed size and a patched
+  // header's have to be the *compressed* number, and this library's reader
+  // consults neither - it reads the central directory. So a writer that put the
+  // uncompressed size in the local header would pass every round trip here and
+  // fail on the first reader that streams, which is what check-zip-writer is for
+  // and what this test is the in-process half of.
+  for (const auto & discipline : disciplines()) {
+    SCOPED_TRACE(discipline.first);
+    Built built(discipline.second, false, GARC_ZIP_METHOD_DEFLATE);
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    Spec spec;
+    spec.name = "a.txt";
+    spec.data = std::string(3000u, 'k');
+    ASSERT_EQ(built.add(spec), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+    const std::vector<uint8_t> bytes = built.bytes();
+
+    Roundtrip trip(bytes);
+    ASSERT_EQ(trip.open_result(), GARC_OK);
+    ASSERT_EQ(trip.members().size(), 1u);
+    const uint64_t compressed = trip.members()[0].compressed_size;
+    ASSERT_LT(compressed, spec.data.size());
+
+    const uint16_t flags = le16(bytes, 6u);
+    if (flags & 0x0008u) {
+      // The descriptor sits immediately after the data, which starts after the
+      // header and the name.
+      const size_t data_at = 30u + spec.name.size();
+      ASSERT_EQ(std::memcmp(bytes.data() + data_at + compressed, "PK\x07\x08", 4),
+          0);
+      EXPECT_EQ(le32(bytes, data_at + (size_t)compressed + 8u),
+          (uint32_t)compressed);
+      EXPECT_EQ(le32(bytes, data_at + (size_t)compressed + 12u),
+          (uint32_t)spec.data.size());
+      // And the header itself says nothing.
+      EXPECT_EQ(le32(bytes, 18u), 0u);
+    }
+    else {
+      EXPECT_EQ(le32(bytes, 18u), (uint32_t)compressed);
+      EXPECT_EQ(le32(bytes, 22u), (uint32_t)spec.data.size());
+    }
+  }
+}
+
+TEST(ZipWrite, TheDeflateBoundBoundsWhatDeflateActuallyProduces) {
+  // **The instrument that caught the first version of this function.** It spelled
+  // RFC 1951's own worst case - five bytes of stored-block header per 65535 bytes -
+  // and compress's encoder reserves rather more, so the constant was below the
+  // implementation's real bound for every size over 65534. The library now asks
+  // compress, which makes the comparison against `gcomp_encode_bound()` a
+  // tautology; what is worth asserting instead is that the bound bounds the thing
+  // it is named after, measured by compressing bytes chosen to defeat deflate.
+  const size_t sizes[] = {1u, 2u, 1000u, 65534u, 65535u, 65536u, 65537u,
+      131071u, 200000u};
+  for (size_t size : sizes) {
+    SCOPED_TRACE(size);
+    const uint64_t bound = garc_zip_deflate_bound((uint64_t)size);
+    EXPECT_GE(bound, (uint64_t)size) << "a bound below the input is no bound";
+
+    // What the writer actually produces for the worst input there is, read back
+    // out of the archive it wrote.
+    Built built(GARC_ZIP_SIZES_LOCAL, false, GARC_ZIP_METHOD_DEFLATE);
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    Spec spec;
+    spec.name = "noise.bin";
+    spec.data = incompressible(size);
+    ASSERT_EQ(built.add(spec), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+    Roundtrip trip(built.bytes());
+    ASSERT_EQ(trip.open_result(), GARC_OK);
+    ASSERT_EQ(trip.members().size(), 1u);
+    EXPECT_LE(trip.members()[0].compressed_size, bound);
+    EXPECT_EQ(trip.members()[0].data, spec.data);
+  }
+  // Monotonic, and saturating rather than wrapping at the top: the writer compares
+  // the answer against 4 GiB, and a wrapped one would compare below it. UINT64_MAX
+  // is a size no member has and a caller can still declare, which is what makes
+  // the saturating arm reachable from here at all.
+  EXPECT_GT(garc_zip_deflate_bound(1u << 20), garc_zip_deflate_bound(1u << 19));
+  EXPECT_EQ(garc_zip_deflate_bound(UINT64_MAX), UINT64_MAX);
+}
+
+TEST(ZipWrite, ADeflatedMemberNearTheThresholdGetsZip64WithoutBeingAskedTo) {
+  // The consequence of deciding zip64 on the bound rather than on the declared
+  // size, stated where it can be read: the threshold moves down by deflate's
+  // overhead. Asserted through the bound rather than by writing a 4 GiB member,
+  // which is the only part of this that a test can afford - and the arithmetic is
+  // the whole of the rule.
+  const uint64_t marker = 0xFFFFFFFFu;
+  // A member this big fits a 32-bit compressed-size field when stored and cannot
+  // be promised to when deflated.
+  const uint64_t near = marker - 16u;
+  EXPECT_LT(near, marker);
+  EXPECT_GE(garc_zip_deflate_bound(near), marker)
+      << "the bound is what moves the threshold, so it must cross it first";
+  // And well below it nothing moves, which is what keeps every ordinary member out
+  // of zip64. 256 MiB is two orders of magnitude inside the bound's slack.
+  EXPECT_LT(garc_zip_deflate_bound(1u << 28), marker);
+}
+
+TEST(ZipWrite, AMethodBesideStoredAndDeflateIsRefusedAtCreate) {
+  // Including the ones this library can read. Refused at create rather than at the
+  // first member, so that a caller who asked for zstd members is told before any
+  // bytes exist - and with GARC_ERR_UNSUPPORTED rather than GARC_ERR_INVALID,
+  // because the value is a real zip method and the answer is that this writer does
+  // not produce it.
+  const GARC_Zip_Method refused[] = {GARC_ZIP_METHOD_ZSTD,
+      GARC_ZIP_METHOD_DEFLATE64, GARC_ZIP_METHOD_BZIP2, GARC_ZIP_METHOD_LZMA,
+      GARC_ZIP_METHOD_XZ, GARC_ZIP_METHOD_AES, GARC_ZIP_METHOD_IMPLODED};
+  for (GARC_Zip_Method method : refused) {
+    SCOPED_TRACE(garc_zip_method_string((uint16_t)method));
+    GARC_Sink * sink = nullptr;
+    ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+    GARC_Writer_Options options;
+    garc_writer_options_default(&options);
+    options.zip_method = method;
+    GARC_Writer * writer = nullptr;
+    EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer),
+        GARC_ERR_UNSUPPORTED);
+    EXPECT_EQ(writer, nullptr);
+    garc_sink_destroy(sink);
+  }
+  // And a tar writer is not asked about it, the same way it is not asked about the
+  // sizes: a caller copying an archive from zip to tar should not have to clear a
+  // field that describes the format they have left.
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_method = GARC_ZIP_METHOD_ZSTD;
+  GARC_Writer * writer = nullptr;
+  EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_TAR, &options, &writer),
+      GARC_OK);
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+}
+
+TEST(ZipWrite, TheDefaultMethodIsStoredAndIsAlsoTheZeroValue) {
+  // Both halves, because the second is why the first is what it is:
+  // GARC_Writer_Options is written so that a zero-filled struct behaves like the
+  // defaults or is refused outright, and a default of deflate would make this the
+  // one field where memset and NULL disagree.
+  GARC_Writer_Options options;
+  std::memset(&options, 0xFF, sizeof(options));
+  garc_writer_options_default(&options);
+  EXPECT_EQ(options.zip_method, GARC_ZIP_METHOD_STORED);
+  EXPECT_EQ((int)GARC_ZIP_METHOD_STORED, 0);
+  EXPECT_STREQ(garc_zip_method_string(GARC_ZIP_METHOD_DEFLATE), "deflate");
 }
 
 //-----------------------------------------------------------------------------
@@ -1008,7 +1435,9 @@ TEST(ZipWrite, AWriteFailureAtEveryStageIsReportedAndNothingIsClaimed) {
   // writing side.
   size_t failures = 0;
   for (int forced = 0; forced < 2; ++forced) {
+  for (const auto & method : methods()) {
   SCOPED_TRACE(forced ? "forced zip64" : "default");
+  SCOPED_TRACE(method.first);
   // Far enough to reach the end of the archive: six members at three or four
   // writes each, then the directory, the two zip64 records and the end record. A
   // bound that stopped inside the members would leave those four writes in the
@@ -1022,6 +1451,11 @@ TEST(ZipWrite, AWriteFailureAtEveryStageIsReportedAndNothingIsClaimed) {
     GARC_Writer_Options options;
     garc_writer_options_default(&options);
     options.zip_force_zip64 = forced;
+    // **And the method, because deflate has writes stored does not.** The final
+    // block of a member's deflate stream goes out from garc_zip_write_close_member()
+    // rather than from the caller's write, so a sweep over stored alone never puts
+    // that call in a position to fail.
+    options.zip_method = method.second;
     GARC_Writer * writer = nullptr;
     ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer),
         GARC_OK);
@@ -1051,9 +1485,55 @@ TEST(ZipWrite, AWriteFailureAtEveryStageIsReportedAndNothingIsClaimed) {
     garc_sink_destroy(sink);
   }
   }
-  // The sweep has to break something, or it is forty passes through a working
+  }
+  // The sweep has to break something, or it is a hundred passes through a working
   // writer.
-  EXPECT_GE(failures, 50u);
+  EXPECT_GE(failures, 100u);
+}
+
+TEST(ZipWrite, ASinkFailureDuringADeflatedMemberIsReported) {
+  // **The arm the sweep above cannot reach, and why it cannot.** A deflated member
+  // of a few hundred bytes produces no output at all until its stream is finished -
+  // the encoder is still holding everything - so every write the caller makes
+  // succeeds without touching the sink, and the sweep's failing stage lands on the
+  // next member's header instead. The failure inside garc_writer_write() needs a
+  // member big enough and awkward enough that the encoder has to flush mid-call,
+  // which is 64 KiB of bytes with no structure in them.
+  size_t failures = 0;
+  for (size_t stage = 0; stage < 12u; ++stage) {
+    SCOPED_TRACE(stage);
+    BufferDrain drain;
+    drain.fail_write_at(stage);
+    GARC_Sink * sink = nullptr;
+    ASSERT_EQ(garc_sink_create_callback(drain.callbacks(), &sink), GARC_OK);
+    GARC_Writer_Options options;
+    garc_writer_options_default(&options);
+    options.zip_method = GARC_ZIP_METHOD_DEFLATE;
+    GARC_Writer * writer = nullptr;
+    ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer),
+        GARC_OK);
+
+    Spec spec;
+    spec.name = "noise.bin";
+    spec.data = incompressible(65536u);
+    const GARC_Member member = member_of(spec);
+    GARC_Result last = garc_writer_add(writer, &member);
+    if (last == GARC_OK) {
+      last = garc_writer_write(writer, spec.data.data(), spec.data.size());
+    }
+    if (last == GARC_OK) {
+      last = garc_writer_finish(writer);
+    }
+    if (last != GARC_OK) {
+      EXPECT_EQ(last, GARC_ERR_IO) << garc_result_string(last);
+      ++failures;
+    }
+    garc_writer_destroy(writer);
+    garc_sink_destroy(sink);
+  }
+  // Header, name, then seven buffers of compressed output, then the descriptor or
+  // the directory: every stage in this range is a write that happens.
+  EXPECT_EQ(failures, 12u);
 }
 
 TEST(ZipWrite, APatchFailureIsReportedRatherThanLeavingAWrongHeader) {
@@ -1093,7 +1573,9 @@ TEST(ZipWrite, AnAllocationFailureAtEveryBudgetIsAStatus) {
   // a tar writer does not. Every budget, because which allocation is the first to
   // fail is what decides whether the failure lands in add, in finish, or nowhere.
   for (int forced = 0; forced < 2; ++forced) {
+  for (const auto & method : methods()) {
   SCOPED_TRACE(forced ? "forced zip64" : "default");
+  SCOPED_TRACE(method.first);
   // Wide enough to reach the per-member extra-field append, which only happens
   // when a member has an extra field at all - so the forced pass is what puts that
   // allocation in the population.
@@ -1107,6 +1589,9 @@ TEST(ZipWrite, AnAllocationFailureAtEveryBudgetIsAStatus) {
     GARC_Writer_Options options;
     garc_writer_options_default(&options);
     options.zip_force_zip64 = forced;
+    // The deflate pass is what puts the encoder's output buffer in the population:
+    // one allocation per archive, made on the first member that needs a codec.
+    options.zip_method = method.second;
     GARC_Writer * writer = nullptr;
     const GARC_Result created = garc_writer_create_with_allocator(
         sink, GARC_FORMAT_ZIP, &options, allocator.get(), &writer);
@@ -1140,6 +1625,7 @@ TEST(ZipWrite, AnAllocationFailureAtEveryBudgetIsAStatus) {
     garc_writer_destroy(writer);
     garc_sink_destroy(sink);
     EXPECT_EQ(allocator.live(), 0u) << "destroy left a block behind";
+  }
   }
   }
 }

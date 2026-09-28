@@ -33,6 +33,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <ghoti.io/compress/stream.h>
+
 #include "core/buffer_internal.h"
 #include "reader/reader_internal.h"
 
@@ -62,6 +64,26 @@ typedef struct {
   GARC_Buffer central;
   /** How many entries are in @ref central. */
   uint64_t entries;
+
+  /**
+   * The deflate encoder, created for the first member that needs one.
+   *
+   * **One encoder for the archive, reset between members**, not one per member:
+   * every member is an independent deflate stream, which is what
+   * gcomp_encoder_reset() produces, and a zip of ten thousand small files would
+   * otherwise allocate and free a window ten thousand times. NULL until a
+   * deflated member arrives, so an archive of stored members allocates nothing.
+   */
+  gcomp_encoder_t * encoder;
+  /**
+   * Where @ref encoder's output lands on its way to the sink. Owned.
+   *
+   * Allocated with the encoder and freed with it. A fixed size rather than a
+   * growable buffer, because the encoder is asked to fill it repeatedly until it
+   * has nothing left - the same arrangement the compressing sink uses, for the
+   * same reason.
+   */
+  uint8_t * packed;
 
   /**
    * @name The member being written

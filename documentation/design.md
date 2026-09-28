@@ -1013,6 +1013,75 @@ because an archive carrying zip64 fields unnecessarily is refused by some old
 readers. The forced flag exists because the upper side of that threshold is a 4 GiB
 member and a test needs both sides.
 
+### Deflate, and what decides a member's method
+
+`GARC_Writer_Options.zip_method` takes `GARC_ZIP_METHOD_STORED` or
+`GARC_ZIP_METHOD_DEFLATE` and refuses every other value at
+`garc_writer_create()` - including the ones this library can *read*. Reading a
+method means owning a decoder; writing one means choosing to produce it, and a
+zstd member is refused by enough readers that a caller should have to name it.
+
+**Stored is the default, and the reason is the zero.** Every field in
+`GARC_Writer_Options` is written so that a zero-filled struct either behaves like
+the defaults or is refused outright, and `GARC_ZIP_METHOD_STORED` is 0 - so a
+default of deflate would make this the one field where `memset` and NULL disagree.
+Compression is one assignment away, and the assignment is visible in the caller's
+code.
+
+Two members are stored whatever the option says:
+
+- **One with no data.** Deflating nothing produces a two-byte empty final block,
+  so the choice is between a member occupying 0 bytes and one occupying 2, and
+  every reference writes the first. A directory reaches it without ever having had
+  the option.
+- **A symlink.** Its target is its data, and a target is a path: short enough that
+  deflate rarely helps, and wanted by every reader that cares where the link
+  points. **This was a finding rather than a preference.** The first version
+  deflated targets along with everything else - consistently, since the target
+  *is* the data - and they then came back empty from this library's own reader,
+  which reads a target eagerly only when it is stored. Checking the corpus settled
+  which side to fix: every symlink in it is stored, Info-ZIP's included.
+
+**A member whose data does not compress is still deflated.** The method is in a
+local header written before the first byte of data arrives, so there is no point
+at which it could be changed back. `zip` stores such a member instead, which it
+can because it has the whole file on disk before it writes anything; a streaming
+writer does not. The cost is deflate's stored-block overhead, and the example
+program shows it: five tiny members come out six bytes *larger* deflated than
+stored.
+
+One encoder per archive, reset between members, because each member is an
+independent deflate stream and an archive of ten thousand small files should not
+allocate ten thousand windows. The CRC-32 is of the **uncompressed** bytes in both
+methods - it is what an extractor checks after inflating - which is the one field a
+writer that checksummed its own output would get wrong, and every reader would then
+reject the deflated member while accepting the stored one.
+
+### The zip64 threshold moved, because deflate can expand a member
+
+A member's zip64 fields are decided before its data exists, so the compressed size
+is not available to decide on. What stands in for it is not the declared size but
+the **largest the compressed size can be**: `garc_zip_deflate_bound()`, which is
+`gcomp_encode_bound()` for deflate with its failure modes collapsed into "assume
+the worst".
+
+The alternative was to decide on the declared size and refuse when the compressed
+size turned out to cross 4 GiB after all - a refusal arm reachable only by a member
+of very nearly 4 GiB that deflate expands, which is a line nothing could put in a
+position to fail. Deciding on the bound has no such arm: a member whose bound fits
+a 32-bit field cannot produce a compressed size that does not. The cost is that a
+member inside the bound's slack gets zip64 fields it would probably have done
+without - about the top ten megabytes of the 4 GiB range - and being wrong in that
+direction costs an archive a few readers from 1993 where being wrong in the other
+costs it a size field it cannot write.
+
+**The bound is asked for rather than derived, and that was a finding too.** The
+first version spelled RFC 1951's own worst case - five bytes of stored-block header
+per 65535 bytes of payload - and compress's encoder reserves rather more, so the
+constant sat *below* the implementation's real bound for every size over 65534. The
+test comparing the two caught it on its first run, which is the whole argument for
+writing that test before trusting the constant.
+
 ### Three decisions about a member
 
 **The type bits come from the type and the permissions from the mode.** A zip has

@@ -164,6 +164,49 @@ typedef struct GARC_Writer_Options {
   GARC_Zip_Sizes zip_sizes;
 
   /**
+   * Which method a zip member's data is written with. Ignored for tar.
+   *
+   * ::GARC_ZIP_METHOD_STORED is the default, and only
+   * ::GARC_ZIP_METHOD_DEFLATE is accepted beside it - every other value is
+   * refused by ::garc_writer_create() with ::GARC_ERR_UNSUPPORTED, including the
+   * ones this library can *read*. Reading a method means having a decoder for
+   * it; writing one means choosing to produce it, and a zstd or an LZMA member
+   * is refused by enough readers that a caller should have to name it rather
+   * than inherit it.
+   *
+   * **Stored is the default because zero is stored.** Every other field in this
+   * struct is written so that a zero-filled options struct behaves like the
+   * defaults or is refused outright, and ::GARC_ZIP_METHOD_STORED is 0 - so a
+   * default of deflate would make this the one field where a caller who
+   * memset their options gets something other than what NULL would have given
+   * them. A caller who wants their bytes compressed says so in one assignment,
+   * and that assignment is visible in their code.
+   *
+   * Two things are decided per member rather than by this field, because the
+   * format decides them:
+   *
+   * - **A member with no data is stored** whatever this says. Deflating nothing
+   *   produces a two-byte empty final block, so the choice is between a member
+   *   that occupies 0 bytes and one that occupies 2, and every reference writes
+   *   the first. A directory reaches that by having no data; an empty file
+   *   reaches it by declaring none.
+   * - **A symlink is stored.** Its target is its data - zip has no link field -
+   *   and a target is a path: short enough that deflate rarely helps, and needed
+   *   by every reader that wants to know what the link points at. This library's
+   *   own reader reads a target eagerly only when it is stored, which is a
+   *   deliberate limit argued where it is written, and every symlink every
+   *   reference in the corpus wrote is stored too. So this is not a concession to
+   *   our own reader: it is what a zip symlink looks like.
+   * - **A member whose data does not compress is still deflated.** The method is
+   *   in a local header written before the first byte of data arrives, so there
+   *   is no point at which it could be changed back. `zip` stores such a member
+   *   instead, which it can because it has the whole file on disk before it
+   *   writes anything; a streaming writer does not. The cost is deflate's
+   *   stored-block overhead, five bytes per 65535.
+   */
+  GARC_Zip_Method zip_method;
+
+  /**
    * Write zip64 fields on every member, whether or not they are needed.
    *
    * **Off by default, and the default is the rule the format wants**: a zip64

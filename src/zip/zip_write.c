@@ -83,12 +83,16 @@
 #include <ghoti.io/archive/allocator.h>
 #include <ghoti.io/archive/name.h>
 #include <ghoti.io/archive/writer.h>
+#include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/crc32.h>
+#include <ghoti.io/compress/registry.h>
+#include <ghoti.io/compress/stream.h>
 #include <ghoti.io/cutil/allocator.h>
 #include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
+#include "codec/codec_internal.h"
 #include "core/buffer_internal.h"
 #include "writer/writer_internal.h"
 #include "zip/zip_internal.h"
@@ -125,6 +129,26 @@
 
 /** The largest archive comment the end record's length field can describe. */
 #define ZIP_MAX_COMMENT 65535u
+
+/**
+ * Bytes handed to the deflate encoder's output buffer at a time.
+ *
+ * The same 10240 the codec layer uses, and the same reason: big enough that the
+ * encoder always makes progress in it, small enough to be one allocation per
+ * archive rather than a function of the member's size.
+ */
+#define ZIP_DEFLATE_BUFFER 10240u
+
+/**
+ * `compress`'s name for zip's method 8.
+ *
+ * Raw RFC 1951, which is what a zip member holds - not `"zlib"`, whose two-byte
+ * header no zip reader expects. The reader's zip_codec_name() spells the same
+ * string for the same reason, and the two are deliberately not shared: they are
+ * the same word for opposite directions, and a reader that gained a method the
+ * writer must not produce is the case that would break a shared table.
+ */
+#define ZIP_DEFLATE_METHOD "deflate"
 
 static const uint8_t ZIP_SIG_LOCAL[4] = {'P', 'K', 3, 4};
 static const uint8_t ZIP_SIG_CENTRAL[4] = {'P', 'K', 1, 2};
@@ -196,28 +220,147 @@ static GARC_Result zip_central_append(
   return GARC_OK;
 }
 
+uint64_t garc_zip_deflate_bound(uint64_t size) {
+  size_t bound = 0;
+  if (size > (uint64_t)(size_t)-1
+      || gcomp_encode_bound(gcomp_registry_default(), ZIP_DEFLATE_METHOD, NULL,
+             (size_t)size, &bound)
+          != GCOMP_OK) {
+    // **Saturating rather than refusing**, because the caller is asking a question
+    // whose safe answer is already known: a size with no bound to be had is a
+    // member whose compressed size cannot be promised to fit a 32-bit field, so it
+    // gets zip64 fields. Three ways to arrive here and one answer for all of them -
+    // a size larger than a size_t on a 32-bit host, a bound larger than a size_t,
+    // and a deflate that is somehow not registered.
+    return UINT64_MAX;
+  }
+  return (uint64_t)bound;
+}
+
 /**
  * Whether this member's records need zip64 fields, and mark them if so.
  *
  * Decided **before the data is written**, because the local header is written
- * first and its layout depends on the answer. The compressed size is therefore
- * not available to decide on, which is why the declared size stands in for it:
- * for a stored member they are the same number, and for a compressed one the
- * compressed size is smaller except on data that does not compress, where it is
- * larger by a fraction of a percent. The consequence is recorded rather than
- * guarded here, because this cut writes only stored members: when deflate lands,
- * a member whose *compressed* size crosses the boundary its declared size did not
- * needs an answer, and the honest one is a refusal at the point the overflow is
- * discovered.
+ * first and its layout depends on the answer. The compressed size is therefore not
+ * available to decide on - so what stands in for it is not the declared size but
+ * the largest the compressed size *can* be, which for a stored member is the
+ * declared size and for a deflated one is ::garc_zip_deflate_bound of it.
+ *
+ * **That is the whole of the answer, and it is an answer rather than a deferral.**
+ * The alternative - decide on the declared size, and refuse when the compressed
+ * size turns out to cross 4 GiB after all - needs a refusal arm reachable only by
+ * a member of very nearly 4 GiB that deflate expands, which is a line nothing
+ * could put in a position to fail. Deciding on the bound has no such arm: a
+ * member whose bound fits a 32-bit field cannot produce a compressed size that
+ * does not.
+ *
+ * The cost is that a member within the bound's slack of the threshold gets zip64
+ * fields it would probably have done without. compress's deflate bound reserves
+ * about a quarter of a percent, so that is the top ten megabytes of the 4 GiB
+ * range - and being wrong in that direction costs an archive a few readers from
+ * 1993, where being wrong in the other costs it a size field it cannot write.
  *
  * @param writer The writer.
  * @param size The member's declared size.
+ * @param method The method this member will be written with.
  * @return Non-zero when zip64 fields are needed.
  */
-static int zip_needs_zip64(const GARC_Writer * writer, uint64_t size) {
+static int zip_needs_zip64(
+    const GARC_Writer * writer, uint64_t size, uint16_t method) {
+  const uint64_t largest = method == GARC_ZIP_METHOD_DEFLATE
+      ? garc_zip_deflate_bound(size) : size;
   return writer->options.zip_force_zip64
-      || size >= (uint64_t)ZIP_MARKER32
+      || largest >= (uint64_t)ZIP_MARKER32
       || garc_sink_tell(writer->sink) >= (uint64_t)ZIP_MARKER32;
+}
+
+/**
+ * Have an encoder ready for this member, in its initial state.
+ *
+ * One encoder for the archive, reset between members: see
+ * @ref GARC_Zip_Write_State.encoder. Created on the first member that needs one,
+ * so that an archive of stored members allocates nothing for a codec it never
+ * uses.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK, ::GARC_ERR_OOM, or what the encoder refused with.
+ */
+static GARC_Result zip_deflate_begin(GARC_Writer * writer) {
+  GARC_Zip_Write_State * zip = &writer->zip;
+  if (zip->encoder) {
+    return garc_codec_result(gcomp_encoder_reset(zip->encoder));
+  }
+
+  // The encoder before the buffer, which is the order with one unreachable line in
+  // it rather than three: deflate is always registered and always has an encoder,
+  // so the refusal below cannot be reached from a test, while the buffer's can be -
+  // and putting the allocation second means the refusal needs no cleanup.
+  const gcomp_status_t status = gcomp_encoder_create(
+      gcomp_registry_default(), ZIP_DEFLATE_METHOD, NULL, &zip->encoder);
+  if (status != GCOMP_OK) {
+    return garc_codec_result(status);
+  }
+  zip->packed
+      = (uint8_t *)gcu_allocator_malloc(writer->allocator, ZIP_DEFLATE_BUFFER);
+  if (!zip->packed) {
+    gcomp_encoder_destroy(zip->encoder);
+    zip->encoder = NULL;
+    return GARC_ERR_OOM;
+  }
+  return GARC_OK;
+}
+
+/**
+ * Pass whatever the encoder has produced to the sink, and count it.
+ *
+ * @param writer The writer.
+ * @param used How many bytes are in @ref GARC_Zip_Write_State.packed.
+ * @return ::GARC_OK or what the sink refused with.
+ */
+static GARC_Result zip_deflate_emit(GARC_Writer * writer, size_t used) {
+  GARC_Zip_Write_State * zip = &writer->zip;
+  if (!used) {
+    return GARC_OK;
+  }
+  const GARC_Result result = garc_sink_write(writer->sink, zip->packed, used);
+  if (result != GARC_OK) {
+    return result;
+  }
+  zip->compressed += (uint64_t)used;
+  return GARC_OK;
+}
+
+/**
+ * Close this member's deflate stream, writing its final block.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK, or what the encoder or the sink refused with.
+ */
+static GARC_Result zip_deflate_end(GARC_Writer * writer) {
+  GARC_Zip_Write_State * zip = &writer->zip;
+  for (;;) {
+    gcomp_buffer_t out = {zip->packed, ZIP_DEFLATE_BUFFER, 0};
+    const gcomp_status_t status = gcomp_encoder_finish(zip->encoder, &out);
+    const GARC_Result result = zip_deflate_emit(writer, out.used);
+    if (result != GARC_OK) {
+      return result;
+    }
+    if (status == GCOMP_OK) {
+      return GARC_OK;
+    }
+    if (status != GCOMP_ERR_LIMIT) {
+      return garc_codec_result(status);
+    }
+    // GCOMP_ERR_LIMIT is "there is more"; go round with a drained buffer. The
+    // same loop codec_sink_finish() runs, and the same reason it is a loop: a
+    // member's last block can be larger than the buffer. A round that produced
+    // nothing cannot be made progress on by draining, so it is this library's
+    // invariant failing rather than a caller's mistake - and it is the one thing
+    // standing between that failure and a loop with no end.
+    if (!out.used) {
+      return GARC_ERR_INTERNAL;
+    }
+  }
 }
 
 GARC_Result garc_zip_write_member(
@@ -280,9 +423,25 @@ GARC_Result garc_zip_write_member(
   zip->declared = size;
   zip->compressed = 0;
   zip->running_crc = GCOMP_CRC32_INIT;
-  zip->method = GARC_ZIP_METHOD_STORED;
-  zip->used_zip64 = zip_needs_zip64(writer, size);
+  // **The method, decided here because the local header carries it** and the
+  // header goes out before the first byte of data. Two kinds of member are stored
+  // whatever the options say - one with no data at all, and a symlink - and
+  // writer.h argues both. A directory reaches the first without ever having had
+  // the option.
+  zip->method
+      = writer->options.zip_method == GARC_ZIP_METHOD_DEFLATE && size
+          && member->type != GARC_MEMBER_SYMLINK
+      ? GARC_ZIP_METHOD_DEFLATE : GARC_ZIP_METHOD_STORED;
+  zip->used_zip64 = zip_needs_zip64(writer, size, zip->method);
   zip->zip64_offset = 0;
+  if (zip->method == GARC_ZIP_METHOD_DEFLATE) {
+    // Before the header, so that a member refused for want of an encoder is
+    // refused with nothing written - the same rule the name checks above follow.
+    const GARC_Result ready = zip_deflate_begin(writer);
+    if (ready != GARC_OK) {
+      return ready;
+    }
+  }
 
   zip->flags = 0;
   if (zip_name_needs_utf8_flag(member->name, member->name_length)) {
@@ -478,16 +637,52 @@ GARC_Result garc_zip_write_member(
 GARC_Result garc_zip_write_data(
     GARC_Writer * writer, const void * data, size_t size) {
   GARC_Zip_Write_State * zip = &writer->zip;
-  GARC_Result result = garc_sink_write(writer->sink, data, size);
-  if (result != GARC_OK) {
-    return result;
-  }
-  zip->running_crc
+  // **The CRC is of the uncompressed bytes whatever the method**, because it is
+  // what an extractor checks after inflating. Computed into a local and assigned
+  // only once the bytes are away, so that a failed write leaves the member exactly
+  // as it was - the all-or-nothing the sink promises, kept one level up.
+  const uint32_t crc
       = gcomp_crc32_update(zip->running_crc, (const uint8_t *)data, size);
-  // Counted separately from data_remaining, which counts what the *caller* still
-  // owes. For a stored member the two totals agree; a compressed one is why they
-  // are two fields.
-  zip->compressed += (uint64_t)size;
+
+  if (zip->method == GARC_ZIP_METHOD_STORED) {
+    const GARC_Result result = garc_sink_write(writer->sink, data, size);
+    if (result != GARC_OK) {
+      return result;
+    }
+    // Counted separately from data_remaining, which counts what the *caller* still
+    // owes. For a stored member the two totals agree; a compressed one is why they
+    // are two fields.
+    zip->compressed += (uint64_t)size;
+    zip->running_crc = crc;
+    return GARC_OK;
+  }
+
+  // Deflate. The loop drains the encoder rather than assuming one pass empties it,
+  // because the output of a block can exceed the buffer on data that does not
+  // compress - which is the case the buffer is sized for rather than against.
+  gcomp_buffer_t in = {data, size, 0};
+  while (in.used < size) {
+    gcomp_buffer_t out = {zip->packed, ZIP_DEFLATE_BUFFER, 0};
+    const size_t before = in.used;
+    const gcomp_status_t status
+        = gcomp_encoder_update(zip->encoder, &in, &out);
+    if (status != GCOMP_OK) {
+      return garc_codec_result(status);
+    }
+    const GARC_Result result = zip_deflate_emit(writer, out.used);
+    if (result != GARC_OK) {
+      return result;
+    }
+    if (!out.used && in.used == before) {
+      // Neither consumed nor produced, with input still in hand: codec_sink_write()
+      // guards the same round for the same reason, and calls it the same thing.
+      return GARC_ERR_INTERNAL;
+    }
+  }
+  // Only here. Unlike the stored path this cannot be retried - the encoder has the
+  // bytes - so the assignment is not a promise about a retry, it is the same
+  // statement made in the same place.
+  zip->running_crc = crc;
   return GARC_OK;
 }
 
@@ -560,6 +755,17 @@ static GARC_Result zip_patch_header(GARC_Writer * writer, uint32_t crc) {
 
 GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
   GARC_Zip_Write_State * zip = &writer->zip;
+
+  // **The deflate stream ends before anything is written about its length**, which
+  // is the whole reason this is a hook and not a subtraction: the final block is
+  // part of the compressed size, and the descriptor or the patched header that
+  // carries that size comes after it.
+  if (zip->method == GARC_ZIP_METHOD_DEFLATE) {
+    const GARC_Result ended = zip_deflate_end(writer);
+    if (ended != GARC_OK) {
+      return ended;
+    }
+  }
   const uint32_t crc = gcomp_crc32_finalize(zip->running_crc);
 
   GARC_Result result = (zip->flags & ZIP_FLAG_DATA_DESCRIPTOR)
@@ -682,6 +888,11 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
 }
 
 void garc_zip_write_release(GARC_Writer * writer) {
+  // The encoder before the buffer it writes into, which is the order
+  // garc_member_codec_destroy() gives the reason for: a teardown that reads the
+  // buffer would read a freed one the other way round.
+  gcomp_encoder_destroy(writer->zip.encoder);
+  gcu_allocator_free(writer->allocator, writer->zip.packed);
   garc_buffer_free(writer->allocator, &writer->zip.central);
   garc_buffer_free(writer->allocator, &writer->zip.name);
   garc_buffer_free(writer->allocator, &writer->zip.extra);
