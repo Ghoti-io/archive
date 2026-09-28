@@ -54,37 +54,37 @@ extern "C" {
  * does not have to keep.
  * @{
  */
-#define GARC_TAR_OFF_NAME 0u
-#define GARC_TAR_LEN_NAME 100u
-#define GARC_TAR_OFF_MODE 100u
-#define GARC_TAR_LEN_MODE 8u
-#define GARC_TAR_OFF_UID 108u
-#define GARC_TAR_LEN_UID 8u
-#define GARC_TAR_OFF_GID 116u
-#define GARC_TAR_LEN_GID 8u
-#define GARC_TAR_OFF_SIZE 124u
-#define GARC_TAR_LEN_SIZE 12u
-#define GARC_TAR_OFF_MTIME 136u
-#define GARC_TAR_LEN_MTIME 12u
-#define GARC_TAR_OFF_CHKSUM 148u
-#define GARC_TAR_LEN_CHKSUM 8u
-#define GARC_TAR_OFF_TYPEFLAG 156u
-#define GARC_TAR_OFF_LINKNAME 157u
-#define GARC_TAR_LEN_LINKNAME 100u
-#define GARC_TAR_OFF_MAGIC 257u
-#define GARC_TAR_LEN_MAGIC 6u
-#define GARC_TAR_OFF_VERSION 263u
-#define GARC_TAR_LEN_VERSION 2u
-#define GARC_TAR_OFF_UNAME 265u
-#define GARC_TAR_LEN_UNAME 32u
-#define GARC_TAR_OFF_GNAME 297u
-#define GARC_TAR_LEN_GNAME 32u
-#define GARC_TAR_OFF_DEVMAJOR 329u
-#define GARC_TAR_LEN_DEVMAJOR 8u
-#define GARC_TAR_OFF_DEVMINOR 337u
-#define GARC_TAR_LEN_DEVMINOR 8u
-#define GARC_TAR_OFF_PREFIX 345u
-#define GARC_TAR_LEN_PREFIX 155u
+#define GARC_TAR_OFF_NAME 0u        ///< Member name, NUL-padded, not NUL-required.
+#define GARC_TAR_LEN_NAME 100u      ///< 100 bytes; the prefix field extends it.
+#define GARC_TAR_OFF_MODE 100u      ///< Permission bits, octal.
+#define GARC_TAR_LEN_MODE 8u        ///< 8 bytes: 7 octal digits and a terminator.
+#define GARC_TAR_OFF_UID 108u       ///< Owner id, octal or base-256.
+#define GARC_TAR_LEN_UID 8u         ///< 8 bytes, so 2097151 is the octal ceiling.
+#define GARC_TAR_OFF_GID 116u       ///< Group id, octal or base-256.
+#define GARC_TAR_LEN_GID 8u         ///< As ::GARC_TAR_LEN_UID.
+#define GARC_TAR_OFF_SIZE 124u      ///< Member data length, octal or base-256.
+#define GARC_TAR_LEN_SIZE 12u       ///< 12 bytes, so 8 GiB is the octal ceiling.
+#define GARC_TAR_OFF_MTIME 136u     ///< Modification time, seconds since the epoch.
+#define GARC_TAR_LEN_MTIME 12u      ///< 12 bytes; 8589934591 is the octal ceiling.
+#define GARC_TAR_OFF_CHKSUM 148u    ///< Header checksum, read as spaces when summed.
+#define GARC_TAR_LEN_CHKSUM 8u      ///< 8 bytes: six digits, a NUL and a space.
+#define GARC_TAR_OFF_TYPEFLAG 156u  ///< One byte saying what kind of member this is.
+#define GARC_TAR_OFF_LINKNAME 157u  ///< Link target, for a symlink or a hard link.
+#define GARC_TAR_LEN_LINKNAME 100u  ///< 100 bytes, with no prefix field to extend it.
+#define GARC_TAR_OFF_MAGIC 257u     ///< `ustar\0` for POSIX, `ustar  \0` for GNU.
+#define GARC_TAR_LEN_MAGIC 6u       ///< 6 bytes, which is what separates the variants.
+#define GARC_TAR_OFF_VERSION 263u   ///< `00` for POSIX; GNU's magic runs over it.
+#define GARC_TAR_LEN_VERSION 2u     ///< 2 bytes, and not NUL-terminated.
+#define GARC_TAR_OFF_UNAME 265u     ///< Owner name, which overrides the id on extract.
+#define GARC_TAR_LEN_UNAME 32u      ///< 32 bytes.
+#define GARC_TAR_OFF_GNAME 297u     ///< Group name, ditto.
+#define GARC_TAR_LEN_GNAME 32u      ///< 32 bytes.
+#define GARC_TAR_OFF_DEVMAJOR 329u  ///< Device major, for a character or block device.
+#define GARC_TAR_LEN_DEVMAJOR 8u    ///< 8 bytes.
+#define GARC_TAR_OFF_DEVMINOR 337u  ///< Device minor, ditto.
+#define GARC_TAR_LEN_DEVMINOR 8u    ///< 8 bytes.
+#define GARC_TAR_OFF_PREFIX 345u    ///< Leading path components, joined with a `/`.
+#define GARC_TAR_LEN_PREFIX 155u    ///< 155 bytes, so 255 is the longest split name.
 /** @} */
 
 /**

@@ -76,8 +76,8 @@ typedef struct GARC_Stream GARC_Stream;
  * error, and a format that needs what is missing refuses with
  * ::GARC_ERR_UNSUPPORTED rather than guessing.
  *
- * Every callback receives @ref ctx as its first argument. The library never
- * inspects or frees @ref ctx; its lifetime is the caller's, and it must
+ * Every callback receives `ctx` as its first argument. The library never
+ * inspects or frees `ctx`; its lifetime is the caller's, and it must
  * outlive the stream.
  */
 typedef struct GARC_Stream_Callbacks {

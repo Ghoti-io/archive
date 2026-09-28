@@ -92,6 +92,13 @@ static void print_escaped(const char * bytes, size_t length) {
   }
 }
 
+/**
+ * List one archive's members.
+ *
+ * @param argc Argument count.
+ * @param argv `argv[1]` is the archive to read.
+ * @return 0 on success, 1 on any failure, 2 on a usage error.
+ */
 int main(int argc, char ** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s <path.tar>\n", argv[0]);

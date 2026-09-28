@@ -39,6 +39,11 @@
 extern "C" {
 #endif
 
+/**
+ * An archive being written.
+ *
+ * Opaque to callers, for the reason ::GARC_Archive gives.
+ */
 struct GARC_Writer {
   /** The sink, borrowed. The caller destroys it; garc_writer_destroy() does
    *  not. */

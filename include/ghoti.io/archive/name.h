@@ -123,7 +123,7 @@ typedef enum {
   GARC_NAME_PARENT_COMPONENT = 1u << 2,
 
   /**
-   * A `.` component is present.
+   * A @c . component is present.
    *
    * Both references accept these, so this is hygiene rather than danger: it is
    * here because `./x` and `x` are the same file under two names, which matters

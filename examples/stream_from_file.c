@@ -28,7 +28,7 @@
  * the `fopen` is here, in the caller, where the caller's own permissions,
  * sandbox and error handling apply. The library sees three function pointers.
  *
- * Usage: stream_from_file <path>
+ * Usage: `stream_from_file <path>`
  */
 
 #include <inttypes.h>
@@ -74,6 +74,13 @@ static GARC_Result file_size(void * ctx, uint64_t * out_size) {
   return GARC_OK;
 }
 
+/**
+ * Read an archive from a file, through callbacks the caller owns.
+ *
+ * @param argc Argument count.
+ * @param argv `argv[1]` is the archive to read.
+ * @return 0 on success, 1 on any failure, 2 on a usage error.
+ */
 int main(int argc, char ** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s <path>\n", argv[0]);

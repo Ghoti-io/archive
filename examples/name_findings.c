@@ -125,6 +125,14 @@ static uint32_t report(const char * what, const char * bytes, size_t length) {
   return findings;
 }
 
+/**
+ * Report what ::garc_name_check() finds about every member name in an archive.
+ *
+ * @param argc Argument count.
+ * @param argv `argv[1]` is the archive to read.
+ * @return 0 when nothing in the archive would be refused, 1 when something
+ *   would, and 2 on a usage error.
+ */
 int main(int argc, char ** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s <path.tar>\n", argv[0]);

@@ -88,6 +88,7 @@ extern "C" {
 #endif
 
 /**
+ * @def GARC_API
  * @brief API export macro for cross-platform library symbols
  *
  * Use this macro to mark functions that should be exported from the
@@ -103,6 +104,14 @@ extern "C" {
  * @code
  * GARC_API void public_function(void);
  * @endcode
+ */
+/**
+ * @def GARC_EXTERN
+ * @brief `extern "C"` where the header is read by a C++ compiler, nothing
+ *   otherwise.
+ *
+ * Split out of ::GARC_API so that the linkage decision is made once rather than
+ * in each of the four platform branches below.
  */
 #ifdef __cplusplus
 #define GARC_EXTERN extern "C"

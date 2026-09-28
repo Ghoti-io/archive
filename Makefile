@@ -325,7 +325,7 @@ INCLUDE := -I include/ -I src/ -I $(GEN_DIR)/
 # machine that can regenerate the corpus is not necessarily one with the suite
 # installed. `make check-corpus` failing at parse time on a missing cutil - before
 # it reached a container - was the reason this list grew.
-DEPLESS_GOALS := docs docs-pdf clean fuzz-clean cloc help \
+DEPLESS_GOALS := docs docs-pdf check-docs clean fuzz-clean cloc help \
 	corpus check-corpus check-corpus-hashes check-oracle \
 	oracle-build oracle-version
 ifeq ($(filter-out $(DEPLESS_GOALS),$(or $(MAKECMDGOALS),all)),)
@@ -598,7 +598,7 @@ $(WRITER_PROBE): tools/oracle/writer_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-aliasing
+.PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-corpus-hashes check-corpus corpus oracle-build oracle-version
 .PHONY: check-oracle check-writer
 # Release build commands
@@ -1383,6 +1383,49 @@ test-watch-debug: ## Watch the file directory for changes and run the unit tests
 
 docs: ## Generate the documentation in the ./docs subdirectory
 	doxygen
+
+check-docs: ## Fail if Doxygen reports a warning about this project's comments
+# **The Doxyfile is left alone and the setting is overridden here**, because
+# `WARN_AS_ERROR` in the file would make plain `make docs` fail on a warning -
+# which is the wrong place for it. Somebody regenerating the documentation wants
+# the documentation; somebody asking whether the comments are clean asks for it.
+# `doxygen -` reads a configuration from standard input, so appending one line to
+# the tracked file is the whole of the override.
+#
+# `FAIL_ON_WARNINGS` rather than `YES`: `YES` stops at the *first* warning, which
+# turns a job with a known list into one error per run and makes the scope look
+# unbounded - the trap `-Wfatal-errors` sets in the compile. This reports them all
+# and then exits non-zero.
+#
+# Not in TEST_GATES: it needs doxygen, which `make test` must not. Asked for by
+# name, an absent doxygen is a failure and not a skip, for the reason the oracle
+# gates give - a machine with no doxygen would otherwise look exactly like one
+# where every comment resolves.
+	@if ! command -v doxygen >/dev/null 2>&1; then \
+		printf '\033[0;31mcheck-docs: doxygen is not on PATH, so this gate is measuring nothing. Install it, or do not ask for this target.\033[0m\n' >&2; \
+		exit 1; \
+	fi
+# The **exit status** is the verdict and the lines are only the message. Counting
+# `warning:` was the first attempt and it reported "0 warning(s)" while failing,
+# because FAIL_ON_WARNINGS relabels every one of them as `error:` - the category
+# word is the wrong thing to grep for when the mode changes it.
+	@out=$$( { cat Doxyfile; echo 'WARN_AS_ERROR = FAIL_ON_WARNINGS'; } \
+		| doxygen - 2>&1 ); \
+	status=$$?; \
+	if [ "$$status" -eq 0 ]; then \
+		printf 'check-docs: doxygen reports no warnings\n'; \
+		exit 0; \
+	fi; \
+	lines=$$(printf '%s\n' "$$out" | grep -E '(warning|error):' || true); \
+	if [ -z "$$lines" ]; then \
+		printf '\033[0;31mcheck-docs: doxygen exited %s and said nothing about a comment, so this is doxygen failing rather than a documentation warning - read the output below before touching a comment.\033[0m\n' "$$status" >&2; \
+		printf '%s\n' "$$out" | tail -20 >&2; \
+		exit 1; \
+	fi; \
+	printf '\033[0;31mcheck-docs: doxygen reported %s diagnostic(s)\033[0m\n' \
+		"$$(printf '%s\n' "$$lines" | wc -l)" >&2; \
+	printf '%s\n' "$$lines" >&2; \
+	exit 1
 
 docs-pdf: docs ## Generate the documentation as a pdf, at ./docs/(SUITE)-(PROJECT)(BRANCH).pdf
 	cd ./docs/latex/ && make

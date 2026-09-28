@@ -122,6 +122,12 @@ typedef struct {
   int have[GARC_PAX_KEY_COUNT];
 } GARC_Tar_Pax;
 
+/**
+ * An archive being read.
+ *
+ * Opaque to callers: ::garc_open() hands back a pointer and every accessor is a
+ * function, so the layout here is free to change without a consumer rebuild.
+ */
 struct GARC_Archive {
   /** The stream, borrowed. The caller destroys it; garc_close() does not. */
   GARC_Stream * stream;
@@ -178,10 +184,21 @@ struct GARC_Archive {
   /** How many of @ref peek have been consumed. */
   size_t peek_consumed;
 
-  char name_storage[GARC_TAR_NAME_STORAGE];
-  char link_storage[GARC_TAR_LINK_STORAGE];
-  char uname_storage[GARC_TAR_OWNER_STORAGE];
-  char gname_storage[GARC_TAR_OWNER_STORAGE];
+  /**
+   * @name Where a member's strings live between calls
+   *
+   * A member's name is lent to the caller until the next ::garc_next(), so it
+   * has to outlive the header block it was read from. These are sized to the
+   * longest a ustar header can express - 100 plus a `/` plus 155 for a split
+   * name - so the common case allocates nothing; a longer one goes to the heap
+   * buffer below.
+   * @{
+   */
+  char name_storage[GARC_TAR_NAME_STORAGE];   ///< Name, plus its terminator.
+  char link_storage[GARC_TAR_LINK_STORAGE];   ///< Link target, plus terminator.
+  char uname_storage[GARC_TAR_OWNER_STORAGE]; ///< Owner name, plus terminator.
+  char gname_storage[GARC_TAR_OWNER_STORAGE]; ///< Group name, plus terminator.
+  /** @} */
 
   /**
    * A name carried in front of the header rather than in it.

@@ -28,7 +28,7 @@
  * operations mean nothing here - there is nothing to read, nothing to skip, and
  * a sink's length is what it has been given rather than something to ask about -
  * so one struct would be one required callback and four optional ones whose
- * absence meant four different things. ::GARC_Stream.read is *required*, and it
+ * absence meant four different things. `GARC_Stream`'s `read` is *required*, and it
  * would have to stop being so.
  *
  * Three differences from the read side, each of which is the format's answer

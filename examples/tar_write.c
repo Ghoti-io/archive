@@ -59,9 +59,9 @@ static GARC_Result file_write(void * ctx, const void * buffer, size_t size) {
 
 /** One member of the archive this builds. */
 typedef struct {
-  const char * name;
-  const char * data;
-  GARC_Member_Type type;
+  const char * name;       ///< The member's name, as it goes into the archive.
+  const char * data;       ///< File content, or a symlink's target. NULL for none.
+  GARC_Member_Type type;   ///< Which kind of member, which decides how @c data reads.
 } Entry;
 
 static const Entry entries[] = {
@@ -141,6 +141,14 @@ static int write_to(GARC_Sink * sink) {
   return result == GARC_OK ? 0 : 1;
 }
 
+/**
+ * Build the archive twice: once into memory, once through a `FILE *`.
+ *
+ * @param argc Argument count.
+ * @param argv `argv[1]`, if given, is where the archive is written; standard
+ *   output otherwise.
+ * @return 0 on success.
+ */
 int main(int argc, char ** argv) {
   // First into memory, so the size can be reported before anything is committed
   // to disk. A caller streaming to a socket would skip this half.

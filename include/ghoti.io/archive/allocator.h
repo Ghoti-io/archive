@@ -23,7 +23,7 @@
  *
  * Allocator abstraction for the Ghoti.io Archive library.
  *
- * This is cutil's @ref GCU_Allocator under a local name, the same arrangement
+ * This is cutil's `GCU_Allocator` under a local name, the same arrangement
  * the compress and image libraries use. One definition across the suite means
  * an allocator written for any of them works with all of them, rather than
  * needing a near-identical copy per library.
