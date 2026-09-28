@@ -775,27 +775,20 @@ static const char * zip_codec_name(uint16_t method) {
  * @param data_offset Where the member's data starts, encryption header included.
  * @param dos_time The member's DOS time field, which is the check byte's other
  *   possible source.
- * @param out_payload Receives the ciphertext length, the header excluded.
  * @param out_source Receives the stream the member's bytes come from.
  * @return ::GARC_OK - whether or not the member was refused, which
- *   ::GARC_Archive.data_refusal carries - ::GARC_ERR_CORRUPT for a member too
- *   short to hold an encryption header, or an I/O or allocation failure.
+ *   ::GARC_Archive.data_refusal carries - or an I/O or allocation failure.
+ *   **Never a structural refusal**: the caller has already made those, because
+ *   they must not depend on whether a password was supplied.
  */
 static GARC_Result zip_setup_zipcrypto(GARC_Archive * archive,
-    uint64_t data_offset, uint16_t dos_time, uint64_t * out_payload,
-    GARC_Stream ** out_source) {
+    uint64_t data_offset, uint16_t dos_time, GARC_Stream ** out_source) {
   GARC_Zip_State * zip = &archive->zip;
 
   if (!zip->have_password) {
     archive->data_refusal = GARC_ERR_PASSWORD_REQUIRED;
     return GARC_OK;
   }
-  if (zip->compressed_size < GARC_ZIP_CRYPT_HEADER_SIZE) {
-    // Not a refusal on the data: an encrypted member has to be at least its own
-    // encryption header long, so this is the archive contradicting itself.
-    return GARC_ERR_CORRUPT;
-  }
-
   uint8_t header[GARC_ZIP_CRYPT_HEADER_SIZE];
   GARC_Result result = zip_read_at(archive, data_offset, header, sizeof(header));
   if (result != GARC_OK) {
@@ -823,7 +816,6 @@ static GARC_Result zip_setup_zipcrypto(GARC_Archive * archive,
   if (result != GARC_OK) {
     return result;
   }
-  *out_payload = zip->compressed_size - GARC_ZIP_CRYPT_HEADER_SIZE;
   *out_source = zip->crypt;
   return GARC_OK;
 }
@@ -1136,6 +1128,32 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   uint64_t payload = compressed_size;
   GARC_Stream * source = archive->stream;
 
+  // **Every structural check happens before the password, and none of them
+  // depends on it.** An encrypted member is at least its own encryption header
+  // long, and a stored member's two sizes are one number; both are facts about the
+  // archive rather than about the caller's secret, so both are checked whether or
+  // not one was supplied.
+  //
+  // This is a defect the fuzz harness found, by walking one archive twice - once
+  // with a password and once without - and comparing the members. The length check
+  // used to live inside the ZipCrypto setup, which runs only when a password is
+  // set, so the same archive was a corrupt one to a caller who had the password
+  // and a walkable one to a caller who did not. A refusal that arrives only for
+  // some callers is worse than either answer.
+  if (zip->encryption == GARC_ZIP_ENCRYPTION_ZIPCRYPTO) {
+    if (compressed_size < GARC_ZIP_CRYPT_HEADER_SIZE) {
+      return GARC_ERR_CORRUPT;
+    }
+    payload = compressed_size - GARC_ZIP_CRYPT_HEADER_SIZE;
+  }
+  if (zip->method == GARC_ZIP_METHOD_STORED && payload != size) {
+    // Stored means the two sizes are one number - the *payload*, which for an
+    // encrypted member is the compressed size less its encryption header. A member
+    // that says otherwise describes something the method cannot do, and both
+    // numbers are things a reader seeks by.
+    return GARC_ERR_CORRUPT;
+  }
+
   // **The method is answered before the password, and the order is the point.**
   // A member this library has no codec for is refused whatever the password, so
   // asking for one first would send a caller to a prompt and then refuse them
@@ -1146,8 +1164,7 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
     archive->data_refusal = GARC_ERR_UNSUPPORTED;
   }
   else if (zip->encryption == GARC_ZIP_ENCRYPTION_ZIPCRYPTO) {
-    result = zip_setup_zipcrypto(archive, data_offset, dos_time, &payload,
-        &source);
+    result = zip_setup_zipcrypto(archive, data_offset, dos_time, &source);
     if (result != GARC_OK) {
       return result;
     }
@@ -1165,13 +1182,6 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
     // have does not need one, and creating it would decompress ciphertext.
   }
   else if (zip->method == GARC_ZIP_METHOD_STORED) {
-    if (payload != size) {
-      // Stored means the two sizes are one number - the *payload*, which for an
-      // encrypted member is the compressed size less its encryption header. A
-      // member that says otherwise describes something the method cannot do, and
-      // both numbers are things a reader seeks by.
-      return GARC_ERR_CORRUPT;
-    }
     if (source == archive->stream) {
       // Only when the bytes come straight from the archive. An encrypted member's
       // stream has already been positioned past the encryption header, and

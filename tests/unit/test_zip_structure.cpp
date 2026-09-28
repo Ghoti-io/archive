@@ -1275,9 +1275,14 @@ TEST(ZipStructure, TheDumpNamesTheStubAndTheEncryption) {
   // Two lines the dump only prints for the archives that have them, so nothing
   // else in the suite reaches them: a base offset that is not zero, and a member
   // with a cipher.
+  // A real ZipCrypto member rather than a flag bit on a plain one: an encrypted
+  // member's declared sizes have to differ by its 12-byte encryption header, and
+  // the reader refuses one that does not whether or not a password was supplied.
+  const std::string plain = "hello, archive\n";
   ZipBuilder builder;
-  builder.add("hello.txt", "hello, archive\n");
-  builder.last().flags = 0x0001u;  // encrypted, as far as the header says
+  add_encrypted(builder, "hello.txt", plain,
+      static_cast<uint32_t>(plain.size()), ZipBuilder::crc32(plain),
+      CheckByte::FromCrc);
   builder.prologue(std::string(64u, 'S'));
   Built built(builder.build());
   ASSERT_EQ(built.open_result(), GARC_OK);
@@ -2000,6 +2005,44 @@ TEST(ZipCrypto, AMethodWithNoCodecIsRefusedBeforeThePasswordIsAskedFor) {
   std::string out;
   // No password set, and the answer is still about the method.
   EXPECT_EQ(read_member(built.archive(), &out), GARC_ERR_UNSUPPORTED);
+}
+
+TEST(ZipCrypto, TheWalkDoesNotDependOnThePassword) {
+  // **A defect the fuzz harness found**, and the test that pins the fix. An
+  // encrypted member is at least its own 12-byte encryption header long, and a
+  // stored one's two sizes differ by exactly that - both facts about the archive.
+  // The length check used to live inside the ZipCrypto setup, which runs only when
+  // a password is set, so this archive was corrupt to a caller who had the password
+  // and walkable to one who did not. A refusal that arrives only for some callers
+  // is worse than either answer.
+  //
+  // Two archives, because there are two structural checks, and each is asserted
+  // both ways round: with a password and without, the walk must reach the same
+  // verdict.
+  for (int which = 0; which < 2; ++which) {
+    SCOPED_TRACE(which == 0 ? "shorter than its encryption header"
+                            : "stored, with sizes that ignore the header");
+    ZipBuilder builder;
+    builder.add("secret.txt", which == 0 ? "tiny" : "hello, archive\n");
+    builder.last().flags = 0x0001u;
+    builder.last().override_sizes = true;
+    const uint32_t length = which == 0 ? 4u : 15u;
+    builder.last().central_compressed_size = length;
+    builder.last().central_size = length;
+    const std::vector<uint8_t> bytes = builder.build();
+
+    for (int password = 0; password < 2; ++password) {
+      Built built(bytes);
+      ASSERT_EQ(built.open_result(), GARC_OK);
+      if (password) {
+        ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+                      sizeof(kPassword) - 1u),
+            GARC_OK);
+      }
+      EXPECT_EQ(built.walk(), GARC_ERR_CORRUPT)
+          << (password ? "with a password" : "without one");
+    }
+  }
 }
 
 TEST(ZipCrypto, TheDecryptingStreamRefusesItsOwnBadArguments) {

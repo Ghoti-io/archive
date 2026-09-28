@@ -81,6 +81,18 @@ extensions. 12, 14, 95 and 98 are refused too, with a status and an accessor tha
 AES are named separately from each other and from "unsupported", because a caller
 needs to know whether a password could ever help.
 
+**ZipCrypto is read and will never be written.** The traditional PKWARE cipher
+needs no cryptography library at all - it is three words mixed with CRC-32, which
+`compress` already has - and it is broken, which is a reason to read what exists in
+the world rather than a reason to refuse it. `garc_zip_set_password()` derives the
+keys and does not keep the password. A wrong one gets **three statuses and not
+one**: none supplied, rejected by the encryption header's single check byte, or
+"wrong password or corrupt member" after the CRC - and the third names two causes
+because ZipCrypto has no authentication tag, so nothing can separate them. WinZip
+AES waits for the `security` library and refuses by name until then. Nothing about
+a zip's *metadata* is encrypted at any password strength: a zip cannot hide which
+files exist.
+
 **Every member's CRC-32 is checked**, which tar has nothing like: reading a member
 to its end and getting `GARC_OK` means this reader and the writer agree about
 every one of its bytes. The verdict arrives on the call that returns zero bytes,
@@ -125,15 +137,15 @@ the digits in a numeric field, whether to use the ustar name split, what the
 extended header is called — so each was measured and each choice is argued in
 `documentation/design.md` rather than copied.
 
-Build clean under GCC 14 with `-Werror`; 507 tests; 99.3% line coverage of 2,824
-lines; the twenty uncovered are four `default:` arms no input can reach - kept so
-that a third format added to an enum and not to a switch is a named internal error
-rather than a silent fall-through - eleven arms reachable only if a codec or
-`compress`'s own allocator broke its contract, and the five this library has always
+Build clean under GCC 14 with `-Werror`; 536 tests; 99.3% line coverage of 2,945
+lines; the twenty-one uncovered are four `default:` arms no input can reach - kept
+so that a third format added to an enum and not to a switch is a named internal
+error rather than a silent fall-through - thirteen arms reachable only if a codec or
+`compress`'s own allocator broke its contract, and the four this library has always
 had, three of which are live only where `size_t` is 32 bits. Clean under Valgrind
 and under ASan+UBSan; `check-symbols`, `check-aliasing`, `check-corpus-hashes`,
-`check-fixtures` and `check-docs` green, the last at zero Doxygen warnings; five
-fuzz harnesses.
+`check-fixtures` and `check-docs` green, the last at zero Doxygen warnings; six
+fuzz harnesses, the newest of which found a defect in its first two minutes.
 
 ## A minimal complete program
 

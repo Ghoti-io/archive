@@ -970,7 +970,23 @@ non-seekable paths rather than whichever one a constructor happened to pick. It
 also drives the failing allocator, so the out-of-memory arms are walked by the
 same corpus rather than by a separate campaign.
 
-**The writer harness can check the answer, not only the survival.** The other three
+**The zip harness walks each archive twice and compares.** Once with a password
+and once without, asserting that every member's name, size, method, CRC, encryption
+and data offset match - because a zip's metadata is in the clear at every password
+strength, so the walk must not depend on the caller's secret. It earned that
+invariant within its first two minutes, and not with a crash: an encrypted member
+shorter than its own 12-byte encryption header was refused when a password was set
+and walked past when one was not, because the length check lived inside the
+decryption setup. The same archive was corrupt to a caller who had the password and
+readable to one who did not, and a refusal that arrives only for some callers is
+worse than either answer. Both of that member's structural checks now happen before
+the password is looked at.
+
+The harness also has no stream-shape axis, which is the difference from the tar
+one: a zip on a pipe is `GARC_ERR_NOT_SEEKABLE` before a byte is parsed, so half the
+inputs would have been spent on one branch.
+
+**The writer harness can check the answer, not only the survival.** The others
 check invariants that hold *by construction* - that `tell` advances by exactly what
 `read` reported, that a traversal implies a parent component, that prefixing
 `safe/` cannot turn a contained name into an escape - which is real and is not the
