@@ -185,6 +185,61 @@ GARC_Result garc_zip_locate_eocd(GARC_Archive * archive, uint64_t * out_offset);
  */
 GARC_Result garc_zip_open(GARC_Archive * archive, uint64_t eocd_offset);
 
+/** ZipCrypto's encryption header, which sits in front of a member's data. */
+#define GARC_ZIP_CRYPT_HEADER_SIZE 12u
+
+/**
+ * Derive the three ZipCrypto keys from a password.
+ *
+ * The password's only role is to produce these, so the caller keeps them and
+ * forgets the password - see zip_crypt.c for why that is not merely tidy.
+ *
+ * @param keys Receives the three words.
+ * @param password The password bytes. May be NULL only when @p length is 0.
+ * @param length Its length.
+ */
+void garc_zip_crypt_derive(uint32_t keys[3], const void * password,
+    size_t length);
+
+/**
+ * Decrypt @p length bytes in place, advancing the keys.
+ *
+ * @param keys The cipher state, updated as it goes.
+ * @param data Ciphertext in, plaintext out.
+ * @param length How many bytes.
+ */
+void garc_zip_crypt_decrypt(uint32_t keys[3], uint8_t * data, size_t length);
+
+/**
+ * Whether a decrypted encryption header's check byte agrees.
+ *
+ * @param header The 12 decrypted bytes.
+ * @param crc32 The member's declared CRC-32.
+ * @param dos_time The member's DOS time field.
+ * @param have_descriptor Whether general purpose flag bit 3 is set.
+ * @return Non-zero when the password is probably right. See zip_crypt.c for
+ *   which convention applies when, and why both are accepted.
+ */
+int garc_zip_crypt_header_ok(const uint8_t header[GARC_ZIP_CRYPT_HEADER_SIZE],
+    uint32_t crc32, uint16_t dos_time, int have_descriptor);
+
+/**
+ * Create a stream that decrypts what it reads from @p inner.
+ *
+ * @p inner is **borrowed** and is read from wherever it is. No seek and no size,
+ * because the keystream depends on the plaintext already produced: there is no
+ * position in this stream a reader can return to.
+ *
+ * @param allocator For the stream and its state. NULL uses the default.
+ * @param inner Where the ciphertext comes from.
+ * @param keys The cipher state, copied, with the encryption header already mixed
+ *   in.
+ * @param out_stream Receives the stream on success.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID, or ::GARC_ERR_OOM.
+ */
+GARC_Result garc_zip_crypt_stream_create(const GARC_Allocator * allocator,
+    GARC_Stream * inner, const uint32_t keys[3], GARC_Stream ** out_stream);
+
 /**
  * Read some of the current member's data, decompressing where it has to.
  *

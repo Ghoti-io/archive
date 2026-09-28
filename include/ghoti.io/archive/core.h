@@ -105,6 +105,47 @@ typedef enum {
    */
   GARC_ERR_LIMIT_CODEC_BYTES,
 
+  /**
+   * The member is encrypted and no password was given.
+   *
+   * The one unambiguous answer of the three below it. A zip's metadata is in
+   * the clear whatever the password, so this arrives from
+   * ::garc_read_member() and never from ::garc_next(): the member's name, size,
+   * time and mode are readable and only its bytes are not.
+   *
+   * See ::garc_zip_set_password().
+   */
+  GARC_ERR_PASSWORD_REQUIRED,
+  /**
+   * The password was rejected before any data was read.
+   *
+   * ZipCrypto ends its 12-byte encryption header with one check byte, and this
+   * is that byte disagreeing. **It is one byte of evidence**, which is worth
+   * being precise about in both directions: a wrong password is caught here 255
+   * times in 256, and the only other thing that produces this answer is a
+   * corrupt encryption header - so the status names the password, because that
+   * is overwhelmingly what it is and what the caller can act on.
+   *
+   * The 256th wrong password gets through and arrives as
+   * ::GARC_ERR_PASSWORD_OR_CORRUPT at the end of the member instead.
+   */
+  GARC_ERR_PASSWORD_REJECTED,
+  /**
+   * An encrypted member's CRC-32 disagreed after its check byte agreed.
+   *
+   * **A status that names two causes, because nothing can separate them.**
+   * ZipCrypto has no authentication tag: a wrong key and a corrupted ciphertext
+   * produce the same observation, which is a member whose bytes are not the ones
+   * the archive's CRC describes. Reporting ::GARC_ERR_CORRUPT would claim the
+   * data is at fault and reporting ::GARC_ERR_PASSWORD_REJECTED would claim the
+   * password is; both would be a guess dressed as a finding.
+   *
+   * This is the case WinZip AES fixed by adding an HMAC, and phase H is where
+   * this status stops being the only answer available for an encrypted member
+   * that does not come out right.
+   */
+  GARC_ERR_PASSWORD_OR_CORRUPT,
+
   GARC_RESULT_COUNT
 } GARC_Result;
 

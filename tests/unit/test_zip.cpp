@@ -35,10 +35,12 @@
 #include "zip_manifest.h"
 
 using garctest::BufferSource;
+using garctest::ZipDecryptedRow;
 using garctest::ZipManifestRow;
 using garctest::ZipNameRow;
 using garctest::ZipOpeningRow;
 using garctest::read_fixture;
+using garctest::zip_decrypted_load;
 using garctest::zip_manifest_load;
 using garctest::zip_names_load;
 using garctest::zip_openings_load;
@@ -69,6 +71,22 @@ const std::vector<ZipOpeningRow> & openings() {
       = zip_openings_load(data_path("openings.tsv"));
   return rows;
 }
+
+/** The plaintext of every encrypted member, from three programs that decrypt. */
+const std::vector<ZipDecryptedRow> & decrypted() {
+  static const std::vector<ZipDecryptedRow> rows
+      = zip_decrypted_load(data_path("decrypted.tsv"));
+  return rows;
+}
+
+/**
+ * The password every encrypted fixture was written with.
+ *
+ * `PASSWORD` in `tools/oracle/make_zip_corpus.py`. Spelled here rather than read
+ * from the corpus because it is an input to the fixtures and not a reading of
+ * them - a `.tsv` carrying it would invite a test to take whatever it found.
+ */
+const char kCorpusPassword[] = "ghoti-password";
 
 /**
  * The name Python read for a member, or an empty result when it read none.
@@ -566,11 +584,25 @@ TEST(ZipCorpus, EveryDeflatedMemberInTheCorpusReadsAndItsCrcVerifies) {
   size_t deflated = 0;
   size_t stored = 0;
   size_t unsupported = 0;
+  size_t encrypted = 0;
   for (const auto & entry : manifest()) {
     Fixture fixture(entry.first);
     ASSERT_EQ(fixture.open_result(), GARC_OK) << entry.first;
+    // **The password is set for every fixture, not only the encrypted ones.** It
+    // costs nothing on an archive with no encrypted member, and it puts the
+    // ZipCrypto-around-deflate member into this sweep rather than beside it: the
+    // strongest statement about the decrypt-then-inflate layering is that its
+    // bytes pass the CRC the writer declared, and that is the statement this test
+    // already makes about everything else.
+    ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+                  std::strlen(kCorpusPassword)),
+        GARC_OK) << entry.first;
     const GARC_Member * member = nullptr;
     while (garc_next(fixture.archive(), &member) == GARC_OK) {
+      if (garc_zip_member_encryption(fixture.archive())
+          != GARC_ZIP_ENCRYPTION_NONE) {
+        ++encrypted;
+      }
       const std::string where = entry.first + " " + member_name(member);
       char buffer[512];
       size_t got = 0;
@@ -602,6 +634,9 @@ TEST(ZipCorpus, EveryDeflatedMemberInTheCorpusReadsAndItsCrcVerifies) {
   // fail here rather than passing with nothing to decompress.
   EXPECT_GE(deflated, 4u);
   EXPECT_GE(stored, 20u);
+  // And the encrypted members are in it rather than skipped past, which is what
+  // makes this test cover the cipher as well as the codec.
+  EXPECT_GE(encrypted, 4u);
   EXPECT_GE(unsupported, 5u) << "bzip2, lzma, ppmd, deflate64, AES, ZipCrypto";
 }
 
@@ -675,10 +710,254 @@ TEST(Zip, ZipCryptoIsNamedRatherThanCalledUnsupported) {
   // 12 bytes of encryption header in front of the data, which is why the
   // compressed size exceeds the uncompressed one for a stored member.
   EXPECT_EQ(garc_zip_member_compressed_size(fixture.archive()), 27u);
+  // **With no password the refusal says so, and says only that.** Before
+  // ZipCrypto was read this was GARC_ERR_UNSUPPORTED, which told a caller to wait
+  // for a release when what it needed was a password.
   char buffer[16];
   size_t got = 0;
   EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
-      GARC_ERR_UNSUPPORTED);
+      GARC_ERR_PASSWORD_REQUIRED);
+}
+
+//-----------------------------------------------------------------------------
+// ZipCrypto, against three programs that decrypt the same archives
+//-----------------------------------------------------------------------------
+
+TEST(ZipCrypto, TheDecryptedReadingIsNotEmpty) {
+  // The denominator. Every row of `decrypted.tsv` is one encrypted member, and a
+  // missing or truncated file would make the tests below pass by iterating
+  // nothing - which is how a corpus-driven suite goes quiet.
+  const auto & rows = decrypted();
+  ASSERT_FALSE(rows.empty()) << "no reading at " << data_path("decrypted.tsv");
+  EXPECT_EQ(rows.size(), 5u);
+
+  size_t zipcrypto = 0;
+  size_t aes = 0;
+  size_t with_plaintext = 0;
+  size_t deflated = 0;
+  for (const ZipDecryptedRow & row : rows) {
+    if (row.scheme == "zipcrypto") {
+      ++zipcrypto;
+    }
+    if (row.scheme == "aes") {
+      ++aes;
+    }
+    if (row.have_plaintext) {
+      ++with_plaintext;
+    }
+    if (row.method == GARC_ZIP_METHOD_DEFLATE) {
+      ++deflated;
+    }
+  }
+  // **Both layerings are present, and that is the point of the second fixture.**
+  // ZipCrypto around stored and ZipCrypto around deflate are different shapes -
+  // the cipher is outermost in both, so a reader that decrypts and decompresses
+  // in the wrong order reads the stored members correctly and the deflated one
+  // not at all. A corpus with only the stored form cannot tell.
+  EXPECT_EQ(zipcrypto, 4u);
+  EXPECT_GE(deflated, 1u) << "no encrypted member is compressed, so nothing here "
+                             "exercises decrypt-then-inflate";
+  EXPECT_EQ(aes, 1u) << "the AES row is phase H's committed expectation";
+  // The AES row has no plaintext, because two of the three references refuse it.
+  EXPECT_EQ(with_plaintext, 4u);
+}
+
+TEST(ZipCrypto, EveryEncryptedMemberReadsWhatThreeProgramsDecrypt) {
+  // **The cross-check.** Each of these bytes came out of Python's zipfile,
+  // unzip 6.00 and 7-Zip 25.01, and the generator writes the plaintext column
+  // only where all three digests agreed - so a passing row is four independent
+  // implementations of a 1994 cipher producing one answer. A test comparing
+  // against an expectation written here would be this library agreeing with
+  // itself about a cipher nobody else checked.
+  size_t compared = 0;
+  size_t refused = 0;
+  for (const ZipDecryptedRow & row : decrypted()) {
+    Fixture fixture(row.archive);
+    ASSERT_EQ(fixture.open_result(), GARC_OK) << row.archive;
+    ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+                  std::strlen(kCorpusPassword)),
+        GARC_OK);
+
+    const GARC_Member * member = nullptr;
+    for (size_t index = 0; index <= row.index; ++index) {
+      ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK)
+          << row.archive << ": fewer members than decrypted.tsv describes";
+    }
+    const std::string where = row.archive + " " + row.name;
+    EXPECT_EQ(member_name(member), row.name) << where;
+    EXPECT_EQ(member->size, row.size) << where;
+    EXPECT_EQ(garc_zip_member_method(fixture.archive()), row.method) << where;
+    EXPECT_EQ(garc_zip_member_encryption(fixture.archive()),
+        row.scheme == "aes" ? GARC_ZIP_ENCRYPTION_AES
+                            : GARC_ZIP_ENCRYPTION_ZIPCRYPTO) << where;
+
+    if (!row.have_plaintext) {
+      // AES, which no password reaches in this cut. The refusal has to name the
+      // scheme rather than the password, because a password is not what is
+      // missing - and this is the row that says so.
+      char buffer[64];
+      size_t got = 0;
+      EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
+          GARC_ERR_UNSUPPORTED) << where;
+      ++refused;
+      continue;
+    }
+    EXPECT_EQ(read_all(fixture.archive()), row.plaintext) << where;
+    ++compared;
+  }
+  EXPECT_EQ(compared, 4u);
+  EXPECT_EQ(refused, 1u);
+}
+
+TEST(ZipCrypto, TheCheckByteComesFromTheDosTimeWhenThereIsADataDescriptor) {
+  // **A finding, asserted rather than described.** ZipCrypto's encryption header
+  // ends in one check byte, and APPNOTE says it is the high byte of the member's
+  // CRC-32. Info-ZIP sets general purpose flag bit 3 on every encrypted member it
+  // writes - the sizes and the CRC go in a data descriptor *after* the data - so
+  // it has no CRC to derive that byte from and uses the high byte of the DOS time
+  // instead. A reader that only knew the CRC convention would reject the correct
+  // password for every encrypted archive `zip` has ever produced.
+  //
+  // What makes this a test rather than a comment: the two bytes differ in this
+  // fixture, so a reader taking the wrong one cannot pass by coincidence. The
+  // measured values when this was written were a check byte of 0x0D against a
+  // CRC whose high byte is 0x51.
+  Fixture fixture("infozip-crypto.zip");
+  ASSERT_EQ(fixture.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+                std::strlen(kCorpusPassword)),
+      GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
+
+  // Bit 3, which is what puts the check byte on the other convention.
+  EXPECT_EQ(garc_zip_member_flags(fixture.archive()) & 0x0008u, 0x0008u);
+  // And the CRC's high byte is not the check byte, which is what makes the
+  // fixture discriminating. 0x0D is the DOS time's high byte; the CRC's is 0x51.
+  EXPECT_EQ(garc_zip_member_crc32(fixture.archive()) >> 24, 0x51u)
+      << "the fixture has moved and this test no longer separates the two "
+         "conventions";
+  EXPECT_EQ(read_all(fixture.archive()), "hello, archive\n");
+}
+
+TEST(ZipCrypto, AWrongPasswordIsRejectedBeforeAnyDataIsRead) {
+  // The header's check byte, which is the cheap answer: one byte of evidence,
+  // returned before a single byte of the member is handed over.
+  Fixture fixture("infozip-crypto.zip");
+  ASSERT_EQ(fixture.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "wrong", 5u), GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  // **The walk is unaffected.** A zip's metadata is in the clear whatever the
+  // password, so a wrong one must not make garc_next() fail - it would lose every
+  // other member of the archive.
+  ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
+  EXPECT_EQ(member_name(member), "hello.txt");
+  EXPECT_EQ(member->size, 15u);
+
+  char buffer[64];
+  size_t got = 0;
+  EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
+      GARC_ERR_PASSWORD_REJECTED);
+  EXPECT_EQ(got, 0u) << "bytes were handed over with the refusal";
+  // And the next member is still reachable, which is the half of "the walk is
+  // unaffected" that a single-member assertion cannot make.
+  ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
+  EXPECT_EQ(member_name(member), "sizes/one");
+}
+
+TEST(ZipCrypto, ASecondPasswordReplacesTheFirst) {
+  // How a caller tries a list of passwords: set, read, and on
+  // GARC_ERR_PASSWORD_REJECTED set another. The archive is not reopened, and the
+  // member does not have to be walked to again - which is only true because the
+  // keys are derived per call and the encryption header is read per member.
+  Fixture fixture("infozip-crypto.zip");
+  ASSERT_EQ(fixture.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "wrong", 5u), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
+
+  char buffer[64];
+  size_t got = 0;
+  ASSERT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
+      GARC_ERR_PASSWORD_REJECTED);
+
+  ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+                std::strlen(kCorpusPassword)),
+      GARC_OK);
+  // The refusal was decided when the member became current, so the member has to
+  // become current again for the new password to be applied. garc_find() is the
+  // documented way back to a member by name, and it is what a caller retrying a
+  // password would reach for.
+  ASSERT_EQ(garc_find(fixture.archive(), "hello.txt", 9u, &member), GARC_OK);
+  EXPECT_EQ(read_all(fixture.archive()), "hello, archive\n");
+}
+
+TEST(ZipCrypto, AnEmptyPasswordIsAPasswordAndNotTheAbsenceOfOne) {
+  // The reason garc_zip_set_password() takes a length rather than a string, and
+  // the reason the state carries a flag beside the keys: "" is a password a writer
+  // can have used, and it has to be distinguishable from never having been given
+  // one. The two answers differ - GARC_ERR_PASSWORD_REJECTED against
+  // GARC_ERR_PASSWORD_REQUIRED - so this is testable rather than merely tidy.
+  Fixture fixture("infozip-crypto.zip");
+  ASSERT_EQ(fixture.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
+
+  char buffer[64];
+  size_t got = 0;
+  EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
+      GARC_ERR_PASSWORD_REQUIRED);
+
+  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "", 0u), GARC_OK);
+  ASSERT_EQ(garc_find(fixture.archive(), "hello.txt", 9u, &member), GARC_OK);
+  EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
+      GARC_ERR_PASSWORD_REJECTED);
+}
+
+TEST(ZipCrypto, APasswordSurvivesARewind) {
+  // It is the archive's, not the walk's. A garc_find() that forgot it would refuse
+  // a member the same walk had just read, which is the kind of bug that looks like
+  // the cipher failing intermittently.
+  Fixture fixture("infozip-crypto.zip");
+  ASSERT_EQ(fixture.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+                std::strlen(kCorpusPassword)),
+      GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_find(fixture.archive(), "sizes/one", 9u, &member), GARC_OK);
+  EXPECT_EQ(read_all(fixture.archive()), "x");
+  ASSERT_EQ(garc_find(fixture.archive(), "hello.txt", 9u, &member), GARC_OK);
+  EXPECT_EQ(read_all(fixture.archive()), "hello, archive\n");
+}
+
+TEST(ZipCrypto, APasswordIsRefusedOnAnArchiveThatIsNotAZip) {
+  // The accessors return zero for a tar; a setter cannot, so it says no. Asserted
+  // because a silent success would leave a caller thinking a tar could carry an
+  // encrypted member.
+  const std::vector<uint8_t> bytes = read_fixture(
+      std::string(GARC_TEST_DATA) + "/tar/ustar-basic.tar");
+  BufferSource source(bytes.data(), bytes.size(), true, true);
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+  ASSERT_EQ(garc_format(archive), GARC_FORMAT_TAR);
+  EXPECT_EQ(garc_zip_set_password(archive, "x", 1u), GARC_ERR_INVALID);
+  EXPECT_EQ(garc_zip_set_password(nullptr, "x", 1u), GARC_ERR_INVALID);
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(ZipCrypto, ANullPasswordWithALengthIsRefused) {
+  Fixture fixture("infozip-crypto.zip");
+  ASSERT_EQ(fixture.open_result(), GARC_OK);
+  EXPECT_EQ(garc_zip_set_password(fixture.archive(), nullptr, 4u),
+      GARC_ERR_INVALID);
+  // And a NULL password of length zero is the empty password, not an error: the
+  // two arms of that condition are separate lines in the implementation and this
+  // is what stops one of them being written as the other.
+  EXPECT_EQ(garc_zip_set_password(fixture.archive(), nullptr, 0u), GARC_OK);
 }
 
 TEST(Zip, WinZipAesIsNamedAndItsRealMethodIsNotLost) {

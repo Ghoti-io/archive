@@ -756,6 +756,78 @@ static const char * zip_codec_name(uint16_t method) {
   }
 }
 
+/**
+ * Prepare a ZipCrypto member's data, or refuse it.
+ *
+ * Reads the 12-byte encryption header, decrypts it, and checks its one check
+ * byte; on agreement it builds the decrypting view the rest of the setup reads
+ * through. Everything it refuses is refused on the *data* - the member's name,
+ * size, time and mode are in the clear whatever the password - so a wrong
+ * password does not stop the walk and ::garc_next() never returns one of these
+ * statuses.
+ *
+ * **The header is read only when a password has been set.** Without one the
+ * answer is already known, and a listing of an encrypted archive is the common
+ * case: paying one seek and one 12-byte read per member to reach a conclusion
+ * that needed neither would be a cost with nothing on the other side of it.
+ *
+ * @param archive The archive.
+ * @param data_offset Where the member's data starts, encryption header included.
+ * @param dos_time The member's DOS time field, which is the check byte's other
+ *   possible source.
+ * @param out_payload Receives the ciphertext length, the header excluded.
+ * @param out_source Receives the stream the member's bytes come from.
+ * @return ::GARC_OK - whether or not the member was refused, which
+ *   ::GARC_Archive.data_refusal carries - ::GARC_ERR_CORRUPT for a member too
+ *   short to hold an encryption header, or an I/O or allocation failure.
+ */
+static GARC_Result zip_setup_zipcrypto(GARC_Archive * archive,
+    uint64_t data_offset, uint16_t dos_time, uint64_t * out_payload,
+    GARC_Stream ** out_source) {
+  GARC_Zip_State * zip = &archive->zip;
+
+  if (!zip->have_password) {
+    archive->data_refusal = GARC_ERR_PASSWORD_REQUIRED;
+    return GARC_OK;
+  }
+  if (zip->compressed_size < GARC_ZIP_CRYPT_HEADER_SIZE) {
+    // Not a refusal on the data: an encrypted member has to be at least its own
+    // encryption header long, so this is the archive contradicting itself.
+    return GARC_ERR_CORRUPT;
+  }
+
+  uint8_t header[GARC_ZIP_CRYPT_HEADER_SIZE];
+  GARC_Result result = zip_read_at(archive, data_offset, header, sizeof(header));
+  if (result != GARC_OK) {
+    return result;
+  }
+
+  // From the archive's keys rather than in place: every member starts from the
+  // same password-derived state, and the header mixes this member's 12 bytes into
+  // a copy of it.
+  uint32_t keys[3];
+  memcpy(keys, zip->crypt_keys, sizeof(keys));
+  garc_zip_crypt_decrypt(keys, header, sizeof(header));
+  if (!garc_zip_crypt_header_ok(header, zip->crc32, dos_time,
+          (zip->flags & ZIP_FLAG_DATA_DESCRIPTOR) != 0)) {
+    archive->data_refusal = GARC_ERR_PASSWORD_REJECTED;
+    return GARC_OK;
+  }
+
+  // The stream is left where zip_read_at() put it, which is one byte past the
+  // header - so the decrypting view reads the ciphertext from its first byte
+  // without a seek of its own, and the keys it is given are the ones the header
+  // produced.
+  result = garc_zip_crypt_stream_create(
+      archive->allocator, archive->stream, keys, &zip->crypt);
+  if (result != GARC_OK) {
+    return result;
+  }
+  *out_payload = zip->compressed_size - GARC_ZIP_CRYPT_HEADER_SIZE;
+  *out_source = zip->crypt;
+  return GARC_OK;
+}
+
 GARC_Result garc_zip_read(
     GARC_Archive * archive, void * buffer, size_t capacity, size_t * out_read) {
   GARC_Zip_State * zip = &archive->zip;
@@ -768,7 +840,13 @@ GARC_Result garc_zip_read(
       // call, and so that a second read after a refusal does not re-refuse.
       zip->crc_active = 0;
       if (gcomp_crc32_finalize(zip->running_crc) != zip->crc32) {
-        return GARC_ERR_CORRUPT;
+        // **For an encrypted member the cause cannot be named**, and the status
+        // says so rather than picking one. ZipCrypto has no authentication tag,
+        // so a key that got past the check byte - one wrong password in 256 - and
+        // a damaged ciphertext produce the same observation. Reporting
+        // GARC_ERR_CORRUPT here would send a caller looking for a damaged file
+        // when the answer is usually the password they typed.
+        return zip->crypt ? GARC_ERR_PASSWORD_OR_CORRUPT : GARC_ERR_CORRUPT;
       }
     }
     return GARC_OK;
@@ -787,8 +865,15 @@ GARC_Result garc_zip_read(
     want = (size_t)archive->data_remaining;
   }
 
-  GARC_Stream * source = zip->codec
-      ? garc_member_codec_stream(zip->codec) : archive->stream;
+  // Outermost first. A member can be decrypted, decompressed, both or neither,
+  // and the bytes a caller gets always come from the outermost of the three.
+  GARC_Stream * source = archive->stream;
+  if (zip->crypt) {
+    source = zip->crypt;
+  }
+  if (zip->codec) {
+    source = garc_member_codec_stream(zip->codec);
+  }
   size_t got = 0;
   GARC_Result result = garc_stream_read(source, buffer, want, &got);
   if (result != GARC_OK) {
@@ -811,6 +896,8 @@ GARC_Result garc_zip_read(
 GARC_Result garc_zip_skip(GARC_Archive * archive) {
   garc_member_codec_destroy(archive->zip.codec);
   archive->zip.codec = NULL;
+  garc_stream_destroy(archive->zip.crypt);
+  archive->zip.crypt = NULL;
   archive->zip.crc_active = 0;
   archive->data_remaining = 0;
   return GARC_OK;
@@ -832,6 +919,11 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   // leave an object whose view of the position is wrong.
   garc_member_codec_destroy(zip->codec);
   zip->codec = NULL;
+  // After the codec, which holds a slice of this: the decoder is the outer object
+  // and destroying the inner one first would leave its teardown reading freed
+  // memory. The same order as codec.c's own, for the same reason.
+  garc_stream_destroy(zip->crypt);
+  zip->crypt = NULL;
   zip->crc_active = 0;
   zip->running_crc = GCOMP_CRC32_INIT;
 
@@ -1041,34 +1133,71 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   archive->data_refusal = GARC_OK;
   const char * codec_name = zip_codec_name(zip->method);
 
-  if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE) {
-    // The metadata is in the clear and the data is not. Phase H decrypts AES and
-    // the ZipCrypto reader arrives before it; until then the refusal names the
-    // scheme rather than the absence of a feature.
+  uint64_t payload = compressed_size;
+  GARC_Stream * source = archive->stream;
+
+  // **The method is answered before the password, and the order is the point.**
+  // A member this library has no codec for is refused whatever the password, so
+  // asking for one first would send a caller to a prompt and then refuse them
+  // anyway. WinZip AES is in this arm rather than one of its own: method 99 has no
+  // codec here either, and garc_zip_member_encryption() is what tells a caller
+  // that what it is waiting for is AES rather than bzip2.
+  if (zip->method != GARC_ZIP_METHOD_STORED && !codec_name) {
     archive->data_refusal = GARC_ERR_UNSUPPORTED;
   }
-  else if (zip->method == GARC_ZIP_METHOD_STORED) {
-    if (compressed_size != size) {
-      // Stored means the two sizes are one number. A member that says otherwise
-      // describes something the method cannot do, and both numbers are things a
-      // reader seeks by.
-      return GARC_ERR_CORRUPT;
-    }
-    result = garc_stream_seek(archive->stream, data_offset);
+  else if (zip->encryption == GARC_ZIP_ENCRYPTION_ZIPCRYPTO) {
+    result = zip_setup_zipcrypto(archive, data_offset, dos_time, &payload,
+        &source);
     if (result != GARC_OK) {
       return result;
+    }
+  }
+  // **There is no arm for WinZip AES here, and that is not an omission.** A member
+  // is classified as AES only when its method field is 99, and 99 is a method
+  // zip_codec_name() does not name - so the arm above has already refused it. An
+  // `else if` for it would be a branch no input could take, which reads as an
+  // untested path rather than as an impossible one.
+
+  if (archive->data_refusal != GARC_OK) {
+    // Already refused: a method with no codec, or a ZipCrypto member with no
+    // password or a password the check byte rejected. Nothing below applies, and
+    // in particular no decoder is created - a member whose bytes a caller cannot
+    // have does not need one, and creating it would decompress ciphertext.
+  }
+  else if (zip->method == GARC_ZIP_METHOD_STORED) {
+    if (payload != size) {
+      // Stored means the two sizes are one number - the *payload*, which for an
+      // encrypted member is the compressed size less its encryption header. A
+      // member that says otherwise describes something the method cannot do, and
+      // both numbers are things a reader seeks by.
+      return GARC_ERR_CORRUPT;
+    }
+    if (source == archive->stream) {
+      // Only when the bytes come straight from the archive. An encrypted member's
+      // stream has already been positioned past the encryption header, and
+      // seeking the archive underneath a decrypting view would move it back.
+      result = garc_stream_seek(archive->stream, data_offset);
+      if (result != GARC_OK) {
+        return result;
+      }
     }
     zip->crc_active = 1;
   }
-  else if (codec_name) {
-    // Seek first: the decoder reads from wherever the stream is, and it reads
-    // lazily, so this is the only moment the position is known to be right.
-    result = garc_stream_seek(archive->stream, data_offset);
-    if (result != GARC_OK) {
-      return result;
+  else {
+    // A codec, necessarily: the arm above this chain refused every method that is
+    // neither stored nor named by zip_codec_name(), so reaching here means
+    // codec_name is set. Written as a plain `else` rather than as a condition that
+    // is always true, which would leave a branch no input can take.
+    if (source == archive->stream) {
+      // Seek first: the decoder reads from wherever the stream is, and it reads
+      // lazily, so this is the only moment the position is known to be right.
+      result = garc_stream_seek(archive->stream, data_offset);
+      if (result != GARC_OK) {
+        return result;
+      }
     }
-    result = garc_member_codec_create(archive->allocator, archive->stream,
-        codec_name, compressed_size, size, &zip->codec);
+    result = garc_member_codec_create(archive->allocator, source,
+        codec_name, payload, size, &zip->codec);
     if (result != GARC_OK) {
       // A method compress does not have after all, or no memory. Either way the
       // member's metadata is still good, so this is a refusal on the *data*
@@ -1086,11 +1215,6 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
       zip->crc_active = 1;
     }
   }
-  else {
-    // A method with no codec here. The refusal names the number through
-    // garc_zip_member_method(), which is what makes it a to-do list.
-    archive->data_refusal = GARC_ERR_UNSUPPORTED;
-  }
 
   zip->cursor = entry_end;
   zip->entries_seen++;
@@ -1105,15 +1229,26 @@ void garc_zip_rewind(GARC_Archive * archive) {
   // not start with a rewind.
   garc_member_codec_destroy(archive->zip.codec);
   archive->zip.codec = NULL;
+  garc_stream_destroy(archive->zip.crypt);
+  archive->zip.crypt = NULL;
   archive->zip.crc_active = 0;
   archive->zip.cursor = archive->zip.central_offset;
   archive->zip.entries_seen = 0;
+  // The password is not cleared here. It is the archive's, like the base offset
+  // and the comment, and a garc_find() that forgot it would refuse a member the
+  // same walk had just read.
 }
 
 void garc_zip_release(GARC_Archive * archive) {
   GARC_Zip_State * zip = &archive->zip;
   garc_member_codec_destroy(zip->codec);
   zip->codec = NULL;
+  garc_stream_destroy(zip->crypt);
+  zip->crypt = NULL;
+  // The derived keys are wiped: they are equivalent to the caller's password for
+  // this archive, and garc_close() is the last moment anything here can do that.
+  memset(zip->crypt_keys, 0, sizeof(zip->crypt_keys));
+  zip->have_password = 0;
   GARC_Buffer * const buffers[4] = {
     &zip->comment,
     &zip->name,
@@ -1220,6 +1355,21 @@ uint16_t garc_zip_member_version_made_by(const GARC_Archive * archive) {
 uint32_t garc_zip_member_external_attributes(const GARC_Archive * archive) {
   const GARC_Zip_State * zip = zip_state(archive);
   return zip ? zip->external_attributes : 0u;
+}
+
+GARC_Result garc_zip_set_password(
+    GARC_Archive * archive, const void * password, size_t length) {
+  if (!archive || archive->format != GARC_FORMAT_ZIP) {
+    return GARC_ERR_INVALID;
+  }
+  if (!password && length) {
+    return GARC_ERR_INVALID;
+  }
+  // Derived here and the password forgotten. See zip.h: the three words are all
+  // any member needs, so this is the only moment the caller's bytes are read.
+  garc_zip_crypt_derive(archive->zip.crypt_keys, password, length);
+  archive->zip.have_password = 1;
+  return GARC_OK;
 }
 
 GARC_Zip_Encryption garc_zip_member_encryption(const GARC_Archive * archive) {

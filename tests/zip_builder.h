@@ -40,6 +40,79 @@ namespace garctest {
 static const size_t GARC_ZIP_ZIP64_EOCD_SIZE_TEST = 56u;
 
 /** One member to write. */
+/**
+ * Encrypt a member's data with ZipCrypto, for a fixture no writer here produces.
+ *
+ * **This is the cipher's *encrypting* direction, which the library does not have
+ * and will never have** - writing ZipCrypto is refused permanently - so it is not
+ * a second copy of the code under test. It is validated the other way round: the
+ * corpus holds real encrypted archives from Info-ZIP, and
+ * ZipCrypto.EveryEncryptedMemberReadsWhatThreeProgramsDecrypt compares the
+ * reader's output against what Python, unzip and 7-Zip produce from them. What
+ * this adds is the fixtures none of those will write: a check byte from the wrong
+ * source, and a member whose CRC is wrong under a check byte that is right.
+ *
+ * The eleven filler bytes of the encryption header are fixed rather than random.
+ * A real writer uses random bytes - that is why `infozip-crypto.zip` has no digest
+ * in `CORPUS-ZIP` - and a fixture with random bytes would not be reproducible
+ * either.
+ *
+ * @param password The password.
+ * @param plain The bytes to encrypt, which for a compressed member are the
+ *   *compressed* bytes: the cipher is outermost.
+ * @param check_byte The twelfth header byte, which is what a reader compares.
+ * @return The 12-byte encryption header followed by the ciphertext.
+ */
+inline std::string zipcrypto_encrypt(const std::string & password,
+    const std::string & plain, uint8_t check_byte) {
+  uint32_t keys[3] = {305419896u, 591751049u, 878082192u};
+  const auto step = [](uint32_t crc, uint8_t byte) {
+    // One table step of CRC-32 with no inversion, which is the whole of the
+    // cipher's mixing function. Spelled out here rather than taken from
+    // `compress` so that this file depends on nothing the reader depends on.
+    static uint32_t table[256];
+    static bool ready = false;
+    if (!ready) {
+      for (uint32_t i = 0; i < 256u; ++i) {
+        uint32_t value = i;
+        for (int bit = 0; bit < 8; ++bit) {
+          value = (value & 1u) ? (0xEDB88320u ^ (value >> 1)) : (value >> 1);
+        }
+        table[i] = value;
+      }
+      ready = true;
+    }
+    return (crc >> 8) ^ table[(crc ^ byte) & 0xFFu];
+  };
+  const auto update = [&](uint8_t byte) {
+    keys[0] = step(keys[0], byte);
+    keys[1] += keys[0] & 0xFFu;
+    keys[1] = keys[1] * 134775813u + 1u;
+    keys[2] = step(keys[2], static_cast<uint8_t>(keys[1] >> 24));
+  };
+  const auto keystream = [&]() {
+    const uint32_t temp = (keys[2] | 2u) & 0xFFFFu;
+    return static_cast<uint8_t>(((temp * (temp ^ 1u)) >> 8) & 0xFFu);
+  };
+
+  for (const char byte : password) {
+    update(static_cast<uint8_t>(byte));
+  }
+  std::string header;
+  for (int i = 0; i < 11; ++i) {
+    header.push_back(static_cast<char>('A' + i));
+  }
+  header.push_back(static_cast<char>(check_byte));
+
+  std::string out;
+  for (const char byte : header + plain) {
+    const uint8_t clear = static_cast<uint8_t>(byte);
+    out.push_back(static_cast<char>(clear ^ keystream()));
+    update(clear);
+  }
+  return out;
+}
+
 struct ZipBuilderMember {
   std::string name;
   std::string data;

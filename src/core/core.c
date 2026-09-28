@@ -67,6 +67,18 @@ const char * garc_result_string(GARC_Result result) {
     // for the field to raise will not find it.
     case GARC_ERR_LIMIT_CODEC_BYTES:
       return "Limit exceeded: the codec's output cap, in its own options";
+    // Three statuses where a lesser reader has one, and the third one names two
+    // causes on purpose. See the enum: at the encryption header a wrong password
+    // and a corrupt header are the same observation with one byte of evidence,
+    // and at the CRC they are the same observation with no way at all to
+    // separate them, because ZipCrypto carries no authentication tag.
+    case GARC_ERR_PASSWORD_REQUIRED:
+      return "The member is encrypted and no password was given";
+    case GARC_ERR_PASSWORD_REJECTED:
+      return "Password rejected by the encryption header's check byte";
+    case GARC_ERR_PASSWORD_OR_CORRUPT:
+      return "Wrong password or corrupt member; this cipher cannot tell them "
+             "apart";
     case GARC_RESULT_COUNT:
     default:
       return "Unknown error";

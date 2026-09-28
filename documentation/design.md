@@ -569,6 +569,73 @@ archive to walk. So the refusal lives on the read rather than on the walk, and
 `garc_read_member()` answers it before the size check - a zero-length member of an
 unreadable kind must not read as a successful end of data.
 
+#### ZipCrypto, and why a wrong password needs three statuses
+
+`garc_zip_set_password()` decrypts the traditional PKWARE cipher. **The whole
+cipher is CRC-32**, which is why it needed no cryptography library and landed with
+the rest of zip rather than behind `security`: three 32-bit words are mixed with
+each plaintext byte, and two of the three steps are one table lookup of the CRC-32
+polynomial - `gcomp_crc32_update()` over a single byte, exactly, because that
+function operates on the unfinalized running value and the cipher's step has no
+inversion in it either.
+
+It is broken - Biham and Kocher's 1994 attack recovers the keys from about a dozen
+known plaintext bytes, and a zip is full of known bytes - and that is not a reason
+to refuse reading what exists in the world. **Writing it is refused permanently**,
+because no option name makes shipping a cipher we know is broken honest.
+
+Three decisions worth arguing about:
+
+**The password is derived and not kept.** Every member starts from the same
+three words, so those are stored and the caller's bytes are read once. A memory
+disclosure then hands over key material for one archive rather than a password that
+may be reused elsewhere, and an empty password becomes representable - which a
+zero-length buffer would not be, and which is a distinct answer from never having
+supplied one.
+
+**Decryption is a stream, not a transform.** ZipCrypto encrypts the *compressed*
+bytes, so for a deflated member the layering is decrypt-then-inflate: the decrypting
+view sits under the bounded slice the decoder reads. Getting that the other way
+round reads a stored member correctly and a deflated one not at all, which is why
+the corpus has `infozip-crypto-deflate.zip` as well as `infozip-crypto.zip`.
+
+**A wrong password gets three statuses and not one**, because the cipher makes it
+distinguishable to three different degrees. The failure to avoid is
+`limit-bounds-not-status` in a new costume: one code for all three cannot tell a
+wrong password from a damaged member.
+
+| status | when | evidence |
+| --- | --- | --- |
+| `GARC_ERR_PASSWORD_REQUIRED` | encrypted, none supplied | unambiguous |
+| `GARC_ERR_PASSWORD_REJECTED` | the encryption header's check byte disagreed | one byte; catches 255 wrong passwords in 256, and the only other cause is a corrupt header |
+| `GARC_ERR_PASSWORD_OR_CORRUPT` | the member decrypted and its CRC-32 disagreed | **none that separates the two causes** |
+
+The third names two causes on purpose. ZipCrypto has no authentication tag, so a
+key that got past the check byte and a corrupted ciphertext produce the same
+observation; reporting `GARC_ERR_CORRUPT` would claim the data is at fault and
+`GARC_ERR_PASSWORD_REJECTED` would claim the password is, and both would be a guess
+dressed as a finding. WinZip AES is what fixed this, with an HMAC, and phase H is
+where this stops being the only answer available.
+
+**The check byte has two conventions and the corpus decided which to implement.**
+APPNOTE says the twelfth header byte is the high byte of the member's CRC-32.
+Info-ZIP sets general purpose flag bit 3 on every encrypted member it writes - the
+sizes and the CRC go in a data descriptor *after* the data, so there is no CRC to
+derive it from - and uses the high byte of the DOS time instead. In
+`infozip-crypto.zip` the check byte is `0x0D` and the CRC's high byte is `0x51`: a
+reader that knew only APPNOTE's convention would reject the correct password for
+every encrypted archive `zip` has ever produced. Both are accepted, the time's only
+when bit 3 is set, which is what unzip does - and the test that pins it is a pair of
+built archives differing in that bit alone, because no writer here produces the
+APPNOTE convention at all.
+
+**The method is answered before the password**, which is a choice rather than an
+accident. A member whose method has no codec here can only be refused, so asking
+for a password first would send a caller to a prompt and refuse them anyway. WinZip
+AES falls in that arm - method 99 has no codec either - and
+`garc_zip_member_encryption()` is what says the thing being waited for is AES rather
+than bzip2.
+
 ### Times, modes and types, each from the field that is allowed to say
 
 **Three fields can carry an mtime** and the most precise wins: the 0x000a NTFS

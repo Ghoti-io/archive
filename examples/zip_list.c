@@ -43,13 +43,26 @@
  * front of it that its own offsets do not count, and this is where a caller
  * finds out how many - the library worked it out rather than reading it.
  *
- * Usage: zip_list <path.zip>
+ * **A password is optional and is set on the archive, not on a member.** With one,
+ * ZipCrypto members are read like any other; without one they are listed and their
+ * data is refused by ::GARC_ERR_PASSWORD_REQUIRED, which is a different answer from
+ * a method with no codec and is printed as itself. A wrong password is
+ * ::GARC_ERR_PASSWORD_REJECTED at the encryption header, or
+ * ::GARC_ERR_PASSWORD_OR_CORRUPT at the CRC if it slipped past - and this program
+ * prints whichever arrived rather than collapsing them, because that distinction is
+ * the whole reason there are three.
+ *
+ * Taking a password on the command line is fine for an example and wrong for a
+ * tool: it lands in the shell's history and in `ps`. A real program prompts.
+ *
+ * Usage: zip_list <path.zip> [password]
  */
 
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <ghoti.io/archive/archive.h>
 
@@ -104,12 +117,13 @@ static void print_escaped(const char * bytes, size_t length) {
  * List one zip's members.
  *
  * @param argc Argument count.
- * @param argv `argv[1]` is the archive to read.
+ * @param argv `argv[1]` is the archive to read; `argv[2]`, if given, is the
+ *   password for its encrypted members.
  * @return 0 on success, 1 on any failure, 2 on a usage error.
  */
 int main(int argc, char ** argv) {
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s <path.zip>\n", argv[0]);
+  if (argc < 2 || argc > 3) {
+    fprintf(stderr, "usage: %s <path.zip> [password]\n", argv[0]);
     return 2;
   }
 
@@ -154,6 +168,20 @@ int main(int argc, char ** argv) {
     return 1;
   }
 
+  if (argc == 3) {
+    // Set once, for the archive. Every member's keys start from the same three
+    // words, so there is nothing per-member to do - and the library forgets these
+    // bytes as soon as it has derived them.
+    result = garc_zip_set_password(archive, argv[2], strlen(argv[2]));
+    if (result != GARC_OK) {
+      fprintf(stderr, "password: %s\n", garc_result_string(result));
+      garc_close(archive);
+      garc_stream_destroy(stream);
+      fclose(file);
+      return 1;
+    }
+  }
+
   printf("%s: %" PRIu64 " members declared%s", argv[1],
       garc_zip_declared_members(archive),
       garc_zip_has_zip64_end_record(archive) ? ", zip64" : "");
@@ -172,6 +200,7 @@ int main(int argc, char ** argv) {
   }
 
   uint64_t unreadable = 0;
+  uint64_t locked = 0;
   const GARC_Member * member = NULL;
   while ((result = garc_next(archive, &member)) == GARC_OK) {
     const uint16_t method = garc_zip_member_method(archive);
@@ -209,6 +238,16 @@ int main(int argc, char ** argv) {
       ++unreadable;
       continue;
     }
+    if (data == GARC_ERR_PASSWORD_REQUIRED || data == GARC_ERR_PASSWORD_REJECTED
+        || data == GARC_ERR_PASSWORD_OR_CORRUPT) {
+      // Printed as itself and counted separately from an unsupported method,
+      // because the caller's next move differs: one of these is answered by
+      // supplying or changing a password and the other is answered by waiting for
+      // a release. Collapsing them is what makes a refusal a dead end.
+      fprintf(stderr, "  %s: %s\n", member->name, garc_result_string(data));
+      ++locked;
+      continue;
+    }
     if (data != GARC_OK) {
       fprintf(stderr, "  reading that member: %s\n", garc_result_string(data));
       break;
@@ -235,6 +274,9 @@ int main(int argc, char ** argv) {
   if (unreadable) {
     printf(", %" PRIu64 " with a method this build cannot decompress",
         unreadable);
+  }
+  if (locked) {
+    printf(", %" PRIu64 " the password did not open", locked);
   }
   putchar('\n');
 

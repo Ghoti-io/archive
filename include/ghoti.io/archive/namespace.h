@@ -159,6 +159,7 @@
 #define garc_zip_member_version_made_by                                        \
   GHOTIIO_ARCHIVE(garc_zip_member_version_made_by)
 #define garc_zip_method_string GHOTIIO_ARCHIVE(garc_zip_method_string)
+#define garc_zip_set_password GHOTIIO_ARCHIVE(garc_zip_set_password)
 
 // Internal names. Hidden by -fvisibility=hidden and so unable to collide, but
 // renamed anyway so that there is one rule rather than two.
@@ -175,6 +176,12 @@
 #define garc_tar_parse_uint GHOTIIO_ARCHIVE(garc_tar_parse_uint)
 #define garc_tar_write_end GHOTIIO_ARCHIVE(garc_tar_write_end)
 #define garc_tar_write_member GHOTIIO_ARCHIVE(garc_tar_write_member)
+#define garc_zip_crypt_decrypt GHOTIIO_ARCHIVE(garc_zip_crypt_decrypt)
+#define garc_zip_crypt_derive GHOTIIO_ARCHIVE(garc_zip_crypt_derive)
+#define garc_zip_crypt_header_ok                                               \
+  GHOTIIO_ARCHIVE(garc_zip_crypt_header_ok)
+#define garc_zip_crypt_stream_create                                           \
+  GHOTIIO_ARCHIVE(garc_zip_crypt_stream_create)
 #define garc_zip_dos_to_epoch GHOTIIO_ARCHIVE(garc_zip_dos_to_epoch)
 #define garc_zip_filetime_to_epoch GHOTIIO_ARCHIVE(garc_zip_filetime_to_epoch)
 #define garc_zip_identify GHOTIIO_ARCHIVE(garc_zip_identify)
@@ -184,8 +191,10 @@
 #define garc_zip_locate_eocd GHOTIIO_ARCHIVE(garc_zip_locate_eocd)
 #define garc_zip_next GHOTIIO_ARCHIVE(garc_zip_next)
 #define garc_zip_open GHOTIIO_ARCHIVE(garc_zip_open)
+#define garc_zip_read GHOTIIO_ARCHIVE(garc_zip_read)
 #define garc_zip_release GHOTIIO_ARCHIVE(garc_zip_release)
 #define garc_zip_rewind GHOTIIO_ARCHIVE(garc_zip_rewind)
+#define garc_zip_skip GHOTIIO_ARCHIVE(garc_zip_skip)
 
 /// @endcond
 

@@ -229,6 +229,23 @@ typedef struct {
   int is_zip64;
   /** The archive comment, as bytes. Empty when there is none. */
   GARC_Buffer comment;
+  /**
+   * The three ZipCrypto key words, with the password already mixed in.
+   *
+   * **The password itself is never kept.** Its only role is to produce these,
+   * and every member starts from this same state, so storing the derived words
+   * means the plaintext password is not in this library's memory for the life of
+   * the archive. It also makes an empty password representable, which a
+   * zero-length buffer would not be - hence @ref have_password beside it rather
+   * than a length.
+   *
+   * Set by ::garc_zip_set_password() and deliberately untouched by
+   * ::garc_zip_rewind(): a password is a property of the archive, not of where
+   * the walk is.
+   */
+  uint32_t crypt_keys[3];
+  /** Whether ::garc_zip_set_password() has been called. */
+  int have_password;
   /** @} */
 
   /**
@@ -264,6 +281,16 @@ typedef struct {
    * costs one allocation per compressed member and no I/O.
    */
   struct GARC_Member_Codec * codec;
+  /**
+   * The decrypting view of this member's data, or NULL.
+   *
+   * Non-NULL only for a ZipCrypto member whose check byte agreed. It sits
+   * *under* @ref codec when the member is also compressed, because ZipCrypto
+   * encrypts the compressed bytes - so the layering is decrypt then inflate, and
+   * getting it the other way round reads a stored member correctly and a deflated
+   * one not at all. Destroyed after @ref codec, which holds a slice of it.
+   */
+  GARC_Stream * crypt;
   /**
    * CRC-32 of the bytes handed to the caller so far, unfinalized.
    *

@@ -18,6 +18,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@
 #include "failing_allocator.h"
 #include "test_helpers.h"
 #include "zip_builder.h"
+#include "zip/zip_internal.h"
 
 using garctest::BufferSource;
 using garctest::FailingAllocator;
@@ -137,6 +139,69 @@ void add_compressed(ZipBuilder & builder, const std::string & name,
   builder.last().central_size = static_cast<uint32_t>(plain.size());
 }
 
+/** The password every encrypted fixture in this file is built with. */
+const char kPassword[] = "builder-password";
+
+/** Which convention a built member's check byte follows. */
+enum class CheckByte {
+  FromCrc,     ///< The high byte of the CRC-32, which is what APPNOTE says.
+  FromDosTime, ///< The high byte of the DOS time, which Info-ZIP uses with bit 3.
+  Wrong,       ///< Neither, which is what a wrong password looks like.
+};
+
+/**
+ * Add a ZipCrypto member, with the check byte from a convention of our choosing.
+ *
+ * The declared compressed size includes the 12-byte encryption header, which is
+ * how a real archive describes one - so this is also the fixture that would catch
+ * a reader subtracting it in the wrong place.
+ *
+ * @param builder The archive under construction.
+ * @param name The member's name.
+ * @param plain The *payload*, already compressed if the member is.
+ * @param declared_size What the member declares its uncompressed size to be.
+ * @param crc The CRC-32 to declare.
+ * @param which Where the check byte comes from.
+ * @param method The compression method to declare.
+ */
+void add_encrypted(ZipBuilder & builder, const std::string & name,
+    const std::string & plain, uint32_t declared_size, uint32_t crc,
+    CheckByte which, uint16_t method = GARC_ZIP_METHOD_STORED) {
+  const uint16_t dos_time = 0x0DD4u;
+  uint8_t check = 0;
+  switch (which) {
+    case CheckByte::FromCrc:
+      check = static_cast<uint8_t>(crc >> 24);
+      break;
+    case CheckByte::FromDosTime:
+      check = static_cast<uint8_t>(dos_time >> 8);
+      break;
+    case CheckByte::Wrong:
+      // Neither convention, and not equal to either by accident: both are
+      // computed above and this is one more than the CRC's, which cannot equal
+      // the time's unless the CRC does.
+      check = static_cast<uint8_t>((crc >> 24) + 1u);
+      if (check == static_cast<uint8_t>(dos_time >> 8)) {
+        check = static_cast<uint8_t>(check + 1u);
+      }
+      break;
+  }
+  const std::string body = garctest::zipcrypto_encrypt(kPassword, plain, check);
+  builder.add(name, body);
+  builder.last().method = method;
+  builder.last().flags = 0x0001u;
+  if (which == CheckByte::FromDosTime) {
+    // Bit 3 as well, because the DOS-time convention exists *because* the CRC is
+    // not known when the header is written. A reader that accepted the time's
+    // byte without it would accept one more wrong password in 256.
+    builder.last().flags |= 0x0008u;
+  }
+  builder.last().crc = crc;
+  builder.last().override_sizes = true;
+  builder.last().central_compressed_size = static_cast<uint32_t>(body.size());
+  builder.last().central_size = declared_size;
+}
+
 /**
  * Every shape a sweep has to cover, because each reads something the others do
  * not.
@@ -189,6 +254,29 @@ std::vector<std::pair<std::string, std::vector<uint8_t>>> shapes() {
     add_compressed(builder, "packed.txt", std::string(600u, 'p'),
         GARC_ZIP_METHOD_DEFLATE, "deflate");
     out.emplace_back("deflated", builder.build());
+  }
+  {
+    // An encrypted member: one more read for the encryption header, one more
+    // allocation for the decrypting view, and a read arm that is neither the
+    // stream's nor the decoder's. The sweeps set the password, so these shapes
+    // reach past the refusal rather than stopping at it.
+    ZipBuilder builder;
+    const std::string plain = "hello, archive\n";
+    add_encrypted(builder, "secret.txt", plain,
+        static_cast<uint32_t>(plain.size()), ZipBuilder::crc32(plain),
+        CheckByte::FromCrc);
+    out.emplace_back("encrypted", builder.build());
+  }
+  {
+    // And encryption *around* a codec, which is the deepest stack the reader
+    // builds: archive stream, decrypting view, bounded slice, decoder.
+    ZipBuilder builder;
+    const std::string plain(600u, 'q');
+    const std::string packed = compress_with("deflate", plain);
+    add_encrypted(builder, "packed-secret.txt", packed,
+        static_cast<uint32_t>(plain.size()), ZipBuilder::crc32(plain),
+        CheckByte::FromCrc, GARC_ZIP_METHOD_DEFLATE);
+    out.emplace_back("encrypted deflate", builder.build());
   }
   return out;
 }
@@ -1267,6 +1355,13 @@ TEST(ZipStructure, AReadFailureAtEveryStageIsReportedAsItself) {
       GARC_Archive * archive = nullptr;
       const GARC_Result opened = garc_open(stream, nullptr, &archive);
       if (opened == GARC_OK) {
+        // **The password, so the encrypted shapes are swept and not merely
+        // refused.** Without it the two encrypted shapes stop at
+        // GARC_ERR_PASSWORD_REQUIRED before a byte of the encryption header is
+        // read, and the cipher's read, seek and allocation arms would be in the
+        // population without ever being reached - the failure this file's shapes()
+        // comment is about, in a new costume.
+        garc_zip_set_password(archive, kPassword, sizeof(kPassword) - 1u);
         const GARC_Member * member = nullptr;
         GARC_Result result;
         while ((result = garc_next(archive, &member)) == GARC_OK) {
@@ -1314,6 +1409,7 @@ TEST(ZipStructure, ASeekFailureAtEveryStageIsReportedAsItself) {
       GARC_Archive * archive = nullptr;
       const GARC_Result opened = garc_open(stream, nullptr, &archive);
       if (opened == GARC_OK) {
+        garc_zip_set_password(archive, kPassword, sizeof(kPassword) - 1u);
         const GARC_Member * member = nullptr;
         GARC_Result result;
         while ((result = garc_next(archive, &member)) == GARC_OK) {
@@ -1695,10 +1791,13 @@ TEST(ZipStructure, AFailedAllocationIsReportedRatherThanCrashed) {
     const GARC_Result opened = garc_open_with_allocator(stream, nullptr,
         allocator.get(), &archive);
     if (opened == GARC_OK) {
+      garc_zip_set_password(archive, kPassword, sizeof(kPassword) - 1u);
       const GARC_Member * member = nullptr;
       while (garc_next(archive, &member) == GARC_OK) {
         // Walking on whatever budget is left; the point is that a failure is a
-        // status rather than a crash, wherever it lands.
+        // status rather than a crash, wherever it lands. An encrypted member adds
+        // one allocation - the decrypting view - so the budgets have to reach
+        // past what the other shapes need.
       }
       garc_close(archive);
     }
@@ -1708,6 +1807,276 @@ TEST(ZipStructure, AFailedAllocationIsReportedRatherThanCrashed) {
     garc_stream_destroy(stream);
   }
   }
+}
+
+//-----------------------------------------------------------------------------
+// ZipCrypto, for the shapes no writer will produce
+//-----------------------------------------------------------------------------
+
+TEST(ZipCrypto, ACheckByteFromTheCrcIsAccepted) {
+  // APPNOTE's convention, which the corpus does not contain: Info-ZIP sets bit 3
+  // on every encrypted member it writes and uses the DOS time's byte instead, so
+  // this arm has no fixture from a real writer and would otherwise be untested
+  // while looking covered.
+  const std::string plain = "hello, archive\n";
+  ZipBuilder builder;
+  add_encrypted(builder, "secret.txt", plain,
+      static_cast<uint32_t>(plain.size()), ZipBuilder::crc32(plain),
+      CheckByte::FromCrc);
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+                sizeof(kPassword) - 1u),
+      GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  EXPECT_EQ(garc_zip_member_flags(built.archive()) & 0x0008u, 0u)
+      << "no data descriptor, so only the CRC convention can be what accepted it";
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_OK);
+  EXPECT_EQ(out, plain);
+}
+
+TEST(ZipCrypto, TheDosTimeConventionNeedsTheDataDescriptorBit) {
+  // **The discriminating pair.** The same archive twice, differing only in bit 3:
+  // with it the DOS time's high byte is an accepted check byte, without it the
+  // same byte is a rejection. A reader that accepted the time unconditionally
+  // would pass the first and also the second, and would accept one more wrong
+  // password in 256 on every archive in the world.
+  const std::string plain = "hello, archive\n";
+  const uint32_t crc = ZipBuilder::crc32(plain);
+
+  ZipBuilder with;
+  add_encrypted(with, "secret.txt", plain, static_cast<uint32_t>(plain.size()),
+      crc, CheckByte::FromDosTime);
+  Built accepted(with.build());
+  ASSERT_EQ(accepted.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(accepted.archive(), kPassword,
+                sizeof(kPassword) - 1u),
+      GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(accepted.archive(), &member), GARC_OK);
+  ASSERT_EQ(garc_zip_member_flags(accepted.archive()) & 0x0008u, 0x0008u);
+  std::string out;
+  EXPECT_EQ(read_member(accepted.archive(), &out), GARC_OK);
+  EXPECT_EQ(out, plain);
+
+  // And the CRC's high byte has to differ from the time's, or the pair below
+  // proves nothing.
+  ASSERT_NE(static_cast<uint8_t>(crc >> 24), static_cast<uint8_t>(0x0DD4u >> 8));
+
+  ZipBuilder without;
+  add_encrypted(without, "secret.txt", plain,
+      static_cast<uint32_t>(plain.size()), crc, CheckByte::FromDosTime);
+  without.last().flags = 0x0001u; // Bit 3 cleared, everything else identical.
+  Built refused(without.build());
+  ASSERT_EQ(refused.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(refused.archive(), kPassword,
+                sizeof(kPassword) - 1u),
+      GARC_OK);
+  ASSERT_EQ(garc_next(refused.archive(), &member), GARC_OK);
+  std::string nothing;
+  EXPECT_EQ(read_member(refused.archive(), &nothing),
+      GARC_ERR_PASSWORD_REJECTED);
+  EXPECT_TRUE(nothing.empty());
+}
+
+TEST(ZipCrypto, AWrongCheckByteIsRejectedWithTheRightPassword) {
+  // The other half of the same condition: the password is correct and the check
+  // byte follows neither convention, which is what a corrupt encryption header
+  // looks like. The status names the password anyway, because that is what it is
+  // 255 times in 256 - and because a caller can act on it.
+  const std::string plain = "hello, archive\n";
+  ZipBuilder builder;
+  add_encrypted(builder, "secret.txt", plain,
+      static_cast<uint32_t>(plain.size()), ZipBuilder::crc32(plain),
+      CheckByte::Wrong);
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+                sizeof(kPassword) - 1u),
+      GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_ERR_PASSWORD_REJECTED);
+}
+
+TEST(ZipCrypto, AWrongCrcUnderARightCheckByteCannotBeAttributed) {
+  // **The pair that justifies a third status.** Two archives with the same wrong
+  // CRC: one encrypted, one not. The unencrypted one is GARC_ERR_CORRUPT, because
+  // nothing else could have gone wrong. The encrypted one is
+  // GARC_ERR_PASSWORD_OR_CORRUPT, because ZipCrypto carries no authentication tag
+  // and a key that got past the check byte is indistinguishable from a damaged
+  // ciphertext. Reporting GARC_ERR_CORRUPT for both would send a caller looking
+  // for a broken file when the answer is usually the password they typed.
+  const std::string plain = "hello, archive\n";
+  const uint32_t lie = ZipBuilder::crc32(plain) ^ 0x1u;
+
+  ZipBuilder clear;
+  clear.add("plain.txt", plain);
+  clear.last().crc = lie;
+  Built unencrypted(clear.build());
+  ASSERT_EQ(unencrypted.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(unencrypted.archive(), &member), GARC_OK);
+  std::string out;
+  EXPECT_EQ(read_member(unencrypted.archive(), &out), GARC_ERR_CORRUPT);
+  EXPECT_EQ(out, plain) << "the bytes that were there are still handed over";
+
+  ZipBuilder sealed;
+  // The check byte comes from the declared CRC, so it agrees: the member gets all
+  // the way to the end and only then disagrees, which is the case this status is
+  // for.
+  add_encrypted(sealed, "secret.txt", plain,
+      static_cast<uint32_t>(plain.size()), lie, CheckByte::FromCrc);
+  Built encrypted(sealed.build());
+  ASSERT_EQ(encrypted.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(encrypted.archive(), kPassword,
+                sizeof(kPassword) - 1u),
+      GARC_OK);
+  ASSERT_EQ(garc_next(encrypted.archive(), &member), GARC_OK);
+  std::string decrypted;
+  EXPECT_EQ(read_member(encrypted.archive(), &decrypted),
+      GARC_ERR_PASSWORD_OR_CORRUPT);
+  EXPECT_EQ(decrypted, plain);
+}
+
+TEST(ZipCrypto, AMemberTooShortForItsEncryptionHeaderIsCorrupt) {
+  // An encrypted member has to be at least its own 12-byte header long. This is
+  // the archive contradicting itself rather than anything about the password, so
+  // it fails the walk instead of refusing the data - and it is checked before the
+  // header is read, so there is no 12-byte read off the end of a 4-byte member.
+  ZipBuilder builder;
+  builder.add("secret.txt", "tiny");
+  builder.last().flags = 0x0001u;
+  builder.last().override_sizes = true;
+  builder.last().central_compressed_size = 4u;
+  builder.last().central_size = 4u;
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+                sizeof(kPassword) - 1u),
+      GARC_OK);
+  EXPECT_EQ(built.walk(), GARC_ERR_CORRUPT);
+}
+
+TEST(ZipCrypto, AStoredMemberWhoseSizesDisagreeAboutTheHeaderIsCorrupt) {
+  // Stored means the two sizes are one number - and for an encrypted member that
+  // number is the compressed size *less* the 12-byte header. A member whose sizes
+  // are equal is therefore wrong by exactly the header, which is the mistake a
+  // reader subtracting it in the wrong place would make and then not notice.
+  const std::string plain = "hello, archive\n";
+  ZipBuilder builder;
+  add_encrypted(builder, "secret.txt", plain,
+      static_cast<uint32_t>(plain.size()), ZipBuilder::crc32(plain),
+      CheckByte::FromCrc);
+  // 27 is right; 15 claims the header is not there.
+  builder.last().central_compressed_size = static_cast<uint32_t>(plain.size());
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+                sizeof(kPassword) - 1u),
+      GARC_OK);
+  EXPECT_EQ(built.walk(), GARC_ERR_CORRUPT);
+}
+
+TEST(ZipCrypto, AMethodWithNoCodecIsRefusedBeforeThePasswordIsAskedFor) {
+  // **The order of two refusals, asserted because it is a choice.** A member that
+  // is both encrypted and compressed with a method this library has no codec for
+  // can only be answered one way, and the useful answer is the one the caller
+  // cannot fix: no password will make bzip2 decodable here, so asking for one
+  // first would send them to a prompt and refuse them anyway.
+  ZipBuilder builder;
+  builder.add("secret.txt", std::string(40u, 'z'));
+  builder.last().method = GARC_ZIP_METHOD_BZIP2;
+  builder.last().flags = 0x0001u;
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  EXPECT_EQ(garc_zip_member_encryption(built.archive()),
+      GARC_ZIP_ENCRYPTION_ZIPCRYPTO);
+  std::string out;
+  // No password set, and the answer is still about the method.
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_ERR_UNSUPPORTED);
+}
+
+TEST(ZipCrypto, TheDecryptingStreamRefusesItsOwnBadArguments) {
+  // Called directly, because nothing the public API can be handed reaches these
+  // two lines: the reader always passes a stream and a key set. They are still a
+  // contract - every `*_create` in this library refuses a NULL out-parameter and
+  // takes the default allocator for a NULL one - and an untested contract is one
+  // the next caller of this function finds out about the hard way.
+  uint32_t keys[3] = {0, 0, 0};
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(garc_stream_create_memory("x", 1u, &inner), GARC_OK);
+  GARC_Stream * out = nullptr;
+  EXPECT_EQ(garc_zip_crypt_stream_create(nullptr, nullptr, keys, &out),
+      GARC_ERR_INVALID);
+  EXPECT_EQ(garc_zip_crypt_stream_create(nullptr, inner, nullptr, &out),
+      GARC_ERR_INVALID);
+  EXPECT_EQ(garc_zip_crypt_stream_create(nullptr, inner, keys, nullptr),
+      GARC_ERR_INVALID);
+  // And a NULL allocator is the default one rather than an error, which is the
+  // other of the two lines.
+  ASSERT_EQ(garc_zip_crypt_stream_create(nullptr, inner, keys, &out), GARC_OK);
+  garc_stream_destroy(out);
+  garc_stream_destroy(inner);
+}
+
+TEST(ZipCrypto, TheKeysAreDerivedFromThePasswordAndNothingElse) {
+  // Two derivations of the same password give the same three words, and a
+  // different password gives different ones. Asserted because this is the whole
+  // reason the password is not kept: if the keys were not a function of the
+  // password alone, forgetting it would lose something.
+  uint32_t first[3];
+  uint32_t second[3];
+  uint32_t other[3];
+  garc_zip_crypt_derive(first, kPassword, sizeof(kPassword) - 1u);
+  garc_zip_crypt_derive(second, kPassword, sizeof(kPassword) - 1u);
+  garc_zip_crypt_derive(other, "different", 9u);
+  EXPECT_EQ(std::memcmp(first, second, sizeof(first)), 0);
+  EXPECT_NE(std::memcmp(first, other, sizeof(first)), 0);
+  // An empty password is a derivation, not a no-op: the seed is mixed with
+  // nothing, so the keys are the published initial values.
+  uint32_t empty[3];
+  garc_zip_crypt_derive(empty, nullptr, 0u);
+  EXPECT_EQ(empty[0], 305419896u);
+  EXPECT_EQ(empty[1], 591751049u);
+  EXPECT_EQ(empty[2], 878082192u);
+}
+
+TEST(ZipCrypto, SkippingAnEncryptedMemberLeavesTheWalkIntact) {
+  // A caller that does not want a member's bytes must not be made to decrypt them
+  // to reach the next one - which in a zip is free, because the next member's
+  // position comes from the central directory. The decrypting view is dropped with
+  // the decoder, and the CRC verdict goes with it: half a member has no checksum.
+  const std::string first = "hello, archive\n";
+  const std::string second = "and another\n";
+  ZipBuilder builder;
+  add_encrypted(builder, "first.txt", first, static_cast<uint32_t>(first.size()),
+      ZipBuilder::crc32(first), CheckByte::FromCrc);
+  add_encrypted(builder, "second.txt", second,
+      static_cast<uint32_t>(second.size()), ZipBuilder::crc32(second),
+      CheckByte::FromCrc);
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+                sizeof(kPassword) - 1u),
+      GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  char buffer[4];
+  size_t got = 0;
+  ASSERT_EQ(garc_read_member(built.archive(), buffer, sizeof(buffer), &got),
+      GARC_OK);
+  ASSERT_EQ(got, 4u);
+  EXPECT_EQ(garc_skip_member(built.archive()), GARC_OK);
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_OK);
+  EXPECT_EQ(out, second);
 }
 
 } // namespace
