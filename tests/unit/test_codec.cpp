@@ -45,6 +45,7 @@
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/options.h>
 
+#include "codec/codec_internal.h"
 #include "test_helpers.h"
 
 using garctest::BufferDrain;
@@ -660,7 +661,10 @@ TEST(Codec, AFailingSourceIsReported) {
   garc_stream_destroy(file);
 }
 
-TEST(Codec, AZeroSizedReadAsksTheCodecForNothing) {
+TEST(Codec, AZeroSizedReadIsAnsweredBeforeTheCodecSeesIt) {
+  // garc_stream_read() answers a zero-length read itself, so this pins the
+  // behaviour a caller sees rather than a guard inside the codec - which is why
+  // there is no such guard: it would be a line nothing could reach.
   std::string packed;
   ASSERT_EQ(GARC_OK, pack("gzip", small_entries(), &packed));
   GARC_Stream * file = nullptr;
@@ -720,6 +724,86 @@ TEST(Codec, EveryAllocationOnTheWayToAStreamCanFail) {
     EXPECT_EQ(0u, allocator.live()) << "leaked on request " << nth;
   }
   garc_stream_destroy(file);
+}
+
+////////////////////////////////////////////////////////////////////////
+// The status table
+////////////////////////////////////////////////////////////////////////
+
+TEST(Codec, EveryCompressStatusMapsToSomethingChosen) {
+  // Enumerated rather than sampled. Three of these rows are all the public API
+  // can provoke, and the other five would be a wrong status arriving silently -
+  // GCOMP_ERR_MEMORY reported as an internal error rather than GARC_ERR_OOM is a
+  // caller who retries instead of freeing something.
+  EXPECT_EQ(GARC_OK, garc_codec_result(GCOMP_OK));
+  EXPECT_EQ(GARC_ERR_INVALID, garc_codec_result(GCOMP_ERR_INVALID_ARG));
+  EXPECT_EQ(GARC_ERR_OOM, garc_codec_result(GCOMP_ERR_MEMORY));
+  EXPECT_EQ(GARC_ERR_LIMIT_CODEC_BYTES, garc_codec_result(GCOMP_ERR_LIMIT));
+  EXPECT_EQ(GARC_ERR_CORRUPT, garc_codec_result(GCOMP_ERR_CORRUPT));
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED, garc_codec_result(GCOMP_ERR_UNSUPPORTED));
+  EXPECT_EQ(GARC_ERR_INTERNAL, garc_codec_result(GCOMP_ERR_INTERNAL));
+  EXPECT_EQ(GARC_ERR_IO, garc_codec_result(GCOMP_ERR_IO));
+}
+
+TEST(Codec, NoCompressStatusMapsToEndOrToALimitThatIsNotItsOwn) {
+  // Two claims about the table as a whole rather than about a row. GARC_END is
+  // not a failure, so a codec failure mapped onto it would be read as the end of
+  // an archive; and the only cap a codec can report is its own.
+  for (int i = 0; i <= GCOMP_ERR_IO; ++i) {
+    const gcomp_status_t status = static_cast<gcomp_status_t>(i);
+    const GARC_Result result = garc_codec_result(status);
+    SCOPED_TRACE(i);
+    EXPECT_NE(GARC_END, result);
+    if (garc_result_is_limit(result)) {
+      EXPECT_EQ(GARC_ERR_LIMIT_CODEC_BYTES, result);
+    }
+    EXPECT_EQ(status == GCOMP_OK, result == GARC_OK);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////
+// Two arms the round trips do not reach
+////////////////////////////////////////////////////////////////////////
+
+TEST(Codec, ReadingPastTheEndKeepsReturningZero) {
+  // A caller that reads once more after the end should get another zero rather
+  // than a failure or a restarted decoder.
+  std::string packed;
+  ASSERT_EQ(GARC_OK, pack("gzip", small_entries(), &packed));
+  GARC_Stream * file = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(packed.data(), packed.size(), &file));
+  GARC_Stream * plain = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_decompress(file, "gzip", nullptr, &plain));
+  char buffer[4096];
+  size_t read = 0;
+  do {
+    ASSERT_EQ(GARC_OK, garc_stream_read(plain, buffer, sizeof(buffer), &read));
+  } while (read);
+  for (int i = 0; i < 3; ++i) {
+    read = 1;
+    EXPECT_EQ(GARC_OK, garc_stream_read(plain, buffer, sizeof(buffer), &read));
+    EXPECT_EQ(0u, read);
+  }
+  garc_stream_destroy(plain);
+  garc_stream_destroy(file);
+}
+
+TEST(Codec, AFailingInnerSinkDuringTheDataIsReported) {
+  // Distinct from the failure during finish(): this is the write of a codec
+  // block in the middle of a member, which is the arm the small archives never
+  // reach because they produce no output until finish.
+  BufferDrain drain;
+  GARC_Sink * file = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_callback(drain.callbacks(), &file));
+  GARC_Sink * packer = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_compress(file, "gzip", nullptr, &packer));
+  drain.fail_writes(1);
+  // Large enough that the encoder hands over a block before the archive ends.
+  EXPECT_EQ(GARC_ERR_IO, write_tar(packer, big_entries()));
+  garc_sink_destroy(packer);
+  garc_sink_destroy(file);
 }
 
 int main(int argc, char ** argv) {

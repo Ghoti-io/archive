@@ -55,6 +55,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "codec_internal.h"
+
 #include "../sink/sink_internal.h"
 #include "../stream/stream_internal.h"
 
@@ -67,16 +69,8 @@
  */
 #define GARC_CODEC_BUFFER 10240u
 
-/**
- * Map a `compress` status onto this library's.
- *
- * `GCOMP_ERR_LIMIT` is the interesting row. In a `finish()` loop it means "more
- * to give, no room" and is handled by the caller before reaching here; anywhere
- * else it is a cap in the decoder's options, which is a refusal and has a status
- * of its own. Collapsing the two would make a decompression bomb and a small
- * buffer the same answer.
- */
-static GARC_Result codec_result(gcomp_status_t status) {
+// Not static: see codec_internal.h for why a translation table is exposed.
+GARC_Result garc_codec_result(gcomp_status_t status) {
   switch (status) {
     case GCOMP_OK:
       return GARC_OK;
@@ -128,9 +122,8 @@ static GARC_Result codec_stream_read(
     void * ctx, void * buffer, size_t size, size_t * out_read) {
   Codec_Stream * state = (Codec_Stream *)ctx;
   *out_read = 0;
-  if (!size) {
-    return GARC_OK;
-  }
+  // No guard on a zero @p size: garc_stream_read() answers that before it calls
+  // a callback, so one here is a line no test can put in a position to run.
 
   for (;;) {
     if (state->complete) {
@@ -149,7 +142,7 @@ static GARC_Result codec_stream_read(
         return GARC_OK;
       }
       if (status != GCOMP_ERR_LIMIT) {
-        return codec_result(status);
+        return garc_codec_result(status);
       }
       // GCOMP_ERR_LIMIT here is "more to give, nowhere to put it", so the
       // caller's buffer is full and the next call continues. A limit that
@@ -181,7 +174,7 @@ static GARC_Result codec_stream_read(
     gcomp_status_t status
         = gcomp_decoder_update(state->decoder, &in, &out);
     if (status != GCOMP_OK) {
-      return codec_result(status);
+      return garc_codec_result(status);
     }
     state->staged_offset += in.used;
     if (out.used) {
@@ -216,10 +209,9 @@ static GARC_Result codec_stream_read(
  * @param stream The stream.
  */
 static void codec_stream_destroy(GARC_Stream * stream) {
+  // No null check on the ctx: this hook is installed only after the state exists
+  // and is cleared by nothing, so a guard here could never run.
   Codec_Stream * state = (Codec_Stream *)stream->cb.ctx;
-  if (!state) {
-    return;
-  }
   gcomp_decoder_destroy(state->decoder);
   // The inner stream is borrowed and is not touched.
   gcu_allocator_free(state->allocator, state->staged);
@@ -262,7 +254,7 @@ GARC_Result garc_stream_create_decompress_with_allocator(GARC_Stream * inner,
   if (status != GCOMP_OK) {
     gcu_allocator_free(allocator, state->staged);
     gcu_allocator_free(allocator, state);
-    return codec_result(status);
+    return garc_codec_result(status);
   }
 
   // No seek and no size, which is the honest answer for a codec stream and is
@@ -328,7 +320,7 @@ static GARC_Result codec_sink_write(
     gcomp_status_t status
         = gcomp_encoder_update(state->encoder, &in, &out);
     if (status != GCOMP_OK) {
-      return codec_result(status);
+      return garc_codec_result(status);
     }
     if (out.used) {
       GARC_Result result
@@ -373,7 +365,7 @@ static GARC_Result codec_sink_finish(GARC_Sink * sink) {
       break;
     }
     if (status != GCOMP_ERR_LIMIT) {
-      return codec_result(status);
+      return garc_codec_result(status);
     }
     // GCOMP_ERR_LIMIT is "more to give", so go round with a drained buffer. A
     // limit that produced nothing cannot be made progress on by draining.
@@ -391,10 +383,8 @@ static GARC_Result codec_sink_finish(GARC_Sink * sink) {
  * @param sink The sink.
  */
 static void codec_sink_destroy(GARC_Sink * sink) {
+  // No null check on the ctx, for the reason codec_stream_destroy() gives.
   Codec_Sink * state = (Codec_Sink *)sink->cb.ctx;
-  if (!state) {
-    return;
-  }
   gcomp_encoder_destroy(state->encoder);
   // The inner sink is borrowed and is not touched - nor finished, which is why
   // garc_sink_finish() exists as a call a caller makes.
@@ -437,7 +427,7 @@ GARC_Result garc_sink_create_compress_with_allocator(GARC_Sink * inner,
   if (status != GCOMP_OK) {
     gcu_allocator_free(allocator, state->packed);
     gcu_allocator_free(allocator, state);
-    return codec_result(status);
+    return garc_codec_result(status);
   }
 
   GARC_Sink_Callbacks callbacks;
