@@ -49,17 +49,34 @@ writes the same headers and *refuses*, by name, anything that would need a recor
 a caller who needs an archive a 1988 reader can read wants to be told rather than
 handed one with records in it. No zip either way yet, and no filesystem layer.
 
+**Reads and writes `tar.gz`, `tar.zst` and `tar.lz4`, with no format code for
+any of them.** A codec wraps the stream or the sink, the tar reader and writer
+see the same interface they always saw, and the codec is named by a **string**
+rather than an enum — an enum here would be a second copy of compress's list of
+methods, and the copy goes stale. What a compressed archive gives up is
+random access: it has no seek and no size, which is the same shape as a pipe, so
+`garc_find()` on one is `GARC_ERR_NOT_SEEKABLE` permanently rather than quietly
+linear.
+
+**`garc_find()` is a scan and says so.** tar has no index and cannot gain one, so
+finding a name means reading every header until it appears; the function exists so
+that the walk back to the start is written once — resetting an inherited pax global
+record set on the way is easy to forget — rather than in every caller. A format
+with a central directory overrides it later with a real lookup.
+
 The three reference writers disagree about nearly every spelling in a pax header —
 the digits in a numeric field, whether to use the ustar name split, what the
 extended header is called — so each was measured and each choice is argued in
 `documentation/design.md` rather than copied.
 
-Build clean under GCC 14 with `-Werror`; 326 tests; 99.7% line coverage, the six
-remaining lines being a defensive arm no input can reach, three guards that are
-live only where `size_t` is 32 bits, and one that needs a record set larger than
-`INT64_MAX`; clean under Valgrind and under ASan+UBSan; `check-symbols`,
-`check-aliasing`, `check-corpus-hashes` and `check-fixtures` green; four fuzz
-harnesses.
+Build clean under GCC 14 with `-Werror`; 383 tests; 99.4% line coverage of 2,023
+lines, the thirteen uncovered being the six this library has always had — a
+defensive arm no input can reach, three guards live only where `size_t` is 32
+bits, one needing a pax record set larger than `INT64_MAX` — and seven arms in the
+codec module that only a codec breaking its own contract reaches; clean under
+Valgrind and under ASan+UBSan; `check-symbols`, `check-aliasing`,
+`check-corpus-hashes`, `check-fixtures` and `check-docs` green, the last at zero
+Doxygen warnings; five fuzz harnesses.
 
 ## A minimal complete program
 
