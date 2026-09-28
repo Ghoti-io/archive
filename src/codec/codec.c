@@ -537,6 +537,11 @@ GARC_Result garc_sink_create_compress_with_allocator(GARC_Sink * inner,
   memset(&callbacks, 0, sizeof(callbacks));
   callbacks.ctx = state;
   callbacks.write = codec_sink_write;
+  // **No `patch`, and not because it would be hard.** A codec's output for a byte
+  // depends on every byte before it, so no offset in the compressed stream
+  // corresponds to a field in the uncompressed one - there is nothing for an
+  // offset to mean. garc_sink_is_seekable() therefore says no, and a zip writer
+  // wrapping one of these puts its sizes in a data descriptor.
 
   GARC_Sink * sink = NULL;
   GARC_Result result = garc_sink_create_callback_with_allocator(

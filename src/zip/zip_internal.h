@@ -103,6 +103,50 @@ uint32_t garc_zip_le32(const uint8_t * bytes);
 uint64_t garc_zip_le64(const uint8_t * bytes);
 
 /**
+ * Write a 16-bit little-endian field.
+ *
+ * The mirror of ::garc_zip_le16, and shifts for the same reason: little-endian is
+ * a fact about the format, so a `memcpy` from a `uint16_t` would be right on one
+ * host and wrong on another.
+ *
+ * @param bytes Two bytes of destination.
+ * @param value The value.
+ */
+void garc_zip_put16(uint8_t * bytes, uint16_t value);
+
+/**
+ * Write a 32-bit little-endian field.
+ *
+ * @param bytes Four bytes of destination.
+ * @param value The value.
+ */
+void garc_zip_put32(uint8_t * bytes, uint32_t value);
+
+/**
+ * Write a 64-bit little-endian field.
+ *
+ * @param bytes Eight bytes of destination.
+ * @param value The value.
+ */
+void garc_zip_put64(uint8_t * bytes, uint64_t value);
+
+/**
+ * Convert an epoch second to the two MS-DOS fields, clamping where it must.
+ *
+ * The inverse of ::garc_zip_dos_to_epoch, and lossy in three ways the field
+ * cannot avoid: before 1980 and after 2107 it clamps, and an odd second rounds
+ * down. **The return value is how the caller knows**, which is what lets the
+ * writer decide whether an extended timestamp field is worth the bytes.
+ *
+ * @param seconds Seconds since the epoch, signed.
+ * @param out_date Receives the DOS date field.
+ * @param out_time Receives the DOS time field.
+ * @return Non-zero when the two fields carry @p seconds exactly.
+ */
+int garc_zip_epoch_to_dos(
+    int64_t seconds, uint16_t * out_date, uint16_t * out_time);
+
+/**
  * Convert an MS-DOS date and time to seconds since the epoch, as UTC.
  *
  * **The field carries no time zone, so this is a decision rather than a

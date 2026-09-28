@@ -17,6 +17,7 @@
 #ifndef GHOTI_IO_GARC_TEST_TEST_HELPERS_H
 #define GHOTI_IO_GARC_TEST_TEST_HELPERS_H
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -211,6 +212,23 @@ public:
   void fail_writes(size_t count) { failing_writes_ = count; }
 
   /**
+   * Offer a `patch` callback, so a sink over this drain is seekable.
+   *
+   * **Call before `garc_sink_create_callback()`**, which copies the struct - and
+   * off by default, because the interesting default is the one a socket has. The
+   * zip writer asks ::garc_sink_is_seekable() to decide whether to write data
+   * descriptors, so a drain that could always patch would leave the descriptor
+   * path unreachable from a callback sink.
+   */
+  void allow_patch() { callbacks_.patch = &BufferDrain::patch_cb; }
+
+  /** Patches served, refused ones included. */
+  size_t patches() const { return patches_; }
+
+  /** Make the next @p count patches report ::GARC_ERR_IO. */
+  void fail_patches(size_t count) { failing_patches_ = count; }
+
+  /**
    * Make the write with this index - counting from the next one - fail.
    *
    * `fail_writes(1)` can only reach the first write of a sequence, so a call that
@@ -224,6 +242,25 @@ public:
   }
 
 private:
+  static GARC_Result patch_cb(
+      void * ctx, uint64_t offset, const void * buffer, size_t size) {
+    BufferDrain * self = static_cast<BufferDrain *>(ctx);
+    self->patches_++;
+    if (self->failing_patches_) {
+      self->failing_patches_--;
+      return GARC_ERR_IO;
+    }
+    // The bound is the sink's to check, and it does - see garc_sink_patch(). This
+    // asserts it anyway, because a helper that silently grew the buffer would hide
+    // exactly the bug that check exists to catch.
+    if (offset + size > self->bytes_.size()) {
+      return GARC_ERR_INTERNAL;
+    }
+    const uint8_t * in = static_cast<const uint8_t *>(buffer);
+    std::copy(in, in + size, self->bytes_.begin() + static_cast<long>(offset));
+    return GARC_OK;
+  }
+
   static GARC_Result write_cb(void * ctx, const void * buffer, size_t size) {
     BufferDrain * self = static_cast<BufferDrain *>(ctx);
     self->writes_++;
@@ -243,6 +280,8 @@ private:
   GARC_Sink_Callbacks callbacks_{};
   std::vector<uint8_t> bytes_;
   size_t writes_ = 0;
+  size_t patches_ = 0;
+  size_t failing_patches_ = 0;
   size_t failing_writes_ = 0;
   size_t skip_writes_ = 0;
 };

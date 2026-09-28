@@ -98,6 +98,7 @@
 #include <ghoti.io/archive/reader.h>
 #include <ghoti.io/archive/sink.h>
 #include <ghoti.io/archive/tar.h>
+#include <ghoti.io/archive/zip.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -153,6 +154,30 @@ typedef struct GARC_Writer_Options {
    * the reason this is a knob rather than a constant.
    */
   uint32_t blocking_factor;
+
+  /**
+   * Where a zip member's CRC-32 and compressed size go. Ignored for tar.
+   *
+   * ::GARC_ZIP_SIZES_AUTO is the default and asks the sink. See
+   * ::GARC_Zip_Sizes, which is where the choice is argued.
+   */
+  GARC_Zip_Sizes zip_sizes;
+
+  /**
+   * Write zip64 fields on every member, whether or not they are needed.
+   *
+   * **Off by default, and the default is the rule the format wants**: a zip64
+   * field appears only for a value that does not fit its 32-bit slot, because an
+   * archive that carries them unnecessarily is refused by some old readers. So
+   * this is not a knob to reach for.
+   *
+   * It exists because the threshold needs a test on both sides of it and the
+   * upper side is a 4 GiB member. `zip -fz` exists for the same reason, and
+   * `infozip-zip64.zip` in the corpus is what it produced: two small members with
+   * their size fields marked and a zip64 extra carrying the real values. Ignored
+   * for tar.
+   */
+  int zip_force_zip64;
 } GARC_Writer_Options;
 
 /**
@@ -171,12 +196,14 @@ GARC_API void garc_writer_options_default(GARC_Writer_Options * options);
  * ::garc_writer_add().
  *
  * @param sink Where the bytes go.
- * @param format Which container to write. Only ::GARC_FORMAT_TAR today.
+ * @param format Which container to write: ::GARC_FORMAT_TAR or
+ *   ::GARC_FORMAT_ZIP.
  * @param options How to write it. NULL uses ::garc_writer_options_default().
  * @param out_writer Receives the writer on success.
- * @return ::GARC_OK, ::GARC_ERR_INVALID, ::GARC_ERR_OOM, or
+ * @return ::GARC_OK, ::GARC_ERR_INVALID, ::GARC_ERR_OOM,
  *   ::GARC_ERR_UNSUPPORTED for a format or a variant this library does not
- *   write.
+ *   write, or ::GARC_ERR_NOT_SEEKABLE when ::GARC_ZIP_SIZES_LOCAL is asked of a
+ *   sink that cannot be patched.
  */
 GARC_API GARC_Result garc_writer_create(GARC_Sink * sink, GARC_Format format,
     const GARC_Writer_Options * options, GARC_Writer ** out_writer);

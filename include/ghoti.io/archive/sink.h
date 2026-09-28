@@ -48,13 +48,26 @@
  * joins it. So ::garc_sink_create_memory() allocates and grows, and
  * ::garc_sink_data() lends the result back for as long as the sink lives.
  *
- * **There is no `seek`, and that is this cut rather than the design.** tar is
- * append-only: every byte is written once, in order, and nothing is patched
- * afterwards. zip is not - a streamed local header carries zeros where the sizes
- * go and either a data descriptor after the data or a seek back to fill them in -
- * so a `seek` callback and a `garc_sink_is_seekable()` to go with it arrive with
- * the writer that reads them. A field nothing reads is worse than an absent one,
- * because it reads as a promise.
+ * **Going back is a patch, not a seek, and the distinction is the whole design.**
+ * tar is append-only: every byte is written once, in order. zip is not - a local
+ * header carries a CRC and a compressed size that are not known until the data has
+ * been written, so a writer either puts them in a data descriptor after the data
+ * or goes back and fills them in. That second form is
+ * ::GARC_Sink_Callbacks.patch, and it is deliberately **not** a `seek` plus a
+ * `write`:
+ *
+ * - A patch cannot extend the archive. It writes over bytes already accounted
+ *   for, which is asserted here rather than trusted, so ::garc_sink_tell() keeps
+ *   meaning "how long this archive is" at every moment. A `seek` would make that
+ *   figure a *position*, and every padding calculation in the writer reads it.
+ * - A caller implementing `seek` would have to remember to come back. One
+ *   `patch` that saves and restores its own position is a contract a caller can
+ *   satisfy once; two calls they must pair correctly is one they can get wrong
+ *   per member.
+ *
+ * ::garc_sink_is_seekable() is how a writer asks, because the answer changes what
+ * it *writes* and not merely how: an archive built through a patching sink has no
+ * data descriptors in it, and one built through a pipe does.
  */
 
 #ifndef GHOTI_IO_GARC_SINK_H
@@ -97,7 +110,29 @@ typedef struct GARC_Sink_Callbacks {
    */
   GARC_Result (*write)(void * ctx, const void * buffer, size_t size);
 
-  /** Passed to `write`. Borrowed; must outlive the sink. */
+  /**
+   * Overwrite @p size bytes at @p offset, and leave the write position alone.
+   *
+   * **Optional**, and its absence is the answer to
+   * ::garc_sink_is_seekable() - which is a question a writer asks before it
+   * decides what to write, so supplying this changes the bytes of the archive
+   * and not only the route they take.
+   *
+   * The range is always inside what has already been written: this library
+   * checks `offset + size <= garc_sink_tell()` before calling, so an
+   * implementation never has to decide what patching past the end would mean.
+   *
+   * **Restoring the position is this callback's job.** A caller writing to a
+   * `FILE *` saves `ftell`, seeks, writes, and seeks back - three lines, in one
+   * place, rather than a pairing rule the library trusts them to keep.
+   *
+   * All @p size bytes or none, like `write`: return ::GARC_OK only when every
+   * byte has been accepted, and ::GARC_ERR_IO otherwise.
+   */
+  GARC_Result (*patch)(
+      void * ctx, uint64_t offset, const void * buffer, size_t size);
+
+  /** Passed to `write` and `patch`. Borrowed; must outlive the sink. */
   void * ctx;
 } GARC_Sink_Callbacks;
 
@@ -198,6 +233,48 @@ GARC_API GARC_Result garc_sink_fill(
  * @return Bytes accepted so far. A failed write contributes nothing.
  */
 GARC_API uint64_t garc_sink_tell(const GARC_Sink * sink);
+
+/**
+ * @brief Whether this sink can overwrite bytes it has already accepted.
+ *
+ * True for a memory sink, which owns its buffer, and for a callback sink whose
+ * ::GARC_Sink_Callbacks.patch is not NULL. **False for a compressing sink at any
+ * time**, and that is not an oversight: a codec's output for a given byte depends
+ * on everything before it, so there is no offset in the compressed stream that
+ * corresponds to a field in the uncompressed one.
+ *
+ * A writer asks this to decide **what to write**, not how. A zip built through a
+ * patching sink has the sizes and the CRC in each local header; one built through
+ * a pipe has zeros there and a data descriptor after the data. Both are valid
+ * zips and every reader takes either, so this is a question about the output
+ * rather than a capability check.
+ *
+ * @param sink The sink. NULL returns 0.
+ * @return Non-zero when ::garc_sink_patch() can be used.
+ */
+GARC_API int garc_sink_is_seekable(const GARC_Sink * sink);
+
+/**
+ * @brief Overwrite bytes this sink has already accepted.
+ *
+ * The write position is unchanged, so ::garc_sink_tell() before and after is the
+ * same number and the archive does not grow. The range must lie entirely within
+ * what has been written - patching past the end is ::GARC_ERR_INVALID rather than
+ * an extension, because a gap this library did not write is a hole no reader can
+ * interpret.
+ *
+ * @param sink The sink.
+ * @param offset Where to start, as an absolute offset from the first byte
+ *   written.
+ * @param data The replacement bytes.
+ * @param size How many. Zero is accepted and does nothing.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID for a NULL argument, a range past
+ *   ::garc_sink_tell(), or a sink that cannot patch - ::GARC_ERR_UNSUPPORTED is
+ *   deliberately not used, since ::garc_sink_is_seekable() is the question and
+ *   asking it is the caller's job - or ::GARC_ERR_IO from the callback.
+ */
+GARC_API GARC_Result garc_sink_patch(
+    GARC_Sink * sink, uint64_t offset, const void * data, size_t size);
 
 /**
  * @brief Borrow a memory sink's bytes.

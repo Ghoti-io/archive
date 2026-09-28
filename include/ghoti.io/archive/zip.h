@@ -121,6 +121,59 @@ typedef enum {
 } GARC_Zip_Method;
 
 /**
+ * @brief Where a written member's CRC-32 and compressed size go.
+ *
+ * **Neither is known when the local header is written**, so a zip writer has two
+ * ways out and they produce different bytes: leave zeros in the header and write
+ * the real values in a *data descriptor* after the data, with general purpose flag
+ * bit 3 set; or go back and fill the header in once the data is done. Both are
+ * valid and every reader takes either - the central directory carries the real
+ * values in both cases, which is why this library's reader consults the local
+ * header for one thing only.
+ *
+ * The choice is exposed because it is a property of the archive a caller may need
+ * to control, not merely a route the bytes take. A consumer that reads a zip as a
+ * stream needs the descriptors; a consumer that refuses them - and some old tools
+ * do - needs the other form.
+ */
+typedef enum {
+  /**
+   * Fill the local header in when the sink can, use a descriptor when it cannot.
+   *
+   * The default, and the only value that never refuses: it asks
+   * ::garc_sink_is_seekable() and writes whichever form that sink supports. A
+   * memory sink patches; a pipe or a compressing sink gets descriptors.
+   */
+  GARC_ZIP_SIZES_AUTO = 0,
+  /**
+   * Always write a data descriptor, even into a sink that could be patched.
+   *
+   * What libarchive does for every member, which is why `bsdtar-descriptors.zip`
+   * in the corpus has local headers saying a size of zero where its central
+   * directory says fifteen. Useful for producing an archive that can be read
+   * without seeking, and for testing that this library reads its own.
+   */
+  GARC_ZIP_SIZES_DESCRIPTOR,
+  /**
+   * Always fill the local header in; refuse a sink that cannot be patched.
+   *
+   * ::GARC_ERR_NOT_SEEKABLE from ::garc_writer_create(), by name, because the
+   * caller asked for something this sink cannot do rather than for a feature this
+   * library lacks.
+   */
+  GARC_ZIP_SIZES_LOCAL,
+  GARC_ZIP_SIZES_COUNT
+} GARC_Zip_Sizes;
+
+/**
+ * @brief Name for a size discipline, for messages and dumps.
+ *
+ * @param sizes The discipline.
+ * @return A static string, never NULL.
+ */
+GARC_API const char * garc_zip_sizes_string(GARC_Zip_Sizes sizes);
+
+/**
  * @brief How a member is encrypted, where it is.
  *
  * Two schemes rather than a bit, because they are not the same answer to a

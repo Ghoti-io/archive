@@ -681,6 +681,13 @@ GARC_Result garc_tar_write_member(
   return GARC_OK;
 }
 
+GARC_Result garc_tar_write_close_member(GARC_Writer * writer) {
+  // Pad the member's data out to the 512-byte block the next header has to start
+  // on. The count was computed when the member was added, because the declared
+  // size is what decides it and that is what the header already carries.
+  return garc_sink_fill(writer->sink, 0, writer->data_padding);
+}
+
 GARC_Result garc_tar_write_end(GARC_Writer * writer) {
   // Two zero blocks. One is what a trimmed tail looks like and is not an end
   // marker; the reader says so from the other side.

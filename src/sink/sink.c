@@ -115,6 +115,17 @@ static GARC_Result sink_mem_write(
   return GARC_OK;
 }
 
+static GARC_Result sink_mem_patch(
+    void * ctx, uint64_t offset, const void * buffer, size_t size) {
+  GARC_Sink * sink = (GARC_Sink *)ctx;
+  // The range is checked by garc_sink_patch() against pos, and a memory sink's
+  // pos and mem_length are the same number - so this is a memcpy and nothing
+  // else. The cast is safe for the same reason: an offset inside a buffer this
+  // process allocated fits a size_t.
+  memcpy(sink->mem_bytes + (size_t)offset, buffer, size);
+  return GARC_OK;
+}
+
 static GARC_Result sink_alloc(
     const GARC_Allocator * allocator, GARC_Sink ** out_sink) {
   // Resolved here rather than left NULL, so that destroy frees through the
@@ -148,9 +159,13 @@ GARC_Result garc_sink_create_memory_with_allocator(
     return result;
   }
 
-  // ctx is the sink itself, which is how the callback above reaches the buffer.
+  // ctx is the sink itself, which is how the callbacks above reach the buffer.
   sink->cb.ctx = sink;
   sink->cb.write = sink_mem_write;
+  // A memory sink owns its buffer, so it can always patch. Setting the callback
+  // is also how garc_sink_is_seekable() answers for it: one field rather than a
+  // per-kind switch, which is the same reason the write path is one path.
+  sink->cb.patch = sink_mem_patch;
 
   *out_sink = sink;
   return GARC_OK;
@@ -228,6 +243,32 @@ GARC_Result garc_sink_fill(GARC_Sink * sink, uint8_t byte, uint64_t count) {
 
 uint64_t garc_sink_tell(const GARC_Sink * sink) {
   return sink ? sink->pos : 0u;
+}
+
+int garc_sink_is_seekable(const GARC_Sink * sink) {
+  return sink && sink->cb.patch ? 1 : 0;
+}
+
+GARC_Result garc_sink_patch(
+    GARC_Sink * sink, uint64_t offset, const void * data, size_t size) {
+  if (!sink || (!data && size)) {
+    return GARC_ERR_INVALID;
+  }
+  if (!sink->cb.patch) {
+    return GARC_ERR_INVALID;
+  }
+  if (!size) {
+    return GARC_OK;
+  }
+  // **The bound, checked here once rather than in every implementation.** A
+  // patch that ran past the end would have to either extend the archive - leaving
+  // a gap this library never wrote - or be silently truncated. Both are worse
+  // than a refusal, and checking it here is what lets the memory sink's own
+  // implementation be a memcpy with no arithmetic of its own.
+  if (offset > sink->pos || (uint64_t)size > sink->pos - offset) {
+    return GARC_ERR_INVALID;
+  }
+  return sink->cb.patch(sink->cb.ctx, offset, data, size);
 }
 
 GARC_Result garc_sink_data(

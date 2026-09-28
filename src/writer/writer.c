@@ -39,12 +39,20 @@
 
 #include "tar/tar_internal.h"
 #include "writer/writer_internal.h"
+#include "zip/zip_internal.h"
 
 void garc_writer_options_default(GARC_Writer_Options * options) {
   if (!options) {
     return;
   }
   options->tar_variant = GARC_TAR_PAX;
+  // Ask the sink. The only value that never refuses, and the one that produces
+  // the better archive wherever it can: local headers with real sizes in them
+  // where the sink can be patched, descriptors where it cannot.
+  options->zip_sizes = GARC_ZIP_SIZES_AUTO;
+  // Off, because a zip64 field on a member that does not need one is refused by
+  // some old readers. GARC_Writer_Options says why the knob exists at all.
+  options->zip_force_zip64 = 0;
   // No record padding. bsdtar's answer rather than GNU tar's: 10240 bytes was a
   // tape record, every reader accepts either, and this library's archives are
   // built in memory and handed to a caller far more often than they are written
@@ -74,7 +82,12 @@ static GARC_Result writer_close_member(GARC_Writer * writer) {
     // it through would put the next header where a reader is not looking for one.
     return GARC_ERR_INVALID;
   }
-  GARC_Result result = garc_sink_fill(writer->sink, 0, writer->data_padding);
+  // Each format's own closing work, through a hook rather than inline: tar pads
+  // and zip writes a descriptor or patches a header and appends a directory
+  // entry, and neither rule belongs in the file that has no format in it.
+  GARC_Result result = writer->format == GARC_FORMAT_ZIP
+      ? garc_zip_write_close_member(writer)
+      : garc_tar_write_close_member(writer);
   if (result != GARC_OK) {
     return result;
   }
@@ -102,24 +115,47 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
     resolved = *options;
   }
 
-  if (format != GARC_FORMAT_TAR) {
+  if (format == GARC_FORMAT_TAR) {
+    switch (resolved.tar_variant) {
+      case GARC_TAR_PAX:
+      case GARC_TAR_USTAR:
+        break;
+      case GARC_TAR_NONE:
+        // What a zero-filled options struct holds. Refused rather than treated as
+        // the default, so that a caller who meant to choose and forgot is told;
+        // NULL is how a caller says they do not mind.
+        return GARC_ERR_INVALID;
+      default:
+        // v7 and GNU. Both are read, neither is written; writer.h says why.
+        return GARC_ERR_UNSUPPORTED;
+    }
+  }
+  else if (format == GARC_FORMAT_ZIP) {
+    switch (resolved.zip_sizes) {
+      case GARC_ZIP_SIZES_AUTO:
+      case GARC_ZIP_SIZES_DESCRIPTOR:
+        break;
+      case GARC_ZIP_SIZES_LOCAL:
+        if (!garc_sink_is_seekable(sink)) {
+          // **Refused here rather than at the first member**, and by name rather
+          // than as "unsupported": the caller asked for a form of archive this
+          // sink cannot produce, which is a fact known before a byte is written.
+          // Failing later would leave a truncated archive behind a refusal.
+          return GARC_ERR_NOT_SEEKABLE;
+        }
+        break;
+      default:
+        return GARC_ERR_INVALID;
+    }
+    // zip has no variants and tar_variant is meaningless here, so it is not
+    // checked: a caller copying an archive from tar to zip should not have to
+    // clear a field that describes the format they are no longer writing.
+  }
+  else {
     // GARC_FORMAT_UNKNOWN included: a caller who has not said what to write has
     // not said it, and there is no format to guess at from a sink.
     return format == GARC_FORMAT_UNKNOWN ? GARC_ERR_INVALID
                                          : GARC_ERR_UNSUPPORTED;
-  }
-  switch (resolved.tar_variant) {
-    case GARC_TAR_PAX:
-    case GARC_TAR_USTAR:
-      break;
-    case GARC_TAR_NONE:
-      // What a zero-filled options struct holds. Refused rather than treated as
-      // the default, so that a caller who meant to choose and forgot is told;
-      // NULL is how a caller says they do not mind.
-      return GARC_ERR_INVALID;
-    default:
-      // v7 and GNU. Both are read, neither is written; writer.h says why.
-      return GARC_ERR_UNSUPPORTED;
   }
 
   if (!allocator) {
@@ -152,7 +188,9 @@ GARC_Result garc_writer_add(GARC_Writer * writer, const GARC_Member * member) {
     return result;
   }
 
-  result = garc_tar_write_member(writer, member);
+  result = writer->format == GARC_FORMAT_ZIP
+      ? garc_zip_write_member(writer, member)
+      : garc_tar_write_member(writer, member);
   if (result != GARC_OK) {
     // have_member stays clear: a header that was not written describes nothing,
     // and leaving a member open would make the next add() pad for data that has
@@ -183,7 +221,9 @@ GARC_Result garc_writer_write(
     return GARC_OK;
   }
 
-  GARC_Result result = garc_sink_write(writer->sink, data, size);
+  GARC_Result result = writer->format == GARC_FORMAT_ZIP
+      ? garc_zip_write_data(writer, data, size)
+      : garc_sink_write(writer->sink, data, size);
   if (result != GARC_OK) {
     return result;
   }
@@ -201,7 +241,8 @@ GARC_Result garc_writer_finish(GARC_Writer * writer) {
     return result;
   }
 
-  result = garc_tar_write_end(writer);
+  result = writer->format == GARC_FORMAT_ZIP ? garc_zip_write_end(writer)
+                                            : garc_tar_write_end(writer);
   if (result != GARC_OK) {
     return result;
   }
@@ -225,10 +266,20 @@ void garc_writer_dump(const GARC_Writer * writer, FILE * out) {
     fprintf(out, "GARC_Writer: (null)\n");
     return;
   }
-  fprintf(out, "GARC_Writer: format=%s variant=%s blocking=%u\n",
-      garc_format_string(writer->format),
-      garc_tar_variant_string(writer->options.tar_variant),
-      (unsigned)writer->options.blocking_factor);
+  if (writer->format == GARC_FORMAT_ZIP) {
+    fprintf(out, "GARC_Writer: format=zip sizes=%s%s\n",
+        garc_zip_sizes_string(writer->options.zip_sizes),
+        writer->options.zip_force_zip64 ? " zip64=forced" : "");
+    fprintf(out, "  directory: %llu entries, %llu bytes\n",
+        (unsigned long long)writer->zip.entries,
+        (unsigned long long)writer->zip.central.length);
+  }
+  else {
+    fprintf(out, "GARC_Writer: format=%s variant=%s blocking=%u\n",
+        garc_format_string(writer->format),
+        garc_tar_variant_string(writer->options.tar_variant),
+        (unsigned)writer->options.blocking_factor);
+  }
   fprintf(out, "  members=%llu offset=%llu finished=%d\n",
       (unsigned long long)writer->member_count,
       (unsigned long long)garc_sink_tell(writer->sink), writer->finished);
@@ -245,5 +296,9 @@ void garc_writer_destroy(GARC_Writer * writer) {
   }
   const GARC_Allocator * allocator = writer->allocator;
   garc_buffer_free(allocator, &writer->records);
+  // Unconditionally, not behind a format test: the zip state's buffers are NULL
+  // for a tar writer and garc_buffer_free() of a NULL buffer is a no-op, so a
+  // condition here would be a second place the format lives for no gain.
+  garc_zip_write_release(writer);
   gcu_allocator_free(allocator, writer);
 }

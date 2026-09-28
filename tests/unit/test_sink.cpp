@@ -454,6 +454,152 @@ TEST(SinkDestroy, ACallbackSinksContextIsNotTouched) {
   EXPECT_EQ(drain.writes(), 2u);
 }
 
+//-----------------------------------------------------------------------------
+// Patching, which is what a zip writer needs and a tar writer never did
+//-----------------------------------------------------------------------------
+
+TEST(SinkPatch, AMemorySinkCanAlwaysPatch) {
+  // It owns its buffer, so there is nothing to ask. Asserted rather than assumed
+  // because garc_sink_is_seekable() is what decides whether a zip gets data
+  // descriptors, so its answer for the sink every test in this library uses is
+  // load-bearing.
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  EXPECT_TRUE(garc_sink_is_seekable(sink));
+  garc_sink_destroy(sink);
+}
+
+TEST(SinkPatch, ACallbackSinkIsSeekableOnlyWhenItOffersPatch) {
+  // The pair, so the predicate is seen to answer both ways. A drain with no
+  // `patch` is what a socket is, and it is the default here for that reason.
+  BufferDrain plain;
+  GARC_Sink * without = nullptr;
+  ASSERT_EQ(garc_sink_create_callback(plain.callbacks(), &without), GARC_OK);
+  EXPECT_FALSE(garc_sink_is_seekable(without));
+
+  BufferDrain patchable;
+  patchable.allow_patch();
+  GARC_Sink * with = nullptr;
+  ASSERT_EQ(garc_sink_create_callback(patchable.callbacks(), &with), GARC_OK);
+  EXPECT_TRUE(garc_sink_is_seekable(with));
+
+  garc_sink_destroy(without);
+  garc_sink_destroy(with);
+  EXPECT_FALSE(garc_sink_is_seekable(nullptr));
+}
+
+TEST(SinkPatch, AMemorySinkOverwritesInPlaceAndDoesNotGrow) {
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  const std::vector<uint8_t> bytes = sample();
+  ASSERT_EQ(garc_sink_write(sink, bytes.data(), bytes.size()), GARC_OK);
+  const uint64_t before = garc_sink_tell(sink);
+
+  const uint8_t replacement[] = {0xAA, 0xBB, 0xCC};
+  ASSERT_EQ(garc_sink_patch(sink, 4u, replacement, sizeof(replacement)),
+      GARC_OK);
+
+  // **The length is the point.** garc_sink_tell() has to keep meaning "how long
+  // this archive is" across a patch, because every padding calculation in the
+  // writer reads it - which is the whole argument for a patch rather than a seek.
+  EXPECT_EQ(garc_sink_tell(sink), before);
+  std::vector<uint8_t> expected = bytes;
+  expected[4] = 0xAA;
+  expected[5] = 0xBB;
+  expected[6] = 0xCC;
+  EXPECT_EQ(collected(sink), expected);
+  garc_sink_destroy(sink);
+}
+
+TEST(SinkPatch, PatchingPastTheEndIsRefusedRatherThanExtending) {
+  // Three shapes of out-of-range, because they are three comparisons: an offset
+  // past the end, an offset at the end, and a range that starts inside and runs
+  // out. The last is the one an off-by-one in the bound lets through.
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  ASSERT_EQ(garc_sink_write(sink, "abcd", 4), GARC_OK);
+
+  EXPECT_EQ(garc_sink_patch(sink, 5u, "x", 1), GARC_ERR_INVALID);
+  EXPECT_EQ(garc_sink_patch(sink, 4u, "x", 1), GARC_ERR_INVALID);
+  EXPECT_EQ(garc_sink_patch(sink, 3u, "xy", 2), GARC_ERR_INVALID);
+  // And the last byte, which is in range and must not be refused with them.
+  EXPECT_EQ(garc_sink_patch(sink, 3u, "x", 1), GARC_OK);
+  EXPECT_EQ(collected(sink), std::vector<uint8_t>({'a', 'b', 'c', 'x'}));
+  EXPECT_EQ(garc_sink_tell(sink), 4u);
+  garc_sink_destroy(sink);
+}
+
+TEST(SinkPatch, ASinkThatCannotPatchRefusesRatherThanIgnoring) {
+  // GARC_ERR_INVALID and not GARC_ERR_UNSUPPORTED, because
+  // garc_sink_is_seekable() is the question and asking it is the caller's job -
+  // the same distinction garc_find() draws with GARC_ERR_NOT_SEEKABLE, from the
+  // other side.
+  BufferDrain drain;
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_callback(drain.callbacks(), &sink), GARC_OK);
+  ASSERT_EQ(garc_sink_write(sink, "abcd", 4), GARC_OK);
+  EXPECT_EQ(garc_sink_patch(sink, 0u, "x", 1), GARC_ERR_INVALID);
+  EXPECT_EQ(drain.bytes(), std::vector<uint8_t>({'a', 'b', 'c', 'd'}));
+  garc_sink_destroy(sink);
+}
+
+TEST(SinkPatch, ACallbackSinkPassesThePatchStraightThrough) {
+  BufferDrain drain;
+  drain.allow_patch();
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_callback(drain.callbacks(), &sink), GARC_OK);
+  ASSERT_EQ(garc_sink_write(sink, "abcd", 4), GARC_OK);
+  ASSERT_EQ(garc_sink_patch(sink, 1u, "XY", 2), GARC_OK);
+  EXPECT_EQ(drain.bytes(), std::vector<uint8_t>({'a', 'X', 'Y', 'd'}));
+  EXPECT_EQ(drain.patches(), 1u);
+  EXPECT_EQ(garc_sink_tell(sink), 4u);
+  garc_sink_destroy(sink);
+}
+
+TEST(SinkPatch, AFailedPatchIsReportedAndChangesNothing) {
+  BufferDrain drain;
+  drain.allow_patch();
+  drain.fail_patches(1);
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_callback(drain.callbacks(), &sink), GARC_OK);
+  ASSERT_EQ(garc_sink_write(sink, "abcd", 4), GARC_OK);
+  EXPECT_EQ(garc_sink_patch(sink, 1u, "XY", 2), GARC_ERR_IO);
+  EXPECT_EQ(drain.bytes(), std::vector<uint8_t>({'a', 'b', 'c', 'd'}));
+  EXPECT_EQ(garc_sink_tell(sink), 4u);
+  garc_sink_destroy(sink);
+}
+
+TEST(SinkPatch, TheDegenerateArgumentsAreAnswered) {
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  ASSERT_EQ(garc_sink_write(sink, "abcd", 4), GARC_OK);
+  EXPECT_EQ(garc_sink_patch(nullptr, 0u, "x", 1), GARC_ERR_INVALID);
+  EXPECT_EQ(garc_sink_patch(sink, 0u, nullptr, 1), GARC_ERR_INVALID);
+  // Zero bytes is a successful no-op and never reaches the callback, which is the
+  // same answer garc_sink_write() gives for the same question.
+  EXPECT_EQ(garc_sink_patch(sink, 0u, nullptr, 0), GARC_OK);
+  EXPECT_EQ(collected(sink), std::vector<uint8_t>({'a', 'b', 'c', 'd'}));
+  garc_sink_destroy(sink);
+}
+
+TEST(SinkPatch, ACompressingSinkIsNeverSeekable) {
+  // **Not an oversight, and worth a test because a reader of sink.h might take it
+  // for one.** A codec's output for a byte depends on every byte before it, so
+  // there is no offset in the compressed stream that corresponds to a field in the
+  // uncompressed one - there is nothing for an offset to mean. A zip writer
+  // wrapping one of these therefore writes data descriptors.
+  GARC_Sink * memory = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&memory), GARC_OK);
+  GARC_Sink * packer = nullptr;
+  ASSERT_EQ(garc_sink_create_compress(memory, "deflate", nullptr, &packer),
+      GARC_OK);
+  EXPECT_TRUE(garc_sink_is_seekable(memory));
+  EXPECT_FALSE(garc_sink_is_seekable(packer));
+  EXPECT_EQ(garc_sink_patch(packer, 0u, "x", 1), GARC_ERR_INVALID);
+  garc_sink_destroy(packer);
+  garc_sink_destroy(memory);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

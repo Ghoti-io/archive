@@ -117,6 +117,100 @@ GARC_Result garc_zip_dos_to_epoch(
   return GARC_OK;
 }
 
+void garc_zip_put16(uint8_t * bytes, uint16_t value) {
+  bytes[0] = (uint8_t)(value & 0xFFu);
+  bytes[1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+void garc_zip_put32(uint8_t * bytes, uint32_t value) {
+  for (unsigned i = 0; i < 4u; ++i) {
+    bytes[i] = (uint8_t)((value >> (8u * i)) & 0xFFu);
+  }
+}
+
+void garc_zip_put64(uint8_t * bytes, uint64_t value) {
+  for (unsigned i = 0; i < 8u; ++i) {
+    bytes[i] = (uint8_t)((value >> (8u * i)) & 0xFFu);
+  }
+}
+
+/**
+ * The civil date that many days after 1970-01-01.
+ *
+ * The inverse of days_from_civil(), and Hinnant's again for the same reason: no
+ * table, no loop, and exact for every year the DOS field can express. It is here
+ * rather than in the writer because the pair has to agree, and two functions in
+ * one file that are each other's inverse can be tested against each other for
+ * every day in range - which `ZipNumber.EveryDosDateRoundTrips` does.
+ *
+ * @param days Days since 1970-01-01.
+ * @param out_year Receives the year.
+ * @param out_month Receives 1 to 12.
+ * @param out_day Receives 1 to 31.
+ */
+static void civil_from_days(int64_t days, int64_t * out_year,
+    unsigned * out_month, unsigned * out_day) {
+  days += 719468;
+  const int64_t era = (days >= 0 ? days : days - 146096) / 146097;
+  const unsigned day_of_era = (unsigned)(days - era * 146097);
+  const unsigned year_of_era = (day_of_era - day_of_era / 1460u
+      + day_of_era / 36524u - day_of_era / 146096u) / 365u;
+  const int64_t year = (int64_t)year_of_era + era * 400;
+  const unsigned day_of_year
+      = day_of_era - (365u * year_of_era + year_of_era / 4u
+          - year_of_era / 100u);
+  const unsigned month_prime = (5u * day_of_year + 2u) / 153u;
+  *out_day = day_of_year - (153u * month_prime + 2u) / 5u + 1u;
+  *out_month = month_prime + (month_prime < 10u ? 3u : -9u);
+  *out_year = year + (*out_month <= 2u);
+}
+
+/** 1980-01-01T00:00:00Z, the earliest time a DOS date field can express. */
+#define GARC_ZIP_DOS_EPOCH ((int64_t)315532800)
+
+/** 2107-12-31T23:59:58Z, the latest. */
+#define GARC_ZIP_DOS_MAX ((int64_t)4354819198)
+
+int garc_zip_epoch_to_dos(
+    int64_t seconds, uint16_t * out_date, uint16_t * out_time) {
+  // **Clamped rather than refused, and the return value says which happened.**
+  // Every real zip writer clamps: the DOS field is the only time a zip is
+  // required to carry, so refusing a member whose mtime predates 1980 would
+  // refuse a member for a reason the format has an answer to. What the answer
+  // costs is precision, and a caller that needs to know is told - which is what
+  // the extended timestamp field this writer also emits is for.
+  int exact = 1;
+  if (seconds < GARC_ZIP_DOS_EPOCH) {
+    seconds = GARC_ZIP_DOS_EPOCH;
+    exact = 0;
+  }
+  else if (seconds > GARC_ZIP_DOS_MAX) {
+    seconds = GARC_ZIP_DOS_MAX;
+    exact = 0;
+  }
+  // The odd second, which the field cannot hold: two-second resolution means the
+  // low bit is lost, and rounding *down* is what every writer does - an mtime
+  // that moved forward would make a freshly written archive look newer than the
+  // file it came from.
+  if (seconds & 1) {
+    seconds -= 1;
+    exact = 0;
+  }
+
+  const int64_t days = seconds / 86400;
+  const int64_t rest = seconds % 86400;
+  int64_t year = 0;
+  unsigned month = 0;
+  unsigned day = 0;
+  civil_from_days(days, &year, &month, &day);
+
+  *out_date = (uint16_t)((((unsigned)(year - 1980)) << 9) | (month << 5) | day);
+  *out_time = (uint16_t)((((unsigned)(rest / 3600)) << 11)
+      | (((unsigned)((rest / 60) % 60)) << 5)
+      | ((unsigned)(rest % 60) / 2u));
+  return exact;
+}
+
 /** Seconds between 1601-01-01 and 1970-01-01, which is what a FILETIME counts
  *  from. 134,774 days. */
 #define GARC_ZIP_FILETIME_EPOCH_DELTA ((uint64_t)11644473600u)
