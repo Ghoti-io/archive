@@ -470,6 +470,14 @@ GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,
   if (!archive->have_member) {
     return GARC_ERR_INVALID;
   }
+  if (archive->format == GARC_FORMAT_ZIP && archive->data_refusal == GARC_OK) {
+    // The zip reader's own read, because a zip member's bytes may have to be
+    // decompressed and are checksummed either way. Dispatched here rather than
+    // folded into the loop below for the reason garc_next() dispatches: a second
+    // format's rules in the format-agnostic function is where the two start
+    // borrowing each other's assumptions.
+    return garc_zip_read(archive, buffer, capacity, out_read);
+  }
   if (archive->data_refusal != GARC_OK) {
     // A member whose metadata was readable and whose bytes are not: a zip member
     // compressed with a method there is no codec for, or encrypted. Answered
@@ -514,6 +522,11 @@ GARC_Result garc_skip_member(GARC_Archive * archive) {
   }
   if (!archive->have_member) {
     return GARC_ERR_INVALID;
+  }
+  if (archive->format == GARC_FORMAT_ZIP) {
+    // Nothing to read past: the next member's position comes from the central
+    // directory rather than from where this member's data ends.
+    return garc_zip_skip(archive);
   }
   if (!archive->data_remaining) {
     return GARC_OK;

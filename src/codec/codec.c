@@ -280,6 +280,109 @@ GARC_Result garc_stream_create_decompress_with_allocator(GARC_Stream * inner,
 }
 
 ////////////////////////////////////////////////////////////////////////
+// One member's decoder
+////////////////////////////////////////////////////////////////////////
+
+/**
+ * What one member's decoder owns: a bounded view, a cap, and the decoder.
+ *
+ * Declared here rather than in the header because nothing outside this file has a
+ * reason to reach into it - the zip reader holds a pointer and reads bytes out of
+ * ::garc_member_codec_stream(), which is the same shape as reading a stored
+ * member from the archive's own stream.
+ */
+struct GARC_Member_Codec {
+  const GARC_Allocator * allocator; ///< For this object.
+  GARC_Stream * slice;              ///< Owned: the bounded compressed range.
+  GARC_Stream * stream;             ///< Owned: the decompressing stream.
+  /**
+   * Owned, and kept for the decoder's whole life rather than freed after
+   * creation.
+   *
+   * `gcomp_decoder_create()` is handed a pointer to these and says nothing about
+   * whether it copies what it needs. Keeping them is a few dozen bytes per member
+   * being read; freeing them on the strength of an assumption is a dangling
+   * pointer that would show up as a wrong limit rather than as a crash.
+   */
+  gcomp_options_t * options;
+};
+
+GARC_Result garc_member_codec_create(const GARC_Allocator * allocator,
+    GARC_Stream * inner, const char * method, uint64_t compressed_length,
+    uint64_t max_output, GARC_Member_Codec ** out_codec) {
+  if (!inner || !method || !out_codec) {
+    return GARC_ERR_INVALID;
+  }
+  if (!allocator) {
+    allocator = garc_allocator_default();
+  }
+
+  GARC_Member_Codec * codec = (GARC_Member_Codec *)gcu_allocator_calloc(
+      allocator, 1, sizeof(GARC_Member_Codec));
+  if (!codec) {
+    return GARC_ERR_OOM;
+  }
+  codec->allocator = allocator;
+
+  GARC_Result result = garc_stream_create_slice_with_allocator(
+      inner, compressed_length, allocator, &codec->slice);
+  if (result != GARC_OK) {
+    garc_member_codec_destroy(codec);
+    return result;
+  }
+
+  if (max_output) {
+    // The two arms below are `compress`'s allocator failing, not this library's,
+    // so nothing here can provoke them - `make coverage` reports both as
+    // unexecuted and they stay. A cap that silently failed to be set would leave
+    // the decoder on its 512 MiB default, which is the wrong answer for a big
+    // member and an invisible one for a small one.
+    if (gcomp_options_create(&codec->options) != GCOMP_OK) {
+      garc_member_codec_destroy(codec);
+      return GARC_ERR_OOM;
+    }
+    // The declared size, exactly. A member that expands past what its own
+    // container said it holds is refused by the decoder, which is a tighter
+    // answer than any ratio and needs no guess - and it arrives as
+    // GARC_ERR_LIMIT_CODEC_BYTES, which says whose cap it was.
+    if (gcomp_options_set_uint64(
+            codec->options, "limits.max_output_bytes", max_output)
+        != GCOMP_OK) {
+      garc_member_codec_destroy(codec);
+      return GARC_ERR_OOM;
+    }
+  }
+
+  result = garc_stream_create_decompress_with_allocator(
+      codec->slice, method, codec->options, allocator, &codec->stream);
+  if (result != GARC_OK) {
+    garc_member_codec_destroy(codec);
+    return result;
+  }
+
+  *out_codec = codec;
+  return GARC_OK;
+}
+
+GARC_Stream * garc_member_codec_stream(GARC_Member_Codec * codec) {
+  return codec ? codec->stream : NULL;
+}
+
+void garc_member_codec_destroy(GARC_Member_Codec * codec) {
+  if (!codec) {
+    return;
+  }
+  // Outermost first: the decompressing stream holds the decoder, which reads
+  // through the slice. Destroying the slice first would leave the decoder's
+  // teardown reading a freed pointer - which it does not do today, and which is
+  // not something to rely on.
+  garc_stream_destroy(codec->stream);
+  garc_stream_destroy(codec->slice);
+  gcomp_options_destroy(codec->options);
+  gcu_allocator_free(codec->allocator, codec);
+}
+
+////////////////////////////////////////////////////////////////////////
 // Compressing sink
 ////////////////////////////////////////////////////////////////////////
 

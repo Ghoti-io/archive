@@ -504,13 +504,57 @@ holds a marker - because `zip -fz` writes the zip64 records for an archive whose
 32-bit counts would all have fitted, and those counts are right, so a reader that
 waited for a marker would pass on that archive until the one where they are not.
 
-### Methods and encryption, which are numbers a refusal has to name
+### Methods, which are numbers, and the two that have codecs
 
-Method 0 is read. 8, 9, 12, 14, 93 and 98 are refused with
-`GARC_ERR_UNSUPPORTED`, and `garc_zip_member_method()` with
-`garc_zip_method_string()` say which - so the refusal is a to-do list rather than
-a dead end. unzip 6.00 refuses 14 and 99 itself, with "need PK compat. v6.3", so
-refusing them here is the format's age rather than conservatism.
+**Methods 0, 8 and 93 are read.** A compressed member is a *bounded view* of the
+file with a decoder over it: the view ends where the member's compressed size ends,
+which is what stops a deflate stream from reading the next member's local header as
+more input, and the decoder is `compress`'s. So method 8 is RFC 1951 raw -
+`compress`'s `"deflate"`, not its `"zlib"`, and reading one as the other fails on
+the first two bytes - and method 93 is a zstd frame, which came almost free.
+
+**Method 9 is refused on purpose, and it is the interesting one.** "Enhanced
+deflate" is not RFC 1951: it allows a 64 KB window and a different length code. A
+reader that pointed it at the deflate decoder would decode the members that used
+neither extension correctly and the ones that used either into plausible wrong
+bytes, which is the worst of the three available outcomes. 12, 14, 95 and 98 are
+refused for the ordinary reason - no codec - and `garc_zip_member_method()` with
+`garc_zip_method_string()` name the number in every case, so a refusal is a to-do
+list rather than a dead end. unzip 6.00 refuses 14 and 99 itself, with "need PK
+compat. v6.3", so refusing them here is the format's age rather than conservatism.
+
+The mapping from a method number to a codec name is **one switch in one file**,
+which is the whole reason the codec layer takes a string: a second enum would be a
+copy of `compress`'s list of methods, and the copy goes stale.
+
+### The CRC, which tar has nothing like
+
+Every member declares a CRC-32 of its uncompressed bytes, and this reader checks
+it. Reading a member to its end and getting ::GARC_OK therefore means something
+stronger than "the bytes were there": it means this reader and whatever wrote the
+archive agree about every one of them.
+
+Two decisions about *when*:
+
+- **The verdict arrives on the call that returns zero bytes**, not on the call that
+  hands over the last of the data. A checksum covers a whole member, so it cannot
+  be reported until the member is over - and reporting it on the last data call
+  would make the caller lose those bytes to an error return.
+- **A partial read gets no verdict**, and neither does a skipped member. Half a
+  member has no checksum to compare against, so a caller that stops early is told
+  nothing rather than told something false.
+
+The decoder's output cap is the member's **declared uncompressed size**, which is
+available before any of its bytes are read. That moves the bound in both
+directions: tighter than `compress`'s 512 MiB default for the small members a bomb
+hides among, and *looser* for the legitimate member that is bigger than 512 MiB,
+which the default would refuse. A member's data is also required to fit between its
+local header and the central directory, so a stored member that declares more bytes
+than are there cannot be handed the directory's own bytes as its contents - the CRC
+would catch that afterwards, and afterwards is after a caller who ignored the
+status has already been given them.
+
+### Encryption, which is two answers rather than one
 
 Encryption is **two schemes and not a bit**: ZipCrypto is broken and will be read
 and never written, WinZip AES is sound and needs a library this one does not yet

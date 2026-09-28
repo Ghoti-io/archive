@@ -186,6 +186,44 @@ GARC_Result garc_zip_locate_eocd(GARC_Archive * archive, uint64_t * out_offset);
 GARC_Result garc_zip_open(GARC_Archive * archive, uint64_t eocd_offset);
 
 /**
+ * Read some of the current member's data, decompressing where it has to.
+ *
+ * The same contract as ::garc_read_member(), which dispatches here: the bytes are
+ * the member's *uncompressed* data, never more than it declared, and a member
+ * whose data ends early is ::GARC_ERR_CORRUPT.
+ *
+ * **The call that returns zero bytes is where the CRC verdict arrives.** A
+ * checksum covers a whole member, so it cannot be reported on the call that hands
+ * over the last of the data - the caller would lose those bytes to an error
+ * return. It is reported on the next call instead, which is the one that says the
+ * member is over.
+ *
+ * @param archive The archive.
+ * @param buffer Destination.
+ * @param capacity Its size.
+ * @param out_read Receives the count; 0 at the end of the member.
+ * @return ::GARC_OK, ::GARC_ERR_CORRUPT for a truncated member or a CRC that
+ *   does not match, ::GARC_ERR_LIMIT_CODEC_BYTES for a member that expands past
+ *   what it declared, or a stream failure.
+ */
+GARC_Result garc_zip_read(
+    GARC_Archive * archive, void * buffer, size_t capacity, size_t * out_read);
+
+/**
+ * Abandon the rest of the current member's data.
+ *
+ * **Nothing is read and nothing is sought**, because in a zip nothing depends on
+ * where the stream is: the next member's position comes from the central
+ * directory. So this drops the decoder and the byte count, and - deliberately -
+ * the CRC verdict with them, since a member that was not read has no checksum to
+ * compare against.
+ *
+ * @param archive The archive.
+ * @return ::GARC_OK.
+ */
+GARC_Result garc_zip_skip(GARC_Archive * archive);
+
+/**
  * Step to the next central directory entry and describe it.
  *
  * @param archive The archive.

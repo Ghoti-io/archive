@@ -872,6 +872,155 @@ TEST(Codec, TheSameArchiveUncompressedIsFindable) {
   garc_stream_destroy(stream);
 }
 
+//-----------------------------------------------------------------------------
+// One member's decoder, which the zip reader uses and the tar reader does not
+//-----------------------------------------------------------------------------
+
+namespace {
+
+/** One codec stream over raw bytes, with no archive around it. */
+std::string compress_one(const char * method, const std::string & plain) {
+  GARC_Sink * memory = nullptr;
+  if (garc_sink_create_memory(&memory) != GARC_OK) {
+    return {};
+  }
+  GARC_Sink * packer = nullptr;
+  if (garc_sink_create_compress(memory, method, nullptr, &packer) != GARC_OK) {
+    garc_sink_destroy(memory);
+    return {};
+  }
+  std::string out;
+  if (garc_sink_write(packer, plain.data(), plain.size()) == GARC_OK
+      && garc_sink_finish(packer) == GARC_OK) {
+    out = collected(memory);
+  }
+  garc_sink_destroy(packer);
+  garc_sink_destroy(memory);
+  return out;
+}
+
+} // namespace
+
+TEST(MemberCodec, ABoundedDecoderStopsAtItsLength) {
+  // The object the zip reader holds per compressed member: a bounded view of the
+  // stream and a decoder over it. What the bound is for is the bytes *after* the
+  // member - in a zip that is the next member's local header, and here it is a
+  // second deflate stream, which the decoder must not reach.
+  const std::string first = compress_one("deflate", std::string(400u, 'a'));
+  const std::string second = compress_one("deflate", std::string(400u, 'b'));
+  ASSERT_FALSE(first.empty());
+  ASSERT_FALSE(second.empty());
+  const std::string both = first + second;
+
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(both.data(), both.size(), &inner));
+  GARC_Member_Codec * codec = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_member_codec_create(nullptr, inner, "deflate", first.size(), 400u,
+          &codec));
+  std::string out;
+  char buffer[64];
+  size_t got = 0;
+  GARC_Result result;
+  while ((result = garc_stream_read(
+              garc_member_codec_stream(codec), buffer, sizeof(buffer), &got))
+          == GARC_OK
+      && got) {
+    out.append(buffer, got);
+  }
+  EXPECT_EQ(GARC_OK, result);
+  EXPECT_EQ(std::string(400u, 'a'), out);
+  garc_member_codec_destroy(codec);
+  garc_stream_destroy(inner);
+}
+
+TEST(MemberCodec, TheOutputCapIsTheDeclaredSize) {
+  // Set to the member's declared size, which is tighter than compress's 512 MiB
+  // default for a small member and looser for a big one. Here it is tighter: the
+  // stream expands to 400 bytes and the cap says 16.
+  const std::string packed = compress_one("deflate", std::string(400u, 'c'));
+  ASSERT_FALSE(packed.empty());
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(packed.data(), packed.size(), &inner));
+  GARC_Member_Codec * codec = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_member_codec_create(nullptr, inner, "deflate", packed.size(), 16u,
+          &codec));
+  std::string out;
+  char buffer[256];
+  size_t got = 0;
+  GARC_Result result;
+  while ((result = garc_stream_read(
+              garc_member_codec_stream(codec), buffer, sizeof(buffer), &got))
+          == GARC_OK
+      && got) {
+    out.append(buffer, got);
+  }
+  EXPECT_EQ(GARC_ERR_LIMIT_CODEC_BYTES, result);
+  EXPECT_LE(out.size(), 16u);
+  garc_member_codec_destroy(codec);
+  garc_stream_destroy(inner);
+}
+
+TEST(MemberCodec, AMethodCompressDoesNotHaveIsRefused) {
+  const std::string bytes = "not a codec stream";
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(bytes.data(), bytes.size(), &inner));
+  GARC_Member_Codec * codec = nullptr;
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED,
+      garc_member_codec_create(nullptr, inner, "nosuchmethod", bytes.size(),
+          16u, &codec));
+  EXPECT_EQ(nullptr, codec);
+  garc_stream_destroy(inner);
+}
+
+TEST(MemberCodec, TheArgumentsAreChecked) {
+  GARC_Member_Codec * codec = nullptr;
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_memory("x", 1u, &inner));
+  EXPECT_EQ(GARC_ERR_INVALID,
+      garc_member_codec_create(nullptr, nullptr, "deflate", 1u, 1u, &codec));
+  EXPECT_EQ(GARC_ERR_INVALID,
+      garc_member_codec_create(nullptr, inner, nullptr, 1u, 1u, &codec));
+  EXPECT_EQ(GARC_ERR_INVALID,
+      garc_member_codec_create(nullptr, inner, "deflate", 1u, 1u, nullptr));
+  // And the accessors on nothing, which is what a caller holding a failed
+  // create would have.
+  EXPECT_EQ(nullptr, garc_member_codec_stream(nullptr));
+  garc_member_codec_destroy(nullptr);
+  garc_stream_destroy(inner);
+}
+
+TEST(MemberCodec, NoCapMeansNoOptions) {
+  // A member that declares nothing gets no cap, which is the one case where the
+  // options object is not created at all - so this is the arm where compress's
+  // own default applies.
+  const std::string packed = compress_one("deflate", std::string(100u, 'd'));
+  ASSERT_FALSE(packed.empty());
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(packed.data(), packed.size(), &inner));
+  GARC_Member_Codec * codec = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_member_codec_create(nullptr, inner, "deflate", packed.size(), 0u,
+          &codec));
+  std::string out;
+  char buffer[256];
+  size_t got = 0;
+  while (garc_stream_read(
+             garc_member_codec_stream(codec), buffer, sizeof(buffer), &got)
+          == GARC_OK
+      && got) {
+    out.append(buffer, got);
+  }
+  EXPECT_EQ(std::string(100u, 'd'), out);
+  garc_member_codec_destroy(codec);
+  garc_stream_destroy(inner);
+}
+
 int main(int argc, char ** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

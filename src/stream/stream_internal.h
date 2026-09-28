@@ -29,6 +29,7 @@
 
 #include <ghoti.io/archive/macros.h>
 
+#include <ghoti.io/archive/allocator.h>
 #include <ghoti.io/archive/stream.h>
 #include <stdint.h>
 
@@ -63,6 +64,36 @@ struct GARC_Stream {
    */
   void (*owned_destroy)(GARC_Stream * stream);
 };
+
+/**
+ * Create a stream over the next @p length bytes of another stream.
+ *
+ * A **bounded view**: it reads from @p inner at wherever @p inner happens to be
+ * and reports the end of the stream after @p length bytes, whatever @p inner has
+ * left. No seek and no size, for the same reason a decompressing stream has
+ * neither - it is a window onto something else's position, and offering a seek
+ * would mean deciding what a seek means for the thing behind it.
+ *
+ * @p inner is **borrowed**: it must outlive the returned stream, and
+ * ::garc_stream_destroy() does not destroy it.
+ *
+ * It exists because a zip member's compressed data is a *range* inside a file,
+ * and the decompressing stream in codec.c decompresses until its input ends -
+ * so without a bound it would read the next member's local header as more
+ * deflate data. A short read from @p inner before the bound is reached is the end
+ * of this stream too; whether that is a truncated member is the caller's
+ * question, because only the caller knows how many bytes were owed.
+ *
+ * @param inner Where the bytes come from.
+ * @param length How many of them belong to this view.
+ * @param allocator Allocator for the stream and its state. NULL uses the
+ *   default.
+ * @param out_stream Receives the stream on success.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID, or ::GARC_ERR_OOM.
+ */
+GARC_Result garc_stream_create_slice_with_allocator(GARC_Stream * inner,
+    uint64_t length, const GARC_Allocator * allocator,
+    GARC_Stream ** out_stream);
 
 #ifdef __cplusplus
 }

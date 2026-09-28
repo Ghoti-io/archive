@@ -69,10 +69,28 @@ be.
 zip64 is read as the format defines it - a value is in a 0x0001 extra field only
 for the fields that hold the `0xFFFFFFFF` marker, which is why `zip -fz` produces
 an eight-byte field where a reader consuming the values positionally expects
-sixteen. Method 0 is read; 8, 9, 12, 14, 93 and 98 are refused with a status and
-an accessor that **name the method number**, so the refusal is a to-do list.
-ZipCrypto and WinZip AES are named separately from each other and from
-"unsupported", because a caller needs to know whether a password could ever help.
+sixteen.
+
+**Methods 0 and 8 are read, and 93 with them**, through `compress`: a member is a
+bounded view of the file with a decoder over it, so method 8 is RFC 1951 raw and
+method 93 a zstd frame with no new format code either way. **Method 9 is refused
+on purpose** - "enhanced deflate" is not RFC 1951, so pointing it at the deflate
+decoder would produce plausible wrong bytes for the members that use its
+extensions. 12, 14, 95 and 98 are refused too, with a status and an accessor that
+**name the method number**, so the refusal is a to-do list. ZipCrypto and WinZip
+AES are named separately from each other and from "unsupported", because a caller
+needs to know whether a password could ever help.
+
+**Every member's CRC-32 is checked**, which tar has nothing like: reading a member
+to its end and getting `GARC_OK` means this reader and the writer agree about
+every one of its bytes. The verdict arrives on the call that returns zero bytes,
+because reporting it on the call that hands over the last of the data would make
+the caller lose those bytes to an error return - and a caller that stops half way
+is told nothing, since half a member has no checksum to compare against. The
+decoder's output cap is the member's **declared** size, which is tighter than
+`compress`'s 512 MiB default for the small members a bomb hides among and looser
+for the legitimate member that is bigger than that.
+
 Reading a zip needs a seekable stream, and a zip on a pipe is
 `GARC_ERR_NOT_SEEKABLE` rather than "not an archive".
 
@@ -107,13 +125,12 @@ the digits in a numeric field, whether to use the ustar name split, what the
 extended header is called — so each was measured and each choice is argued in
 `documentation/design.md` rather than copied.
 
-Build clean under GCC 14 with `-Werror`; 481 tests; 99.4% line coverage of 2,677
-lines, with the zip reader at 100%; the seventeen uncovered lines are four
-`default:` arms no input can reach - kept so that a third format added to an enum
-and not to a switch is a named internal error rather than a silent fall-through -
-seven arms only a codec that broke its own contract reaches, and the six this
-library has always had, three of which are live only where `size_t` is 32 bits and
-one of which needs a pax record set larger than `INT64_MAX`. Clean under Valgrind
+Build clean under GCC 14 with `-Werror`; 507 tests; 99.3% line coverage of 2,824
+lines; the twenty uncovered are four `default:` arms no input can reach - kept so
+that a third format added to an enum and not to a switch is a named internal error
+rather than a silent fall-through - eleven arms reachable only if a codec or
+`compress`'s own allocator broke its contract, and the five this library has always
+had, three of which are live only where `size_t` is 32 bits. Clean under Valgrind
 and under ASan+UBSan; `check-symbols`, `check-aliasing`, `check-corpus-hashes`,
 `check-fixtures` and `check-docs` green, the last at zero Doxygen warnings; five
 fuzz harnesses.

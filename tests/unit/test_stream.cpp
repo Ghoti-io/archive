@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include "stream/stream_internal.h"
 #include "test_helpers.h"
 
 using garctest::BufferSource;
@@ -628,6 +629,126 @@ TEST(StreamSkip, WhereAFailedSkipLeavesTheOffsetDependsOnTheShape) {
 
 TEST(StreamSkip, RejectsNull) {
   EXPECT_EQ(garc_stream_skip(nullptr, 1), GARC_ERR_INVALID);
+}
+
+//-----------------------------------------------------------------------------
+// A bounded view of another stream
+//-----------------------------------------------------------------------------
+
+TEST(Slice, TheViewEndsAtItsLengthAndNotAtTheInnerStreamsEnd) {
+  // **What the bound is for.** A zip member's compressed data is a range inside a
+  // file, and the next member's local header is immediately behind it - so a
+  // decoder reading "until the input ends" would read that header as more
+  // compressed data. Reporting the end of the stream at the bound is what stops
+  // it.
+  const std::string bytes = "0123456789";
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(bytes.data(), bytes.size(), &inner));
+  ASSERT_EQ(GARC_OK, garc_stream_seek(inner, 2u));
+
+  GARC_Stream * slice = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_slice_with_allocator(inner, 4u, nullptr, &slice));
+
+  char buffer[16];
+  size_t got = 0;
+  ASSERT_EQ(GARC_OK, garc_stream_read(slice, buffer, sizeof(buffer), &got));
+  EXPECT_EQ(std::string(buffer, got), "2345");
+  // And then the end of the view, with the inner stream still holding bytes.
+  ASSERT_EQ(GARC_OK, garc_stream_read(slice, buffer, sizeof(buffer), &got));
+  EXPECT_EQ(got, 0u);
+  ASSERT_EQ(GARC_OK, garc_stream_read(inner, buffer, sizeof(buffer), &got));
+  EXPECT_EQ(std::string(buffer, got), "6789");
+
+  garc_stream_destroy(slice);
+  garc_stream_destroy(inner);
+}
+
+TEST(Slice, TheViewHasNoSeekAndNoSize) {
+  // The same answer a decompressing stream gives, and for the same reason: it is
+  // a window onto something else's position, so offering a seek would mean
+  // deciding what a seek means for the thing behind it.
+  const std::string bytes = "abcdef";
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(bytes.data(), bytes.size(), &inner));
+  GARC_Stream * slice = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_slice_with_allocator(inner, 3u, nullptr, &slice));
+  EXPECT_EQ(0, garc_stream_is_seekable(slice));
+  uint64_t size = 0;
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED, garc_stream_size(slice, &size));
+  garc_stream_destroy(slice);
+  garc_stream_destroy(inner);
+}
+
+TEST(Slice, AShortInnerStreamEndsTheViewEarly) {
+  // A view longer than what is behind it. Not an error here: only the caller
+  // knows how many bytes were owed, so "the inner stream ran out" is reported as
+  // the end of the view and the caller decides whether that was a truncated
+  // member.
+  const std::string bytes = "ab";
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(bytes.data(), bytes.size(), &inner));
+  GARC_Stream * slice = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_slice_with_allocator(inner, 100u, nullptr, &slice));
+  char buffer[16];
+  size_t got = 0;
+  ASSERT_EQ(GARC_OK, garc_stream_read(slice, buffer, sizeof(buffer), &got));
+  EXPECT_EQ(std::string(buffer, got), "ab");
+  ASSERT_EQ(GARC_OK, garc_stream_read(slice, buffer, sizeof(buffer), &got));
+  EXPECT_EQ(got, 0u);
+  garc_stream_destroy(slice);
+  garc_stream_destroy(inner);
+}
+
+TEST(Slice, AFailingInnerReadIsReportedRatherThanEndingTheView) {
+  const std::string bytes = "abcdef";
+  BufferSource source(bytes.data(), bytes.size(), true, true);
+  source.fail_reads(1u);
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_callback(source.callbacks(), &inner));
+  GARC_Stream * slice = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_slice_with_allocator(inner, 3u, nullptr, &slice));
+  char buffer[16];
+  size_t got = 0;
+  EXPECT_EQ(GARC_ERR_IO, garc_stream_read(slice, buffer, sizeof(buffer), &got));
+  garc_stream_destroy(slice);
+  garc_stream_destroy(inner);
+}
+
+TEST(Slice, ItsArgumentsAreChecked) {
+  GARC_Stream * slice = nullptr;
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_memory("x", 1u, &inner));
+  EXPECT_EQ(GARC_ERR_INVALID,
+      garc_stream_create_slice_with_allocator(nullptr, 1u, nullptr, &slice));
+  EXPECT_EQ(GARC_ERR_INVALID,
+      garc_stream_create_slice_with_allocator(inner, 1u, nullptr, nullptr));
+  garc_stream_destroy(inner);
+}
+
+TEST(Slice, AZeroLengthViewIsImmediatelyOver) {
+  // The member with no data, which every zip has - a directory entry. A view of
+  // nothing must not read the byte behind it.
+  const std::string bytes = "abc";
+  GARC_Stream * inner = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_memory(bytes.data(), bytes.size(), &inner));
+  GARC_Stream * slice = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_stream_create_slice_with_allocator(inner, 0u, nullptr, &slice));
+  char buffer[8];
+  size_t got = 42u;
+  ASSERT_EQ(GARC_OK, garc_stream_read(slice, buffer, sizeof(buffer), &got));
+  EXPECT_EQ(got, 0u);
+  EXPECT_EQ(garc_stream_tell(inner), 0u);
+  garc_stream_destroy(slice);
+  garc_stream_destroy(inner);
 }
 
 int main(int argc, char ** argv) {

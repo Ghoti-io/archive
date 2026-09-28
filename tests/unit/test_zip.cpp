@@ -479,35 +479,87 @@ TEST(Zip, TheSizesComeFromTheCentralDirectoryAndNotTheLocalHeader) {
 // Methods and encryption: what is refused, and how the refusal names itself
 //-----------------------------------------------------------------------------
 
-TEST(Zip, StoredMembersAreReadableAndDeflatedOnesAreRefusedByName) {
-  Fixture fixture("infozip-deflate.zip");
+TEST(Zip, StoredAndDeflatedMembersReadTheSameBytes) {
+  // **Four writers' deflate against one reader, with a free oracle.** Every
+  // member of python-methods.zip is the same 1,160 bytes under a different
+  // method, so the stored member is what the deflated one has to equal - no
+  // expectation written here, just two members of the corpus that must agree.
+  // A decoder that dropped a block or ended early fails this without anyone
+  // having to say what the content was.
+  Fixture fixture("python-methods.zip");
   ASSERT_EQ(fixture.open_result(), GARC_OK);
   const GARC_Member * member = nullptr;
-  size_t stored = 0;
-  size_t deflated = 0;
+  std::string stored;
+  std::string deflated;
+  size_t refused = 0;
   while (garc_next(fixture.archive(), &member) == GARC_OK) {
     const uint16_t method = garc_zip_member_method(fixture.archive());
-    char buffer[64];
-    size_t got = 0;
-    const GARC_Result result
-        = garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got);
+    const std::string name = member_name(member);
     if (method == GARC_ZIP_METHOD_STORED) {
-      EXPECT_EQ(result, GARC_OK);
-      ++stored;
+      stored = read_all(fixture.archive());
+    }
+    else if (method == GARC_ZIP_METHOD_DEFLATE) {
+      deflated = read_all(fixture.archive());
     }
     else {
-      EXPECT_EQ(method, GARC_ZIP_METHOD_DEFLATE);
-      // **Refused, and the number is available.** Not a silent zero-byte read:
-      // that would hand a caller an empty file for a compressed one.
-      EXPECT_EQ(result, GARC_ERR_UNSUPPORTED);
-      EXPECT_STREQ(garc_zip_method_string(method), "deflate");
-      ++deflated;
+      char buffer[64];
+      size_t got = 0;
+      EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
+          GARC_ERR_UNSUPPORTED) << name;
+      ++refused;
     }
   }
-  // Info-ZIP stores what deflate would not shrink, so this fixture has both -
-  // which is the only reason this test can compare them.
-  EXPECT_GE(stored, 1u);
-  EXPECT_GE(deflated, 1u);
+  EXPECT_EQ(deflated.size(), 1160u);
+  EXPECT_EQ(deflated, stored);
+  EXPECT_EQ(refused, 2u) << "bzip2 and lzma have no codec here";
+}
+
+TEST(ZipCorpus, EveryDeflatedMemberInTheCorpusReadsAndItsCrcVerifies) {
+  // **Every deflated member of every fixture, from four writers.** The CRC is
+  // declared in the archive by the writer, so a member that reads cleanly to the
+  // end is one where this reader and that writer agree about all of its bytes -
+  // which is a stronger statement than any expectation written here could be, and
+  // the only one that scales to the whole corpus.
+  size_t deflated = 0;
+  size_t stored = 0;
+  size_t unsupported = 0;
+  for (const auto & entry : manifest()) {
+    Fixture fixture(entry.first);
+    ASSERT_EQ(fixture.open_result(), GARC_OK) << entry.first;
+    const GARC_Member * member = nullptr;
+    while (garc_next(fixture.archive(), &member) == GARC_OK) {
+      const std::string where = entry.first + " " + member_name(member);
+      char buffer[512];
+      size_t got = 0;
+      uint64_t total = 0;
+      GARC_Result result;
+      while ((result = garc_read_member(fixture.archive(), buffer,
+                  sizeof(buffer), &got))
+              == GARC_OK
+          && got) {
+        total += got;
+      }
+      if (result == GARC_ERR_UNSUPPORTED) {
+        ++unsupported;
+        continue;
+      }
+      // GARC_OK here is both "the bytes were all there" and "the CRC the writer
+      // declared is the CRC of what came out".
+      EXPECT_EQ(result, GARC_OK) << where << ": " << garc_result_string(result);
+      EXPECT_EQ(total, member->size) << where;
+      if (garc_zip_member_method(fixture.archive()) == GARC_ZIP_METHOD_DEFLATE) {
+        ++deflated;
+      }
+      else {
+        ++stored;
+      }
+    }
+  }
+  // The denominator, so a corpus that stopped containing deflated members would
+  // fail here rather than passing with nothing to decompress.
+  EXPECT_GE(deflated, 4u);
+  EXPECT_GE(stored, 20u);
+  EXPECT_GE(unsupported, 5u) << "bzip2, lzma, ppmd, deflate64, AES, ZipCrypto";
 }
 
 TEST(Zip, EveryCodecGatedMethodRefusesWithItsNumber) {
@@ -519,6 +571,10 @@ TEST(Zip, EveryCodecGatedMethodRefusesWithItsNumber) {
     uint16_t method;
     const char * name;
   } cases[] = {
+    // Method 9 is the one worth naming: "enhanced deflate" is *not* RFC 1951 - a
+    // 64 KB window and a different length code - so pointing it at the deflate
+    // decoder would produce plausible wrong bytes for the members that use the
+    // extensions and correct ones for the members that do not.
     {"sevenzip-deflate64.zip", GARC_ZIP_METHOD_DEFLATE64,
         "enhanced deflate (deflate64)"},
     {"sevenzip-methods.zip", GARC_ZIP_METHOD_BZIP2, "bzip2"},

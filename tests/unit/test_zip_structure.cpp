@@ -87,6 +87,57 @@ std::vector<uint8_t> control() {
 }
 
 /**
+ * Compress bytes with one of `compress`'s codecs, through this library's sink.
+ *
+ * **The payload of a compressed zip member has to come from somewhere, and no
+ * tool here will write one to order.** `ZipBuilder` stores what it is given, so a
+ * test about method 8 needs the deflate bytes; this makes them with the public
+ * compressing sink, which is the same codec the reader will use to undo them.
+ *
+ * What that does and does not test is worth being clear about: it does *not* show
+ * that deflate is implemented correctly - that is `compress`'s question, and the
+ * corpus answers the container's half by handing the reader payloads four real
+ * writers produced. What it tests is the **routing**: that a member declaring
+ * method 8 reaches the deflate decoder with the right bounds, and one declaring
+ * 93 reaches zstd.
+ */
+std::string compress_with(const char * method, const std::string & plain) {
+  GARC_Sink * memory = nullptr;
+  if (garc_sink_create_memory(&memory) != GARC_OK) {
+    return std::string();
+  }
+  GARC_Sink * packer = nullptr;
+  if (garc_sink_create_compress(memory, method, nullptr, &packer) != GARC_OK) {
+    garc_sink_destroy(memory);
+    return std::string();
+  }
+  std::string out;
+  if (garc_sink_write(packer, plain.data(), plain.size()) == GARC_OK
+      && garc_sink_finish(packer) == GARC_OK) {
+    const void * bytes = nullptr;
+    size_t length = 0;
+    if (garc_sink_data(memory, &bytes, &length) == GARC_OK) {
+      out.assign(static_cast<const char *>(bytes), length);
+    }
+  }
+  garc_sink_destroy(packer);
+  garc_sink_destroy(memory);
+  return out;
+}
+
+/** Add a member whose stored bytes are a real codec stream of `plain`. */
+void add_compressed(ZipBuilder & builder, const std::string & name,
+    const std::string & plain, uint16_t method, const char * codec) {
+  const std::string packed = compress_with(codec, plain);
+  builder.add(name, packed);
+  builder.last().method = method;
+  builder.last().crc = ZipBuilder::crc32(plain);
+  builder.last().override_sizes = true;
+  builder.last().central_compressed_size = static_cast<uint32_t>(packed.size());
+  builder.last().central_size = static_cast<uint32_t>(plain.size());
+}
+
+/**
  * Every shape a sweep has to cover, because each reads something the others do
  * not.
  *
@@ -129,6 +180,15 @@ std::vector<std::pair<std::string, std::vector<uint8_t>>> shapes() {
     builder.add("hello.txt", "hello, archive\n");
     builder.zip64();
     out.emplace_back("zip64", builder.build());
+  }
+  {
+    // A deflated member, which reads through a decoder and a bounded view of the
+    // stream rather than from the stream itself - two more objects to allocate and
+    // a different read arm.
+    ZipBuilder builder;
+    add_compressed(builder, "packed.txt", std::string(600u, 'p'),
+        GARC_ZIP_METHOD_DEFLATE, "deflate");
+    out.emplace_back("deflated", builder.build());
   }
   return out;
 }
@@ -1312,6 +1372,301 @@ TEST(ZipStructure, AStubInFrontIsMeasuredAndApplied) {
   ASSERT_EQ(garc_read_member(built.archive(), buffer, sizeof(buffer), &got),
       GARC_OK);
   EXPECT_EQ(std::string(buffer, got), "hello, archive\n");
+}
+
+//-----------------------------------------------------------------------------
+// Compressed members
+//-----------------------------------------------------------------------------
+
+/** Read a member's whole data, returning the status that ended it. */
+GARC_Result read_member(GARC_Archive * archive, std::string * out) {
+  char buffer[128];
+  size_t got = 0;
+  GARC_Result result;
+  while ((result = garc_read_member(archive, buffer, sizeof(buffer), &got))
+          == GARC_OK
+      && got) {
+    out->append(buffer, got);
+  }
+  return result;
+}
+
+TEST(ZipStructure, ADeflatedMemberIsDecompressedAndItsCrcChecked) {
+  const std::string plain(2000u, 'a');
+  ZipBuilder builder;
+  add_compressed(builder, "packed.txt", plain, GARC_ZIP_METHOD_DEFLATE,
+      "deflate");
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  EXPECT_EQ(member->size, plain.size());
+  EXPECT_LT(garc_zip_member_compressed_size(built.archive()), plain.size())
+      << "the payload is supposed to be smaller than the plaintext";
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_OK);
+  EXPECT_EQ(out, plain);
+}
+
+TEST(ZipStructure, AZstdMemberReachesTheZstdDecoder) {
+  // Method 93. No writer in the corpus produces one - 7-Zip refuses `-mm=zstd`
+  // for the zip container and Python gains ZIP_ZSTANDARD only in 3.14 - so this
+  // is the only place the routing is exercised. What it shows is that a member
+  // declaring 93 reaches zstd rather than deflate; the next test is the control
+  // for that claim.
+  const std::string plain = "zstd in a zip, which nothing here will write\n";
+  ZipBuilder builder;
+  add_compressed(builder, "packed.zst", plain, GARC_ZIP_METHOD_ZSTD, "zstd");
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  EXPECT_EQ(garc_zip_member_method(built.archive()), GARC_ZIP_METHOD_ZSTD);
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_OK);
+  EXPECT_EQ(out, plain);
+}
+
+TEST(ZipStructure, AMethodThatDoesNotMatchThePayloadIsRefused) {
+  // The same bytes with the wrong number on them. A reader that ignored the
+  // method - or pointed every method at deflate - would produce plausible
+  // nonsense here instead of a refusal.
+  const std::string plain(500u, 'b');
+  ZipBuilder builder;
+  add_compressed(builder, "mislabelled", plain, GARC_ZIP_METHOD_ZSTD,
+      "deflate");
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  std::string out;
+  const GARC_Result result = read_member(built.archive(), &out);
+  EXPECT_NE(result, GARC_OK) << "read " << out.size() << " bytes";
+  EXPECT_NE(out, plain);
+}
+
+TEST(ZipStructure, EnhancedDeflateIsNotPointedAtTheDeflateDecoder) {
+  // **Method 9 is not RFC 1951.** It allows a 64 KB window and a different
+  // length code, so a member using either would decode to plausible wrong bytes -
+  // and one that used neither would decode correctly, which is what makes this
+  // the dangerous kind of nearly-right. Refused by name, with the number
+  // available.
+  const std::string plain(500u, 'c');
+  ZipBuilder builder;
+  add_compressed(builder, "enhanced", plain, GARC_ZIP_METHOD_DEFLATE64,
+      "deflate");
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  char buffer[64];
+  size_t got = 0;
+  EXPECT_EQ(garc_read_member(built.archive(), buffer, sizeof(buffer), &got),
+      GARC_ERR_UNSUPPORTED);
+  EXPECT_EQ(garc_zip_member_method(built.archive()), GARC_ZIP_METHOD_DEFLATE64);
+}
+
+TEST(ZipStructure, AWrongCrcIsRefusedOnTheCallThatEndsTheMember) {
+  // The data is fine and the declared checksum is not, which is the only thing a
+  // CRC catches that a size cannot. The refusal arrives on the call that returns
+  // zero bytes: reporting it on the call that hands over the last of the data
+  // would make the caller lose those bytes to an error return.
+  ZipBuilder builder;
+  builder.add("hello.txt", "hello, archive\n");
+  builder.last().crc = 0xDEADBEEFu;
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  char buffer[64];
+  size_t got = 0;
+  ASSERT_EQ(garc_read_member(built.archive(), buffer, sizeof(buffer), &got),
+      GARC_OK);
+  EXPECT_EQ(std::string(buffer, got), "hello, archive\n")
+      << "the data is still handed over";
+  EXPECT_EQ(garc_read_member(built.archive(), buffer, sizeof(buffer), &got),
+      GARC_ERR_CORRUPT);
+}
+
+TEST(ZipStructure, AWrongCrcOnADeflatedMemberIsRefusedToo) {
+  const std::string plain(300u, 'd');
+  ZipBuilder builder;
+  add_compressed(builder, "packed.txt", plain, GARC_ZIP_METHOD_DEFLATE,
+      "deflate");
+  builder.last().crc ^= 1u;
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_ERR_CORRUPT);
+  EXPECT_EQ(out, plain) << "and the bytes were still handed over first";
+}
+
+TEST(ZipStructure, APartialReadGetsNoCrcVerdict) {
+  // Half a member has no checksum to compare against, so a caller that stops
+  // early is told nothing rather than told something false.
+  ZipBuilder builder;
+  builder.add("hello.txt", "hello, archive\n");
+  builder.last().crc = 0xDEADBEEFu;
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  char buffer[4];
+  size_t got = 0;
+  EXPECT_EQ(garc_read_member(built.archive(), buffer, sizeof(buffer), &got),
+      GARC_OK);
+  EXPECT_EQ(got, 4u);
+  // And the walk continues, because the member was never finished.
+  EXPECT_EQ(garc_next(built.archive(), &member), GARC_END);
+}
+
+TEST(ZipStructure, ASkippedMemberGetsNoVerdictAndCostsNoReads) {
+  // Skipping a zip member reads nothing and seeks nothing: the next member's
+  // position is in the central directory. So the wrong CRC below is never
+  // noticed, which is the point - a skip says the bytes are not wanted.
+  ZipBuilder builder;
+  builder.add("hello.txt", "hello, archive\n");
+  builder.last().crc = 0xDEADBEEFu;
+  builder.add("second.txt", "and another\n");
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  EXPECT_EQ(garc_skip_member(built.archive()), GARC_OK);
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  EXPECT_EQ(std::string(member->name, member->name_length), "second.txt");
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_OK);
+  EXPECT_EQ(out, "and another\n");
+}
+
+TEST(ZipStructure, AMemberThatExpandsPastItsDeclaredSizeIsBounded) {
+  // **The bomb, and the tight bound.** A zip declares each member's uncompressed
+  // size before any of its bytes are read, so the decoder's output cap is set to
+  // exactly that - no ratio and no guess. What must not happen is 5,000 bytes out
+  // of a member that declared 16.
+  const std::string plain(5000u, 'e');
+  ZipBuilder builder;
+  add_compressed(builder, "bomb", plain, GARC_ZIP_METHOD_DEFLATE, "deflate");
+  builder.last().central_size = 16u;
+  builder.last().crc = ZipBuilder::crc32(plain.substr(0, 16));
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  EXPECT_EQ(member->size, 16u);
+  std::string out;
+  const GARC_Result result = read_member(built.archive(), &out);
+  EXPECT_LE(out.size(), 16u) << garc_result_string(result);
+}
+
+TEST(ZipStructure, ATruncatedCompressedMemberIsCorrupt) {
+  // The declared size says 2,000 bytes and the payload runs out first. From
+  // outside the decoder that is indistinguishable from a short read, and both are
+  // the same answer: the archive said the bytes were there.
+  const std::string plain(2000u, 'f');
+  const std::string packed = compress_with("deflate", plain);
+  ASSERT_GT(packed.size(), 8u);
+  ZipBuilder builder;
+  builder.add("packed.txt", packed.substr(0, packed.size() - 4u));
+  builder.last().method = GARC_ZIP_METHOD_DEFLATE;
+  builder.last().crc = ZipBuilder::crc32(plain);
+  builder.last().override_sizes = true;
+  builder.last().central_compressed_size
+      = static_cast<uint32_t>(packed.size() - 4u);
+  builder.last().central_size = static_cast<uint32_t>(plain.size());
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_ERR_CORRUPT);
+  EXPECT_LT(out.size(), plain.size());
+}
+
+TEST(ZipStructure, AMemberDeclaringMoreDataThanFitsBeforeTheDirectoryIsRefused) {
+  // A stored member whose declared size reaches into the central directory. Read
+  // without this check it would be handed the directory's own bytes as its
+  // contents - the CRC would refuse it afterwards, and afterwards is too late for
+  // a caller who ignored the status.
+  ZipBuilder builder;
+  builder.add("hello.txt", "hello, archive\n");
+  builder.last().override_sizes = true;
+  builder.last().central_size = 400u;
+  builder.last().central_compressed_size = 400u;
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  EXPECT_EQ(built.walk(), GARC_ERR_CORRUPT);
+}
+
+TEST(ZipStructure, ACompressedStreamThatEndsEarlyButValidlyIsCorrupt) {
+  // **Different from a truncated payload.** The deflate stream here is complete -
+  // final block, correct checksums, nothing cut - and it produces 1,000 bytes for
+  // a member that declared 2,000. The decoder is happy and the archive is not
+  // telling the truth, so the refusal has to come from the size rather than from
+  // the codec.
+  const std::string half(1000u, 'i');
+  const std::string packed = compress_with("deflate", half);
+  ZipBuilder builder;
+  builder.add("packed.txt", packed);
+  builder.last().method = GARC_ZIP_METHOD_DEFLATE;
+  builder.last().crc = ZipBuilder::crc32(std::string(2000u, 'i'));
+  builder.last().override_sizes = true;
+  builder.last().central_compressed_size = static_cast<uint32_t>(packed.size());
+  builder.last().central_size = 2000u;
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_ERR_CORRUPT);
+  EXPECT_EQ(out, half) << "the bytes that were there are still handed over";
+}
+
+TEST(ZipStructure, AReadOfNoBytesIsNotTheEndOfTheMember) {
+  // A zero-capacity read is a question about nothing, and the answer has to be
+  // zero bytes *without* the member being over - otherwise a caller with an empty
+  // buffer would be told the data had ended, and the CRC verdict would arrive
+  // before any of the bytes had been read.
+  ZipBuilder builder;
+  builder.add("hello.txt", "hello, archive\n");
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  char buffer[4];
+  size_t got = 42u;
+  EXPECT_EQ(garc_read_member(built.archive(), buffer, 0u, &got), GARC_OK);
+  EXPECT_EQ(got, 0u);
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_OK);
+  EXPECT_EQ(out, "hello, archive\n");
+}
+
+TEST(ZipStructure, TheDecoderStopsAtTheMembersLastByte) {
+  // **What the bounded view is for.** Two deflated members back to back: the
+  // first member's decoder has to stop where its compressed size ends rather than
+  // reading the second member's local header as more deflate data.
+  const std::string first(1000u, 'g');
+  const std::string second(1000u, 'h');
+  ZipBuilder builder;
+  add_compressed(builder, "first.txt", first, GARC_ZIP_METHOD_DEFLATE,
+      "deflate");
+  add_compressed(builder, "second.txt", second, GARC_ZIP_METHOD_DEFLATE,
+      "deflate");
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  std::string out;
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_OK);
+  EXPECT_EQ(out, first);
+  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
+  out.clear();
+  EXPECT_EQ(read_member(built.archive(), &out), GARC_OK);
+  EXPECT_EQ(out, second);
 }
 
 //-----------------------------------------------------------------------------

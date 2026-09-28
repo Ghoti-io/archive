@@ -255,6 +255,26 @@ typedef struct {
   GARC_Buffer extra;
   /** A symlink's target, which in zip is the member's *data*. */
   GARC_Buffer link;
+  /**
+   * The decoder over this member's compressed range, or NULL.
+   *
+   * NULL for a stored member, which is read straight from the archive's stream,
+   * and for one whose method has no codec here. Created by ::garc_zip_next() and
+   * destroyed by the next call to it, so a walk that never reads a member's data
+   * costs one allocation per compressed member and no I/O.
+   */
+  struct GARC_Member_Codec * codec;
+  /**
+   * CRC-32 of the bytes handed to the caller so far, unfinalized.
+   *
+   * zip declares a CRC-32 per member, which tar has nothing like, so this reader
+   * can tell a member whose bytes are wrong from one whose bytes are right - and
+   * does, at the end of the member. @ref crc_active says whether a verdict is
+   * still owed: a caller that stops reading half way gets none, because half a
+   * member has no checksum to compare against.
+   */
+  uint32_t running_crc;
+  int crc_active;                ///< Whether a CRC verdict is still owed.
   uint16_t method;               ///< The compression method number.
   uint16_t flags;                ///< The general purpose bit flags.
   uint16_t version_made_by;      ///< Host system in the high byte.

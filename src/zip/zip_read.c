@@ -41,10 +41,12 @@
 #include <ghoti.io/archive/macros.h>
 
 #include <ghoti.io/archive/zip.h>
+#include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/cutil/allocator.h>
 #include <stdint.h>
 #include <string.h>
 
+#include "codec/codec_internal.h"
 #include "core/buffer_internal.h"
 #include "reader/reader_internal.h"
 #include "zip/zip_internal.h"
@@ -723,6 +725,97 @@ static GARC_Result zip_read_link_target(
   return GARC_OK;
 }
 
+/**
+ * The `compress` method name for a zip method number, or NULL.
+ *
+ * **The one place a zip method number becomes a codec name**, and the reason the
+ * codec layer takes a string: a second enum here would be a copy of compress's
+ * list of methods, and the copy goes stale.
+ *
+ * Only two rows, and both are exact rather than approximate. Method 8 is RFC 1951
+ * *raw* - no zlib header and no gzip wrapper - which is `compress`'s `"deflate"`
+ * and not its `"zlib"`; reading one as the other fails on the first two bytes.
+ * Method 93 is a zstd frame, which `compress` has, so it comes almost free.
+ *
+ * Method 9 is deliberately absent. "Enhanced deflate" is *not* RFC 1951 - it
+ * allows a 64 KB window and a different length code - so pointing it at the
+ * deflate decoder would produce plausible wrong bytes for the members that use
+ * the extensions, which is worse than refusing it.
+ *
+ * @param method The method number from the central directory.
+ * @return A method name, or NULL when this library has no codec for it.
+ */
+static const char * zip_codec_name(uint16_t method) {
+  switch (method) {
+    case GARC_ZIP_METHOD_DEFLATE:
+      return "deflate";
+    case GARC_ZIP_METHOD_ZSTD:
+      return "zstd";
+    default:
+      return NULL;
+  }
+}
+
+GARC_Result garc_zip_read(
+    GARC_Archive * archive, void * buffer, size_t capacity, size_t * out_read) {
+  GARC_Zip_State * zip = &archive->zip;
+
+  if (!archive->data_remaining) {
+    *out_read = 0;
+    if (zip->crc_active) {
+      // **The verdict, on the call that says the member is over.** Cleared first,
+      // so a caller that keeps calling gets the answer once rather than on every
+      // call, and so that a second read after a refusal does not re-refuse.
+      zip->crc_active = 0;
+      if (gcomp_crc32_finalize(zip->running_crc) != zip->crc32) {
+        return GARC_ERR_CORRUPT;
+      }
+    }
+    return GARC_OK;
+  }
+  if (!capacity) {
+    *out_read = 0;
+    return GARC_OK;
+  }
+
+  // Never more than the member declared. For a stored member the bytes come
+  // straight from the archive's stream, where the next member's header is just
+  // behind this one's data; for a compressed member they come out of the decoder,
+  // which has the same cap in its own options.
+  size_t want = capacity;
+  if ((uint64_t)want > archive->data_remaining) {
+    want = (size_t)archive->data_remaining;
+  }
+
+  GARC_Stream * source = zip->codec
+      ? garc_member_codec_stream(zip->codec) : archive->stream;
+  size_t got = 0;
+  GARC_Result result = garc_stream_read(source, buffer, want, &got);
+  if (result != GARC_OK) {
+    return result;
+  }
+  if (!got) {
+    // The container said these bytes were here. For a compressed member this is
+    // also what a deflate stream that ended early looks like from out here, and
+    // both are the same answer: the archive lied about its size.
+    return GARC_ERR_CORRUPT;
+  }
+
+  zip->running_crc
+      = gcomp_crc32_update(zip->running_crc, (const uint8_t *)buffer, got);
+  archive->data_remaining -= (uint64_t)got;
+  *out_read = got;
+  return GARC_OK;
+}
+
+GARC_Result garc_zip_skip(GARC_Archive * archive) {
+  garc_member_codec_destroy(archive->zip.codec);
+  archive->zip.codec = NULL;
+  archive->zip.crc_active = 0;
+  archive->data_remaining = 0;
+  return GARC_OK;
+}
+
 GARC_Result garc_zip_next(GARC_Archive * archive) {
   GARC_Zip_State * zip = &archive->zip;
 
@@ -734,6 +827,14 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   // Per-member state, cleared at the top of every call for the reason the tar
   // reader gives for doing the same: a call that fails part way must not leave
   // anything of this member to be applied to the next one.
+  // The previous member's decoder, before anything else: it holds a slice of the
+  // stream this call is about to seek, so keeping it alive across the seek would
+  // leave an object whose view of the position is wrong.
+  garc_member_codec_destroy(zip->codec);
+  zip->codec = NULL;
+  zip->crc_active = 0;
+  zip->running_crc = GCOMP_CRC32_INIT;
+
   zip->name.length = 0;
   zip->link.length = 0;
   zip->extra.length = 0;
@@ -908,6 +1009,15 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   if (result != GARC_OK) {
     return result;
   }
+  // **A member's data has to fit between its header and the central directory.**
+  // Without this, a stored member that declares more bytes than sit between the
+  // two would be handed the directory's own bytes as its contents. The CRC check
+  // would catch it afterwards - and "afterwards" means a caller who ignored the
+  // status has already been given them.
+  if (compressed_size > zip->central_offset
+      || data_offset > zip->central_offset - compressed_size) {
+    return GARC_ERR_CORRUPT;
+  }
   member->data_offset = data_offset;
 
   if (member->type == GARC_MEMBER_SYMLINK) {
@@ -922,31 +1032,64 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
     return result;
   }
 
-  // **The data cursor counts the bytes in the *stream*, which for a stored
-  // member is also the uncompressed count.** A member with any other method has
-  // compressed bytes there, so reading it is refused rather than handing a
-  // caller the compressed form - and skipping it still works, which is what
-  // makes an archive with one bzip2 member walkable.
-  archive->data_remaining = compressed_size;
+  // **The data cursor counts uncompressed bytes owed to the caller**, which for a
+  // stored member is also the number of bytes left in the stream. A compressed
+  // member's stream position is the decoder's business, and the caller's count is
+  // the declared size either way.
+  archive->data_remaining = size;
   archive->data_padding = 0;
+  archive->data_refusal = GARC_OK;
+  const char * codec_name = zip_codec_name(zip->method);
+
   if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE) {
+    // The metadata is in the clear and the data is not. Phase H decrypts AES and
+    // the ZipCrypto reader arrives before it; until then the refusal names the
+    // scheme rather than the absence of a feature.
     archive->data_refusal = GARC_ERR_UNSUPPORTED;
   }
-  else if (zip->method != GARC_ZIP_METHOD_STORED) {
-    archive->data_refusal = GARC_ERR_UNSUPPORTED;
-  }
-  else if (compressed_size != size) {
-    // Stored means the two are the same number. A member that says otherwise is
-    // describing something the method cannot do, and the sizes are what a reader
-    // seeks by.
-    return GARC_ERR_CORRUPT;
-  }
-  else {
-    archive->data_refusal = GARC_OK;
+  else if (zip->method == GARC_ZIP_METHOD_STORED) {
+    if (compressed_size != size) {
+      // Stored means the two sizes are one number. A member that says otherwise
+      // describes something the method cannot do, and both numbers are things a
+      // reader seeks by.
+      return GARC_ERR_CORRUPT;
+    }
     result = garc_stream_seek(archive->stream, data_offset);
     if (result != GARC_OK) {
       return result;
     }
+    zip->crc_active = 1;
+  }
+  else if (codec_name) {
+    // Seek first: the decoder reads from wherever the stream is, and it reads
+    // lazily, so this is the only moment the position is known to be right.
+    result = garc_stream_seek(archive->stream, data_offset);
+    if (result != GARC_OK) {
+      return result;
+    }
+    result = garc_member_codec_create(archive->allocator, archive->stream,
+        codec_name, compressed_size, size, &zip->codec);
+    if (result != GARC_OK) {
+      // A method compress does not have after all, or no memory. Either way the
+      // member's metadata is still good, so this is a refusal on the *data*
+      // rather than a failure of the walk - the same answer a codec-gated method
+      // gets, arrived at from the other direction.
+      if (result != GARC_ERR_OOM) {
+        archive->data_refusal = result;
+        zip->codec = NULL;
+      }
+      else {
+        return result;
+      }
+    }
+    else {
+      zip->crc_active = 1;
+    }
+  }
+  else {
+    // A method with no codec here. The refusal names the number through
+    // garc_zip_member_method(), which is what makes it a to-do list.
+    archive->data_refusal = GARC_ERR_UNSUPPORTED;
   }
 
   zip->cursor = entry_end;
@@ -955,12 +1098,22 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
 }
 
 void garc_zip_rewind(GARC_Archive * archive) {
+  // The decoder belongs to a member, and a rewind leaves no current member - so
+  // it goes here as well as at the top of garc_zip_next(). Both are needed: a
+  // rewind that kept it would leave an object holding a slice of a stream the
+  // rewind has just moved, and garc_zip_next() clears it for the walk that does
+  // not start with a rewind.
+  garc_member_codec_destroy(archive->zip.codec);
+  archive->zip.codec = NULL;
+  archive->zip.crc_active = 0;
   archive->zip.cursor = archive->zip.central_offset;
   archive->zip.entries_seen = 0;
 }
 
 void garc_zip_release(GARC_Archive * archive) {
   GARC_Zip_State * zip = &archive->zip;
+  garc_member_codec_destroy(zip->codec);
+  zip->codec = NULL;
   GARC_Buffer * const buffers[4] = {
     &zip->comment,
     &zip->name,

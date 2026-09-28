@@ -290,6 +290,85 @@ GARC_Result garc_stream_seek(GARC_Stream * stream, uint64_t offset) {
   return GARC_OK;
 }
 
+////////////////////////////////////////////////////////////////////////
+// A bounded view of another stream
+////////////////////////////////////////////////////////////////////////
+
+/** What a slice stream keeps: where to read from, and how much is left. */
+typedef struct {
+  const GARC_Allocator * allocator; ///< For this state.
+  GARC_Stream * inner;              ///< Borrowed.
+  uint64_t remaining;               ///< Bytes of the view not yet read.
+} Stream_Slice;
+
+static GARC_Result stream_slice_read(
+    void * ctx, void * buffer, size_t size, size_t * out_read) {
+  Stream_Slice * slice = (Stream_Slice *)ctx;
+  if (!slice->remaining) {
+    // The end of the view, which is not the end of `inner`. Reporting zero is
+    // what makes a decoder behind this stop at the member's last byte instead
+    // of reading the next header as more compressed data.
+    *out_read = 0;
+    return GARC_OK;
+  }
+  size_t want = size;
+  if ((uint64_t)want > slice->remaining) {
+    want = (size_t)slice->remaining;
+  }
+  size_t got = 0;
+  GARC_Result result = garc_stream_read(slice->inner, buffer, want, &got);
+  if (result != GARC_OK) {
+    return result;
+  }
+  slice->remaining -= (uint64_t)got;
+  *out_read = got;
+  return GARC_OK;
+}
+
+static void stream_slice_destroy(GARC_Stream * stream) {
+  Stream_Slice * slice = (Stream_Slice *)stream->cb.ctx;
+  // `inner` is the caller's and is not touched, which is the rule everywhere in
+  // this library: it never frees what it did not allocate.
+  gcu_allocator_free(slice->allocator, slice);
+}
+
+GARC_Result garc_stream_create_slice_with_allocator(GARC_Stream * inner,
+    uint64_t length, const GARC_Allocator * allocator,
+    GARC_Stream ** out_stream) {
+  if (!inner || !out_stream) {
+    return GARC_ERR_INVALID;
+  }
+  if (!allocator) {
+    allocator = garc_allocator_default();
+  }
+
+  Stream_Slice * slice = (Stream_Slice *)gcu_allocator_calloc(
+      allocator, 1, sizeof(Stream_Slice));
+  if (!slice) {
+    return GARC_ERR_OOM;
+  }
+  slice->allocator = allocator;
+  slice->inner = inner;
+  slice->remaining = length;
+
+  GARC_Stream_Callbacks callbacks;
+  memset(&callbacks, 0, sizeof(callbacks));
+  callbacks.ctx = slice;
+  callbacks.read = stream_slice_read;
+
+  GARC_Stream * stream = NULL;
+  GARC_Result result = garc_stream_create_callback_with_allocator(
+      &callbacks, allocator, &stream);
+  if (result != GARC_OK) {
+    gcu_allocator_free(allocator, slice);
+    return result;
+  }
+  stream->owned_destroy = stream_slice_destroy;
+
+  *out_stream = stream;
+  return GARC_OK;
+}
+
 void garc_stream_destroy(GARC_Stream * stream) {
   if (!stream) {
     return;
