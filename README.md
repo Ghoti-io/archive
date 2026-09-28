@@ -145,7 +145,10 @@ error rather than a silent fall-through - thirteen arms reachable only if a code
 had, three of which are live only where `size_t` is 32 bits. Clean under Valgrind
 and under ASan+UBSan; `check-symbols`, `check-aliasing`, `check-corpus-hashes`,
 `check-fixtures` and `check-docs` green, the last at zero Doxygen warnings; six
-fuzz harnesses, the newest of which found a defect in its first two minutes.
+fuzz harnesses, the newest of which found a defect in its first two minutes; and
+seven oracle gates, of which two hand this library's *own output* to the pinned
+references - `check-zip-writer` found a defect on its first run that nothing
+inside this process could have seen.
 
 ## A minimal complete program
 
@@ -317,8 +320,14 @@ than a preference. **A short write is a failure**, where a short read is just th
 end of the stream — so `write` is all-or-nothing and reports no count. **A memory
 sink owns its buffer**, where a memory stream borrows one, because the bytes a
 writer produces do not exist yet and their number is not known until the archive
-is finished. And **there is no `seek` yet**: tar is append-only, zip is not, so
-that callback arrives with the writer that reads it.
+is finished. And **going back is a `patch`, not a `seek`**: it cannot extend the
+archive, so `garc_sink_tell()` keeps meaning "how long this archive is" — which
+every padding calculation in the writer reads — and a caller implementing one
+callback that restores its own position cannot get the pairing wrong the way a
+`seek` plus a `write` can. `garc_sink_is_seekable()` is the question, and a
+compressing sink answers **no** at any time: a codec's output for a byte depends on
+every byte before it, so no offset in the compressed stream corresponds to a field
+in the uncompressed one.
 
 **Building one.** `garc_writer_create()` takes a sink and a format,
 `garc_writer_add()` begins a member, `garc_writer_write()` writes its bytes, and
@@ -337,6 +346,20 @@ that callback arrives with the writer that reads it.
   typeflag is what says it is a directory either way, and a name
   `garc_name_check()` has findings about is written as given. Deciding what is
   safe to *create* is the filesystem layer's job, and that is phase F.
+
+**Writing zip adds one question and the answer is an option.** A member's CRC-32
+and compressed size are not known when its local header is written, so the archive
+either carries a *data descriptor* after each member or the header is filled in
+afterwards. `GARC_Zip_Sizes` chooses: `AUTO` asks the sink, `DESCRIPTOR` always
+streams, and `LOCAL` refuses a sink that cannot be patched by name. Both forms are
+valid and every reader takes either — this is a property of the archive a caller
+may need to control, not a route its bytes take. zip64 fields appear **when needed
+and not before**, per field and per record, which is why a forced flag exists for
+the threshold no test can otherwise reach. A zip has no typeflag, so the writer
+composes the type bits from `GARC_Member.type` and takes only the permissions from
+`mode` — a caller copying a symlink out of a *tar* has no type bits to give it. And
+a zip symlink's target *is* its data, so the writer puts it there and the caller
+writes nothing, exactly as for a tar.
 
 `garc_writer_finish()` is not called by `garc_writer_destroy()`, on purpose:
 finishing can fail, a destructor cannot report it, and a destructor that finished

@@ -81,6 +81,7 @@
 #include <ghoti.io/archive/macros.h>
 
 #include <ghoti.io/archive/allocator.h>
+#include <ghoti.io/archive/name.h>
 #include <ghoti.io/archive/writer.h>
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/cutil/allocator.h>
@@ -135,30 +136,43 @@ static const uint8_t ZIP_SIG_EOCD[4] = {'P', 'K', 5, 6};
 /**
  * Whether a member's name should be flagged UTF-8.
  *
- * **Bit 11 is a claim, so it is made only where it says something.** A name that
- * is entirely ASCII means the same thing with the flag and without it, and every
- * writer in the corpus leaves it clear there; setting it on such a name would
- * differ from all of them for no gain. A name with a high byte in it is a
- * different matter: without the flag the specification says the bytes are cp437,
- * so a UTF-8 name written without bit 11 is a name this library would read back
- * as something else.
+ * **Bit 11 is a claim about the bytes, so it is made only when the claim is
+ * true.** Two conditions, and the second was a defect the oracle gate found on its
+ * first run:
  *
- * What this does *not* do is validate the encoding. ::garc_name_check() reports
- * ::GARC_NAME_NOT_UTF8 and a writer that refused on it would be deciding
- * something the caller is better placed to decide - the same rule tar's writer
- * follows about a name with findings.
+ * - The name has a byte above 0x7F. An all-ASCII name means the same thing with
+ *   the flag and without it, and every writer in the corpus leaves it clear there.
+ * - **And the name is well-formed UTF-8.** The first version of this asked only
+ *   the first question, so a name carrying raw bytes got the flag - and an archive
+ *   that *claims* UTF-8 about bytes that are not is refused outright by Python's
+ *   `zipfile` and has the member skipped by libarchive. That is not a hypothetical
+ *   shape: it is `mal-utf8-lie.zip` in the corpus, built on purpose to be hostile,
+ *   and this writer was producing it by accident from an ordinary name.
+ *
+ * With the flag clear such a name is cp437 by specification, which is a lawful
+ * reading every reference accepts, and is what Info-ZIP writes.
+ *
+ * The validator is ::garc_name_check()'s, not a second one: one UTF-8 decision in
+ * this library rather than two that can disagree. What this still does *not* do is
+ * refuse anything - a name with findings is the caller's to decide about, which is
+ * the rule tar's writer follows too.
  *
  * @param name The name.
  * @param length Its length.
  * @return Non-zero when bit 11 should be set.
  */
 static int zip_name_needs_utf8_flag(const char * name, size_t length) {
+  int high = 0;
   for (size_t i = 0; i < length; ++i) {
     if ((unsigned char)name[i] >= 0x80u) {
-      return 1;
+      high = 1;
+      break;
     }
   }
-  return 0;
+  if (!high) {
+    return 0;
+  }
+  return (garc_name_check(name, length) & GARC_NAME_NOT_UTF8) ? 0 : 1;
 }
 
 /**

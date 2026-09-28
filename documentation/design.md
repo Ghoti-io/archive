@@ -950,7 +950,125 @@ Both are asserted rather than absorbed into a tolerance:
   `GARC_TIME_PAX_DECIMAL` whatever was asked. The writer's fuzz harness found that
   on its first run, by asserting that it could not happen.
 
-## 12. Testing
+## 12. Writing zip, which is a directory written last
+
+The reader trusts the central directory, so the writer's job is to produce one
+worth trusting: every offset in it is a position recorded on the way past, and
+nothing re-reads what it wrote. Three problems the format sets, and each shaped an
+interface rather than a function.
+
+### A local header carries two values the writer does not have yet
+
+A member's CRC-32 and compressed size are not known until its data has been
+written, and the local header goes in front of the data. There are exactly two
+lawful answers: leave zeros and put the real values in a **data descriptor** after
+the data with general purpose flag bit 3 set, or **go back and fill the header
+in**.
+
+Both are here, chosen by ::GARC_Zip_Sizes, and it is an option rather than an
+internal route because it is a property of the archive: a consumer reading a zip
+as a stream needs the descriptors and some old tools refuse them.
+`GARC_ZIP_SIZES_AUTO` asks the sink, `DESCRIPTOR` always streams, and `LOCAL`
+refuses a sink that cannot be patched - `GARC_ERR_NOT_SEEKABLE`, by name, before a
+byte is written, because failing later would leave a truncated archive behind a
+refusal.
+
+**The central directory always carries the real values**, in every discipline. A
+descriptor is for the local header's benefit; the directory has never had an
+excuse, and it is what a reader believes.
+
+### So the sink gained a patch, and deliberately not a seek
+
+`sink.h` had promised this would arrive "with the writer that reads them", and what
+arrived is narrower than a seek on purpose:
+
+- **A patch cannot extend the archive.** The range is checked against
+  `garc_sink_tell()` before the callback is reached, so that figure keeps meaning
+  "how long this archive is" at every moment - and every padding calculation in
+  the writer reads it. A `seek` would make it a *position*.
+- **A caller implementing `seek` would have to remember to come back.** One
+  `patch` that saves and restores its own position is a contract they satisfy once;
+  two calls they must pair correctly is one they can get wrong per member.
+
+`garc_sink_is_seekable()` is the question, and **a compressing sink answers no at
+any time**: a codec's output for a byte depends on every byte before it, so there
+is no offset in the compressed stream that corresponds to a field in the
+uncompressed one. A zip written through one therefore has descriptors, which is
+the same answer a pipe gets and for a deeper reason.
+
+### zip64 is per field and per record
+
+A value that does not fit is `0xFFFFFFFF` in its slot and real in a 0x0001 extra
+carrying **only the marked fields**, in the specification's order. That makes the
+two records disagree about how many fields are in the extra, and the disagreement
+is correct: in the local header the compressed size is unknown when the header is
+written, so it is marked whenever zip64 is in play; in the directory it is known
+and fits. `zip -fz` produces exactly that asymmetry - 16 bytes of payload in the
+local header against 8 in the directory - and `infozip-zip64.zip` in the corpus is
+the evidence, so `GARC_Writer_Options.zip_force_zip64` reproduces a real writer's
+output rather than a plausible one.
+
+The threshold is otherwise the rule the format wants: **not before it is needed**,
+because an archive carrying zip64 fields unnecessarily is refused by some old
+readers. The forced flag exists because the upper side of that threshold is a 4 GiB
+member and a test needs both sides.
+
+### Three decisions about a member
+
+**The type bits come from the type and the permissions from the mode.** A zip has
+no typeflag: what makes a member a symlink is `S_IFLNK` in the high half of its
+external attributes. A caller copying a member out of a *tar* has permissions in
+`GARC_Member.mode` and nothing else, because tar's mode field carries no type - so
+taking `mode` whole turns every symlink copied from a tar into a regular file,
+which is what the first run of this writer did. A caller copying out of a zip has
+the type bits in `mode` as well, and composing from `member->type` reproduces them
+exactly, so there is no need to ask which kind of caller it is.
+
+**A symlink's target is written for the caller.** In zip the target *is* the
+member's data, so the caller sets `link_target` and writes nothing, exactly as for
+a tar - which is what lets an archive be copied from tar to zip without the caller
+knowing which it is writing. It is the one place this writer puts bytes in a member
+the caller did not hand it.
+
+**One extra field, and it is conditional.** 0x5455 carries the mtime as an epoch
+second, written only when the MS-DOS pair cannot hold the time exactly - which is
+what keeps "write the minimum" true: an archive whose every time is an even second
+in range has no extra fields in it at all. The condition has three parts and the
+third was a defect a test found: the extra field holds a **signed 32-bit** second,
+so it stops in 2038 where the DOS date runs to 2107, and a time past that was
+being truncated into it - 2108 came back as 1971, which is worse than the clamp it
+existed to avoid. Above `INT32_MAX` the DOS pair is the better of the two.
+
+No Ux, no Unix uid/gid, no NTFS timestamp. **A zip cannot carry an owner**, and
+that is the format rather than this cut.
+
+### What it refuses, and why each is a refusal
+
+A fifo, a device, a hard link and `GARC_MEMBER_OTHER`: zip's attributes could carry
+the mode bits, but there is no convention for what such a member's *data* is and no
+reference here writes one, so it is refused by name rather than invented. A name
+the 16-bit length field cannot hold, because zip has no carrier record to put a
+longer one in. And the tar writer's own refusals - an empty name, a NUL in a name
+or a target, a size on a member that carries no data.
+
+### The UTF-8 flag is a claim, and the gate caught it being made falsely
+
+Bit 11 says a name is UTF-8. The first version of this writer set it whenever a
+name had a byte above 0x7F, which is a different question - so a name carrying raw
+bytes got the flag, and an archive that *claims* UTF-8 about bytes that are not is
+refused outright by Python's `zipfile` and has the member skipped by libarchive.
+That is `mal-utf8-lie.zip` in the corpus, built on purpose to be hostile, produced
+by accident from an ordinary name.
+
+The flag is now set only when the name is not ASCII **and** is well-formed UTF-8,
+using `garc_name_check()`'s validator rather than a second one. With it clear such
+a name is cp437 by specification, which every reference accepts.
+
+**Nothing that ran inside this process could have found that.** The round-trip
+tests passed, because this library reads back what it writes either way; it took
+handing the bytes to four other programs. That is what `check-zip-writer` is for.
+
+## 13. Testing
 
 **Four stream shapes, not one.** Seekability and known-size are two independent
 properties, so there are four combinations and a memory stream is one of them.
@@ -1147,6 +1265,8 @@ would have been no evidence at all.
 | `check-corpus-hashes` | no, and so it is in `TEST_GATES` | a fixture edited, truncated, or half-committed |
 | `check-corpus` | yes | the references no longer *writing* these bytes |
 | `check-oracle` | yes | the references no longer *reading* them the same way, or no longer *deciding* the same way about them |
+| `check-writer` | yes | **this library's tar** no longer producing something the references understand |
+| `check-zip-writer` | yes | **this library's zip** likewise, against four references rather than three |
 
 The split matters in both directions. Hashing needs only sha256, so it runs on
 every machine; regenerating needs the image, so it fails closed rather than
@@ -1156,6 +1276,33 @@ are not the same question: a tar release can change how a field is parsed withou
 changing any output, and a suite that only regenerated would call that a pass.
 `check-oracle` is also the only thing that catches a manifest edited *and*
 rehashed to make a failing test pass.
+
+`check-zip-writer` is the zip half of `check-writer`, and it earned its place on
+its first run: the writer was setting the UTF-8 flag on a name that is not UTF-8,
+which no test inside this process could see because this library reads back what it
+writes either way. Python refused the whole archive and libarchive skipped the
+member. Four planted regressions were then caught as well - a flipped CRC bit in a
+directory entry, a name length one byte short, a symlink written as a file, and an
+end record claiming one member too few.
+
+What it compares, and what it deliberately does not: four archives, the same member
+list encoded four ways, are accepted by unzip, bsdtar, 7-Zip and Python, with
+`unzip -t`, `7z t` and `zipfile.testzip()` each recomputing every member's CRC.
+`unzip -Z1` is the byte-faithful **name** reference for zip - it prints a high byte
+and a literal backslash as they are, where GNU tar needs `--quoting-style=literal`
+to do the same for tar. libarchive answers **type, mode and link target**, which
+Python's module does not decide, and its name is compared only where the intended
+name has neither a backslash nor a high byte, because libarchive treats the first
+as a separator and renders the second as octal. Then both bsdtar and Python
+**re-write** every archive and this library reads what they produced: `bsdtar
+--format zip` deflates as it does so, so the method column is skipped and the size
+and CRC are not - libarchive deflated our bytes and we inflated them back to the
+same bytes with the same checksum.
+
+The two columns that are skipped as *findings* rather than as unasked questions are
+named in `ROUNDTRIP_SKIP` with the reason beside each, and the count of skipped
+fields is printed separately from the count of unasked ones - a figure dominated by
+"this reference has no such column" is one nobody can act on.
 
 The zip corpus has the same three gates under their own names -
 `check-corpus-hashes` covers both corpora, `check-zip-corpus` regenerates and

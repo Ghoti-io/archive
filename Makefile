@@ -327,7 +327,7 @@ INCLUDE := -I include/ -I src/ -I $(GEN_DIR)/
 # it reached a container - was the reason this list grew.
 DEPLESS_GOALS := docs docs-pdf check-docs clean fuzz-clean cloc help \
 	corpus check-corpus check-corpus-hashes check-oracle \
-	zip-corpus check-zip-corpus check-zip-oracle \
+	zip-corpus check-zip-corpus check-zip-oracle check-zip-writer \
 	oracle-build oracle-version
 ifeq ($(filter-out $(DEPLESS_GOALS),$(or $(MAKECMDGOALS),all)),)
 SKIP_DEP_CHECK := 1
@@ -594,6 +594,18 @@ $(WRITER_PROBE): tools/oracle/writer_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
 
+# The zip writer's probe, built the same way and for the same reasons. A second
+# binary rather than a mode of the first: the two write different formats, with
+# different member tables and different things worth varying, and one program that
+# did both would make every change to either one a change to both.
+ZIP_WRITER_PROBE := $(APP_DIR)/oracle/zip_writer_probe$(EXE_EXTENSION)
+
+$(ZIP_WRITER_PROBE): tools/oracle/zip_writer_probe.c \
+		$(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Probe: zip_writer_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
+
 ####################################################################
 # Commands
 ####################################################################
@@ -602,7 +614,7 @@ $(WRITER_PROBE): tools/oracle/writer_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-corpus-hashes check-corpus corpus oracle-build oracle-version
 .PHONY: zip-corpus check-zip-corpus check-zip-oracle
-.PHONY: check-oracle check-writer
+.PHONY: check-oracle check-writer check-zip-writer
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1307,6 +1319,16 @@ check-writer: ## Fail if the references disagree with what the writer produces
 check-writer: $(WRITER_PROBE)
 	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/check_writer.py \
 		--probe $(WRITER_PROBE)
+
+check-zip-writer: ## Fail if the references disagree with the zip the writer produces
+# The zip half of check-writer, and it needs its own target for the same reason it
+# needs its own probe: four references rather than three, and the question "does
+# this archive read at all" is answered by `unzip -t` and `7z t` rather than by a
+# listing. Not in TEST_GATES and not in DEPLESS_GOALS: it needs the container, and
+# unlike the corpus gates it links the library under test.
+check-zip-writer: $(ZIP_WRITER_PROBE)
+	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/check_zip_writer.py \
+		--probe $(ZIP_WRITER_PROBE)
 
 ####################################################################
 # Install / uninstall
