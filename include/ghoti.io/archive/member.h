@@ -111,6 +111,26 @@ typedef enum {
   GARC_TIME_NONE = 0,     ///< The container carried no time.
   GARC_TIME_TAR_OCTAL,    ///< tar's header field, whole seconds.
   GARC_TIME_PAX_DECIMAL,  ///< A pax `mtime=` record, with a fraction.
+  /**
+   * zip's MS-DOS date and time field: two-second resolution, and **no time
+   * zone at all**.
+   *
+   * The library converts it as if it were UTC, because every alternative is
+   * worse - reading the host's zone would make one archive answer two ways - and
+   * this value is how a caller knows that is what happened. It is the only time
+   * many zips carry: `zip -X` writes nothing else.
+   */
+  GARC_TIME_ZIP_DOS,
+  /** zip's 0x5455 extended timestamp: epoch seconds, unambiguously UTC. */
+  GARC_TIME_ZIP_UNIX,
+  /**
+   * zip's 0x000a NTFS field: 100-nanosecond intervals since 1601, UTC.
+   *
+   * The only timestamp in a zip with sub-second precision, so it is preferred
+   * over the other two where a writer produced it - 7-Zip does, in the central
+   * directory only.
+   */
+  GARC_TIME_ZIP_NTFS,
   GARC_TIME_SOURCE_COUNT
 } GARC_Time_Source;
 

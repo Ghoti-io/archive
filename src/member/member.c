@@ -74,6 +74,12 @@ const char * garc_time_source_string(GARC_Time_Source source) {
       return "tar octal";
     case GARC_TIME_PAX_DECIMAL:
       return "pax decimal";
+    case GARC_TIME_ZIP_DOS:
+      return "zip DOS date/time";
+    case GARC_TIME_ZIP_UNIX:
+      return "zip extended timestamp";
+    case GARC_TIME_ZIP_NTFS:
+      return "zip NTFS timestamp";
     case GARC_TIME_SOURCE_COUNT:
     default:
       return "invalid";

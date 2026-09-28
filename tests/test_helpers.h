@@ -87,12 +87,35 @@ public:
   /** Make every size query report ::GARC_ERR_IO. */
   void fail_size() { size_fails_ = true; }
 
+  /**
+   * Let @p successes reads through, then fail the next @p count.
+   *
+   * fail_reads() cannot reach a failure arm that is only taken after the format
+   * reader has already read something - and a zip reads its end record, its
+   * central directory, a local header and a member's data through four different
+   * arms, each of which reports a read failure separately. This is how a test
+   * picks one of them.
+   */
+  void fail_reads_after(size_t successes, size_t count = 1) {
+    reads_before_failing_ = successes;
+    failing_reads_ = count;
+  }
+
+  /** Let @p successes seeks through, then fail every seek after them. */
+  void fail_seeks_after(size_t successes) {
+    seeks_before_failing_ = successes;
+    seek_fails_ = true;
+  }
+
 private:
   static GARC_Result read_cb(
       void * ctx, void * buffer, size_t size, size_t * out_read) {
     BufferSource * self = static_cast<BufferSource *>(ctx);
     self->reads_++;
-    if (self->failing_reads_) {
+    if (self->reads_before_failing_) {
+      self->reads_before_failing_--;
+    }
+    else if (self->failing_reads_) {
       self->failing_reads_--;
       return GARC_ERR_IO;
     }
@@ -115,7 +138,10 @@ private:
   static GARC_Result seek_cb(void * ctx, uint64_t offset) {
     BufferSource * self = static_cast<BufferSource *>(ctx);
     self->seeks_++;
-    if (self->seek_fails_) {
+    if (self->seeks_before_failing_) {
+      self->seeks_before_failing_--;
+    }
+    else if (self->seek_fails_) {
       return GARC_ERR_IO;
     }
     if (offset > self->bytes_.size() && !self->permissive_seek_) {
@@ -138,6 +164,10 @@ private:
   GARC_Stream_Callbacks callbacks_{};
   size_t pos_ = 0;
   size_t reads_ = 0;
+  /** Reads to let through before failing_reads_ starts counting. */
+  size_t reads_before_failing_ = 0;
+  /** Seeks to let through before seek_fails_ applies. */
+  size_t seeks_before_failing_ = 0;
   size_t seeks_ = 0;
   size_t bytes_read_ = 0;
   size_t failing_reads_ = 0;

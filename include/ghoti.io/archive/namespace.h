@@ -138,6 +138,27 @@
 #define garc_writer_options_default GHOTIIO_ARCHIVE(garc_writer_options_default)
 #define garc_writer_write GHOTIIO_ARCHIVE(garc_writer_write)
 #define garc_version_string GHOTIIO_ARCHIVE(garc_version_string)
+#define garc_zip_archive_comment GHOTIIO_ARCHIVE(garc_zip_archive_comment)
+#define garc_zip_base_offset GHOTIIO_ARCHIVE(garc_zip_base_offset)
+#define garc_zip_declared_members                                              \
+  GHOTIIO_ARCHIVE(garc_zip_declared_members)
+#define garc_zip_has_zip64_end_record                                          \
+  GHOTIIO_ARCHIVE(garc_zip_has_zip64_end_record)
+#define garc_zip_encryption_string GHOTIIO_ARCHIVE(garc_zip_encryption_string)
+#define garc_zip_member_compressed_size                                        \
+  GHOTIIO_ARCHIVE(garc_zip_member_compressed_size)
+#define garc_zip_member_crc32 GHOTIIO_ARCHIVE(garc_zip_member_crc32)
+#define garc_zip_member_encryption GHOTIIO_ARCHIVE(garc_zip_member_encryption)
+#define garc_zip_member_external_attributes                                    \
+  GHOTIIO_ARCHIVE(garc_zip_member_external_attributes)
+#define garc_zip_member_extra_length                                           \
+  GHOTIIO_ARCHIVE(garc_zip_member_extra_length)
+#define garc_zip_member_flags GHOTIIO_ARCHIVE(garc_zip_member_flags)
+#define garc_zip_member_method GHOTIIO_ARCHIVE(garc_zip_member_method)
+#define garc_zip_member_used_zip64 GHOTIIO_ARCHIVE(garc_zip_member_used_zip64)
+#define garc_zip_member_version_made_by                                        \
+  GHOTIIO_ARCHIVE(garc_zip_member_version_made_by)
+#define garc_zip_method_string GHOTIIO_ARCHIVE(garc_zip_method_string)
 
 // Internal names. Hidden by -fvisibility=hidden and so unable to collide, but
 // renamed anyway so that there is one rule rather than two.
@@ -154,6 +175,17 @@
 #define garc_tar_parse_uint GHOTIIO_ARCHIVE(garc_tar_parse_uint)
 #define garc_tar_write_end GHOTIIO_ARCHIVE(garc_tar_write_end)
 #define garc_tar_write_member GHOTIIO_ARCHIVE(garc_tar_write_member)
+#define garc_zip_dos_to_epoch GHOTIIO_ARCHIVE(garc_zip_dos_to_epoch)
+#define garc_zip_filetime_to_epoch GHOTIIO_ARCHIVE(garc_zip_filetime_to_epoch)
+#define garc_zip_identify GHOTIIO_ARCHIVE(garc_zip_identify)
+#define garc_zip_le16 GHOTIIO_ARCHIVE(garc_zip_le16)
+#define garc_zip_le32 GHOTIIO_ARCHIVE(garc_zip_le32)
+#define garc_zip_le64 GHOTIIO_ARCHIVE(garc_zip_le64)
+#define garc_zip_locate_eocd GHOTIIO_ARCHIVE(garc_zip_locate_eocd)
+#define garc_zip_next GHOTIIO_ARCHIVE(garc_zip_next)
+#define garc_zip_open GHOTIIO_ARCHIVE(garc_zip_open)
+#define garc_zip_release GHOTIIO_ARCHIVE(garc_zip_release)
+#define garc_zip_rewind GHOTIIO_ARCHIVE(garc_zip_rewind)
 
 /// @endcond
 

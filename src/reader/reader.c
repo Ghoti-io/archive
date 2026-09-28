@@ -37,6 +37,7 @@
 
 #include "reader/reader_internal.h"
 #include "tar/tar_internal.h"
+#include "zip/zip_internal.h"
 
 const char * garc_format_string(GARC_Format format) {
   switch (format) {
@@ -44,6 +45,8 @@ const char * garc_format_string(GARC_Format format) {
       return "unknown";
     case GARC_FORMAT_TAR:
       return "tar";
+    case GARC_FORMAT_ZIP:
+      return "zip";
     case GARC_FORMAT_COUNT:
     default:
       return "invalid";
@@ -53,16 +56,28 @@ const char * garc_format_string(GARC_Format format) {
 /**
  * Identify the container, keeping the bytes that were looked at.
  *
- * **Identification does not seek.** Putting the bytes back by seeking to zero
- * would work on a file and fail on a pipe, which would make "tar can be read
- * from a pipe" - the reason this library has a callback stream at all - false
- * for every archive. So the window is kept in the archive and the format reader
- * drains it first.
+ * **Identification does not seek for the formats that can be read without
+ * seeking.** Putting the bytes back by seeking to zero would work on a file and
+ * fail on a pipe, which would make "tar can be read from a pipe" - the reason
+ * this library has a callback stream at all - false for every archive. So the
+ * window is kept in the archive and the format reader drains it first.
  *
- * The window is one tar block today. zip is identified from its *end*, so when
- * it arrives this grows a second question rather than a second window: "is this
- * a tar" is answered from the front and cheaply, and only a stream that can seek
- * can be asked the other one.
+ * **There are three questions here, not one, and the order is the design.**
+ *
+ * 1. Is this a tar? Answered from the front, from one block, on any stream.
+ * 2. Do the first bytes say zip? A local file header, or an end record for an
+ *    archive with no members. This is where a zip on a *pipe* is caught: the
+ *    answer is yes and the format cannot be read that way, so it is
+ *    ::GARC_ERR_NOT_SEEKABLE rather than ::GARC_ERR_FORMAT - "this is a zip and
+ *    I need to seek" rather than "I do not know what this is".
+ * 3. Failing both, and only on a seekable stream: is there an end record within
+ *    the last 65,557 bytes? That is the only way to find a zip behind a
+ *    self-extracting stub, whose first bytes are an executable's.
+ *
+ * Question 3 comes last because it is the expensive one and because it can say
+ * yes about a file whose last bytes merely look like a record - which is exactly
+ * what every zip reader does, and what the validating scan in
+ * ::garc_zip_locate_eocd() keeps honest.
  */
 static GARC_Result reader_identify(GARC_Archive * archive) {
   size_t total = 0;
@@ -96,7 +111,94 @@ static GARC_Result reader_identify(GARC_Archive * archive) {
     return GARC_OK;
   }
 
+  if (garc_zip_identify(archive->peek, total)) {
+    if (!garc_stream_is_seekable(archive->stream)) {
+      // A zip, and unreadable this way. Saying so by name matters: a caller
+      // handed GARC_ERR_FORMAT for a file every other tool opens would go
+      // looking for the wrong thing, and the fix - give me a seekable stream -
+      // is only discoverable from this status.
+      return GARC_ERR_NOT_SEEKABLE;
+    }
+    archive->format = GARC_FORMAT_ZIP;
+    return GARC_OK;
+  }
+
+  if (garc_stream_is_seekable(archive->stream)) {
+    uint64_t eocd_offset = 0;
+    GARC_Result found = garc_zip_locate_eocd(archive, &eocd_offset);
+    if (found == GARC_OK) {
+      // Found from the end, which is the only way a zip behind a stub can be.
+      // The offset is kept rather than looked for twice.
+      archive->zip.eocd_offset = eocd_offset;
+      archive->zip.eocd_found = 1;
+      archive->format = GARC_FORMAT_ZIP;
+      return GARC_OK;
+    }
+    if (found != GARC_ERR_FORMAT) {
+      // An I/O or allocation failure while looking. Reported as itself: a caller
+      // told "not an archive" because a read failed would go and check the
+      // bytes, which are fine.
+      return found;
+    }
+  }
+
   return GARC_ERR_FORMAT;
+}
+
+/**
+ * Let the format reader do whatever it needs at open.
+ *
+ * tar needs nothing: its first header is the next thing in the stream. zip has
+ * to read its end record and its central directory's position before it can
+ * report a single member, and that work can fail on an input identification
+ * already accepted - which is why this is separate from identification rather
+ * than folded into it.
+ *
+ * @param archive The archive.
+ * @return ::GARC_OK, or the format's failure.
+ */
+static GARC_Result reader_open_format(GARC_Archive * archive) {
+  if (archive->format != GARC_FORMAT_ZIP) {
+    return GARC_OK;
+  }
+  uint64_t eocd_offset = archive->zip.eocd_offset;
+  if (!archive->zip.eocd_found) {
+    // Identified from the front, so the end record has not been looked for yet.
+    GARC_Result result = garc_zip_locate_eocd(archive, &eocd_offset);
+    if (result != GARC_OK) {
+      // The first bytes said zip and there is no end record behind them. That is
+      // a truncated zip rather than some other format: GARC_ERR_FORMAT here
+      // would send a caller looking for the wrong problem.
+      return result == GARC_ERR_FORMAT ? GARC_ERR_CORRUPT : result;
+    }
+  }
+  return garc_zip_open(archive, eocd_offset);
+}
+
+/**
+ * Free whatever the format reader allocated for this archive.
+ *
+ * A switch rather than a call to every format's release: a release that ran for
+ * the format that was not used would be reading a state nothing initialised, and
+ * the cost of getting that wrong is a free of an uninitialised pointer rather
+ * than a wrong answer. Both formats leave a calloc'd state alone when they
+ * allocate nothing, so the switch is about the rule and not about the bytes.
+ *
+ * @param archive The archive.
+ */
+static void reader_release(GARC_Archive * archive) {
+  switch (archive->format) {
+    case GARC_FORMAT_TAR:
+      garc_tar_release(archive);
+      break;
+    case GARC_FORMAT_ZIP:
+      garc_zip_release(archive);
+      break;
+    default:
+      // Identification failed, so no format reader has run and there is nothing
+      // to release. Reached on the failure path of garc_open().
+      break;
+  }
 }
 
 GARC_Result garc_open(GARC_Stream * stream, const GARC_Limits * limits,
@@ -135,7 +237,15 @@ GARC_Result garc_open_with_allocator(GARC_Stream * stream,
   archive->start_offset = garc_stream_tell(stream);
 
   GARC_Result result = reader_identify(archive);
+  if (result == GARC_OK) {
+    result = reader_open_format(archive);
+  }
   if (result != GARC_OK) {
+    // reader_open_format() can have allocated before failing - zip reads its
+    // comment into a buffer - so the release runs on this path as well as in
+    // garc_close(). A failed open that leaked would leak once per malformed
+    // archive, which is exactly the input a caller feeds in a loop.
+    reader_release(archive);
     gcu_allocator_free(allocator, archive);
     return result;
   }
@@ -194,16 +304,19 @@ GARC_Result garc_next(GARC_Archive * archive, const GARC_Member ** out_member) {
     case GARC_FORMAT_TAR:
       result = garc_tar_next(archive);
       break;
+    case GARC_FORMAT_ZIP:
+      result = garc_zip_next(archive);
+      break;
     default:
       // reader_identify() refuses anything else, so reaching this is a bug in
       // this file rather than a fact about the input.
       //
-      // **This is the one line `make coverage` reports as unexecuted, and it is
-      // meant to stay that way.** No input can reach it: the only format
-      // identification sets is TAR. Deleting it to make the report read 100%
+      // **This is one of the lines `make coverage` reports as unexecuted, and it
+      // is meant to stay that way.** No input can reach it: identification sets
+      // TAR or ZIP and nothing else. Deleting it to make the report read higher
       // would remove the thing that turns a future format added to the enum and
       // not to this switch into a named internal error instead of falling
-      // through - so the number is 99.7% on purpose, and this comment is why.
+      // through, and this comment is why the number is not 100%.
       return GARC_ERR_INTERNAL;
   }
 
@@ -276,7 +389,29 @@ static GARC_Result reader_rewind(GARC_Archive * archive) {
   archive->at_end = 0;
   archive->data_remaining = 0;
   archive->data_padding = 0;
-  garc_tar_pax_reset(&archive->tar.pax_global);
+  archive->data_refusal = GARC_OK;
+
+  // The per-*walk* state each format owns. tar's is the global pax record set;
+  // zip's is where in the central directory the cursor is. Neither format's is
+  // touched for the other, and what open discovered - zip's base offset, the
+  // directory's position - is not touched at all, because a rewind goes back to
+  // the start of the archive and not to before it was opened.
+  switch (archive->format) {
+    case GARC_FORMAT_TAR:
+      garc_tar_pax_reset(&archive->tar.pax_global);
+      break;
+    case GARC_FORMAT_ZIP:
+      garc_zip_rewind(archive);
+      break;
+    default:
+      // Unreachable, and kept for the reason the switch in garc_next() gives:
+      // identification sets one of the two formats above, so `make coverage`
+      // reports this arm as unexecuted on purpose. A third format added to the
+      // enum and not to this switch would then silently keep whatever per-walk
+      // state it had, which is the bug this arm is here to make impossible to
+      // write by omission.
+      break;
+  }
 
   // The caps count a walk, and this is a new one. Carrying the counts forward
   // would make garc_find() fail with GARC_ERR_LIMIT_MEMBERS on an archive whose
@@ -334,6 +469,14 @@ GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,
   }
   if (!archive->have_member) {
     return GARC_ERR_INVALID;
+  }
+  if (archive->data_refusal != GARC_OK) {
+    // A member whose metadata was readable and whose bytes are not: a zip member
+    // compressed with a method there is no codec for, or encrypted. Answered
+    // before the size check below, because a *zero-length* member of such a kind
+    // would otherwise read as a successful end of data and a caller would
+    // conclude the file was empty.
+    return archive->data_refusal;
   }
 
   if (!archive->data_remaining || !capacity) {
@@ -419,6 +562,29 @@ void garc_archive_dump(const GARC_Archive * archive, FILE * out) {
         garc_tar_variant_string(archive->tar.variant),
         archive->tar.checksum_was_signed ? "signed" : "unsigned");
   }
+  if (archive->format == GARC_FORMAT_ZIP) {
+    fprintf(out, "  zip: %llu declared members, central directory at %llu"
+        " (+%llu bytes)%s\n",
+        (unsigned long long)archive->zip.declared_members,
+        (unsigned long long)archive->zip.central_offset,
+        (unsigned long long)archive->zip.central_size,
+        archive->zip.is_zip64 ? ", zip64" : "");
+    if (archive->zip.origin != archive->start_offset) {
+      fprintf(out, "  zip: %llu bytes in front of the archive\n",
+          (unsigned long long)(archive->zip.origin - archive->start_offset));
+    }
+    if (archive->have_member) {
+      fprintf(out, "  zip member: method %u (%s), flags %04x, %llu compressed"
+          " bytes, crc %08lx%s\n",
+          (unsigned)archive->zip.method,
+          garc_zip_method_string(archive->zip.method),
+          (unsigned)archive->zip.flags,
+          (unsigned long long)archive->zip.compressed_size,
+          (unsigned long)archive->zip.crc32,
+          archive->zip.encryption == GARC_ZIP_ENCRYPTION_NONE ? ""
+              : garc_zip_encryption_string(archive->zip.encryption));
+    }
+  }
   fprintf(out, "  members: %llu\n", (unsigned long long)archive->member_count);
   fprintf(out, "  declared bytes: %llu\n",
       (unsigned long long)archive->total_declared_bytes);
@@ -438,10 +604,10 @@ void garc_close(GARC_Archive * archive) {
   if (!archive) {
     return;
   }
-  // Whatever a format reader allocated for this archive. A name too long for a
-  // header field is the only thing that is, so an ordinary archive frees nothing
-  // here - which is why this is a call rather than a switch on the format.
-  garc_tar_release(archive);
+  // Whatever this archive's format reader allocated. For tar that is a name too
+  // long for a header field, so an ordinary tar frees nothing; for zip it is the
+  // per-member name and the archive comment, so an ordinary zip does.
+  reader_release(archive);
   // The stream is the caller's. This library never frees what it did not
   // allocate, and a close that destroyed it would make the borrowing in
   // garc_open() a lie a caller finds out about as a double free.

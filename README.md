@@ -47,19 +47,45 @@ record only for what ustar cannot say, so a reader that knows only POSIX.1-1988
 gets a correct answer wherever one exists in its vocabulary. `GARC_TAR_USTAR`
 writes the same headers and *refuses*, by name, anything that would need a record:
 a caller who needs an archive a 1988 reader can read wants to be told rather than
-handed one with records in it. No zip either way yet, and no filesystem layer.
+handed one with records in it. No zip writer yet, and no filesystem layer.
 
-**The zip corpus is in before the zip reader**, which is the order that makes the
-reader measurable: 23 archives from four writers - Info-ZIP's `zip`, libarchive's
-`bsdtar`, 7-Zip and Python's `zipfile` - with what `zipfile` and `bsdtar` read out
-of them, and what all four references *do* when handed one. They disagree already:
-an archive comment holding the bytes `PK\x05\x06` is read correctly by three of
-them and refused by Python, a zip behind a self-extracting stub is read by bsdtar
-and Python and refused by unzip and 7-Zip, and libarchive writes a data descriptor
-for every member so its local headers say a size of zero where its central
-directory says the truth. The
-references being pinned is what makes each of those a fact to read rather than a
-surprise to discover later.
+**Reads zip, backwards, from the central directory.** The end record is found by
+scanning back from the end of the stream - at most 65,557 bytes, with every
+candidate validated rather than the last signature taken - and every value
+reported about a member comes from the **central directory**. The local header is
+read for exactly one thing: where the member's data starts, which only it can say,
+because its name and extra fields are sized independently of the directory's.
+
+That is not a preference. libarchive writes a data descriptor for every member
+with data, even into a seekable file, so its local headers say a size of zero
+where its central directory says fifteen - and a reader that believed them would
+report every member of an ordinary archive as empty. Where the two disagree
+deliberately, following the directory is what every real tool does, which makes
+trusting the local header the root of the whole class of zip confusion bugs. This
+reader also **refuses a local header whose name is not the directory's**: an
+archive saying two different things about which member this is has nothing else to
+be.
+
+zip64 is read as the format defines it - a value is in a 0x0001 extra field only
+for the fields that hold the `0xFFFFFFFF` marker, which is why `zip -fz` produces
+an eight-byte field where a reader consuming the values positionally expects
+sixteen. Method 0 is read; 8, 9, 12, 14, 93 and 98 are refused with a status and
+an accessor that **name the method number**, so the refusal is a to-do list.
+ZipCrypto and WinZip AES are named separately from each other and from
+"unsupported", because a caller needs to know whether a password could ever help.
+Reading a zip needs a seekable stream, and a zip on a pipe is
+`GARC_ERR_NOT_SEEKABLE` rather than "not an archive".
+
+The zip fixtures are 23 archives from four writers - Info-ZIP's `zip`,
+libarchive's `bsdtar`, 7-Zip and Python's `zipfile` - with what `zipfile` and
+`bsdtar` read out of them and what all four references *do* when handed one,
+because zip has no GNU tar to take one idea of the format from. They disagree
+already: an archive comment holding the bytes `PK\x05\x06` is read correctly by
+three of them and refused by Python, and a zip behind a self-extracting stub is
+read by bsdtar and Python and refused by unzip and 7-Zip. Where no writer produces
+the input a refusal needs - a header that contradicts its directory, a member count
+that is wrong, a zip64 field one value short - the archive is built byte by byte in
+the test, from a control archive this library reads.
 
 **Reads and writes `tar.gz`, `tar.zst` and `tar.lz4`, with no format code for
 any of them.** A codec wraps the stream or the sink, the tar reader and writer
@@ -81,14 +107,16 @@ the digits in a numeric field, whether to use the ustar name split, what the
 extended header is called — so each was measured and each choice is argued in
 `documentation/design.md` rather than copied.
 
-Build clean under GCC 14 with `-Werror`; 383 tests; 99.4% line coverage of 2,023
-lines, the thirteen uncovered being the six this library has always had — a
-defensive arm no input can reach, three guards live only where `size_t` is 32
-bits, one needing a pax record set larger than `INT64_MAX` — and seven arms in the
-codec module that only a codec breaking its own contract reaches; clean under
-Valgrind and under ASan+UBSan; `check-symbols`, `check-aliasing`,
-`check-corpus-hashes`, `check-fixtures` and `check-docs` green, the last at zero
-Doxygen warnings; five fuzz harnesses.
+Build clean under GCC 14 with `-Werror`; 481 tests; 99.4% line coverage of 2,677
+lines, with the zip reader at 100%; the seventeen uncovered lines are four
+`default:` arms no input can reach - kept so that a third format added to an enum
+and not to a switch is a named internal error rather than a silent fall-through -
+seven arms only a codec that broke its own contract reaches, and the six this
+library has always had, three of which are live only where `size_t` is 32 bits and
+one of which needs a pax record set larger than `INT64_MAX`. Clean under Valgrind
+and under ASan+UBSan; `check-symbols`, `check-aliasing`, `check-corpus-hashes`,
+`check-fixtures` and `check-docs` green, the last at zero Doxygen warnings; five
+fuzz harnesses.
 
 ## A minimal complete program
 

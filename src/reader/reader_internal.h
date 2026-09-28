@@ -31,6 +31,7 @@
 
 #include <ghoti.io/archive/reader.h>
 #include <ghoti.io/archive/tar.h>
+#include <ghoti.io/archive/zip.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -185,6 +186,89 @@ typedef struct {
 } GARC_Tar_State;
 
 /**
+ * Everything in an archive that only the zip reader looks at.
+ *
+ * Split into what was found once at open and what moves as the walk moves,
+ * because ::garc_find() has to reset the second and must not touch the first -
+ * the same split the tar reader's rewind settled, inherited here as that
+ * function's comment says it would be.
+ */
+typedef struct {
+  /**
+   * @name Found once, at open
+   * @{
+   */
+  /**
+   * Where the archive's own offsets count from, as an absolute stream offset.
+   *
+   * Not the same as ::GARC_Archive.start_offset: an archive behind a
+   * self-extracting stub has its offsets counted from after the stub, and this
+   * is *discovered* by comparing where the central directory claims to be with
+   * where it turned out to be. ::garc_zip_base_offset() reports the difference.
+   */
+  uint64_t origin;
+  /** Absolute stream offset of the first central directory entry. */
+  uint64_t central_offset;
+  /** How many bytes of central directory the end record declared. */
+  uint64_t central_size;
+  /**
+   * Absolute stream offset of the end record itself.
+   *
+   * Set by identification when it had to scan for one - which is how a zip
+   * behind a self-extracting stub is found at all - and read back by
+   * ::garc_zip_open() so that the scan happens once. @ref eocd_found says
+   * whether it has been set, because zero is a legitimate offset: it is where
+   * the record of a 22-byte empty archive sits.
+   */
+  uint64_t eocd_offset;
+  /** Whether @ref eocd_offset has been found yet. */
+  int eocd_found;
+  /** How many entries the end record declared. */
+  uint64_t declared_members;
+  /** Non-zero when a zip64 end record supplied the counts. */
+  int is_zip64;
+  /** The archive comment, as bytes. Empty when there is none. */
+  GARC_Buffer comment;
+  /** @} */
+
+  /**
+   * @name Where the walk is
+   * @{
+   */
+  /** Absolute stream offset of the next central directory entry to read. */
+  uint64_t cursor;
+  /** How many entries have been read, which bounds the walk. */
+  uint64_t entries_seen;
+  /** @} */
+
+  /**
+   * @name The current member, as the central directory described it
+   *
+   * Each of these is a field of the entry rather than a conclusion about it, and
+   * each has an accessor in zip.h, because a caller that has to re-derive one
+   * from ::GARC_Member has to know the format to do it.
+   * @{
+   */
+  /** The name, which is up to 65,535 bytes and so cannot be a fixed array. */
+  GARC_Buffer name;
+  /** Scratch for the entry's extra field, reused across members. */
+  GARC_Buffer extra;
+  /** A symlink's target, which in zip is the member's *data*. */
+  GARC_Buffer link;
+  uint16_t method;               ///< The compression method number.
+  uint16_t flags;                ///< The general purpose bit flags.
+  uint16_t version_made_by;      ///< Host system in the high byte.
+  uint32_t external_attributes;  ///< DOS bits low, Unix st_mode high.
+  uint32_t crc32;                ///< The declared CRC-32.
+  uint64_t compressed_size;      ///< Bytes the member occupies in the archive.
+  uint64_t local_offset;         ///< Local header offset *as declared*.
+  size_t extra_length;           ///< Length of the entry's extra field.
+  int used_zip64;                ///< Whether a 0x0001 field supplied a value.
+  GARC_Zip_Encryption encryption; ///< Which scheme, where there is one.
+  /** @} */
+} GARC_Zip_State;
+
+/**
  * An archive being read.
  *
  * Opaque to callers: ::garc_open() hands back a pointer and every accessor is a
@@ -249,8 +333,26 @@ struct GARC_Archive {
   /** How many of @ref peek have been consumed. */
   size_t peek_consumed;
 
+  /**
+   * Whether the current member's data can be handed to a caller, and why not.
+   *
+   * ::GARC_OK for a member ::garc_read_member() may read. Otherwise the status it
+   * returns - ::GARC_ERR_UNSUPPORTED for a zip member compressed with a method
+   * this library has no codec for, or encrypted.
+   *
+   * It exists because in zip a member's *metadata* being readable and its *data*
+   * not is an ordinary state rather than a failure: an archive with one bzip2
+   * member is still an archive to walk. Without this, such a member would either
+   * have to make ::garc_next() fail - losing the other members - or hand back
+   * zero bytes and ::GARC_OK, which is an empty file where there is a compressed
+   * one.
+   */
+  GARC_Result data_refusal;
+
   /** What only the tar reader looks at. Meaningless for any other format. */
   GARC_Tar_State tar;
+  /** What only the zip reader looks at. Meaningless for any other format. */
+  GARC_Zip_State zip;
 };
 
 /**

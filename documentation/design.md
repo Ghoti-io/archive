@@ -1,8 +1,9 @@
 # Design
 
-**Status:** phases A and B shipped, except GNU's and pax's extended members,
-which are refused by name. What is below describes what exists unless a heading
-says otherwise.
+**Status:** tar is read in all four of its formats and written as pax; `tar.gz`,
+`tar.zst` and `tar.lz4` work in both directions; zip is **read** and not yet
+written. The filesystem layer does not exist. What is below describes what exists
+unless a heading says otherwise.
 
 This page records the decisions a reader of the headers would otherwise have to
 reconstruct, and — where the decision could reasonably have gone the other way
@@ -400,7 +401,170 @@ why each has a test naming it:
 - **An unrecognised typeflag is `GARC_MEMBER_OTHER`, not a file.** Extracting an
   unknown type as a regular file is how a reader invents data.
 
-## 7. The result vocabulary, and its two departures
+## 7. zip, which is read backwards
+
+A tar is a sequence of headers from the front. A zip is an index at the **end**:
+the end-of-central-directory record says where the central directory is, and the
+directory's entries say where each member's local header is. Everything below
+follows from that one fact.
+
+**Every value reported about a member comes from the central directory**, and the
+local header is read for exactly one thing - where the member's data starts, which
+only it can say, because its name and extra field are sized independently of the
+directory's copies.
+
+That is not a preference between two equal sources. libarchive writes a data
+descriptor for every member with data, *even into a seekable file*, which means
+the local header's sizes are zero and the real values are behind the data and in
+the directory; a reader that believed the local header would report every member
+of an ordinary bsdtar-made zip as empty and would still pass every test written
+against archives from any other tool. And where the two disagree deliberately,
+following the directory is what every real tool does - which is what makes
+trusting the local header the root of the whole class of zip confusion bugs, where
+one member is displayed and another extracted.
+
+The corollary is a refusal: **a local header whose name is not the directory's is
+`GARC_ERR_CORRUPT`**. An archive saying two different things about which member
+this is has nothing else to be, and no writer in the corpus disagrees with itself,
+so the refusal costs nothing real.
+
+### Finding the end record, which is the part that must not be lazy
+
+The scan starts at the end of the stream and goes back at most 65,557 bytes - 22
+of record plus the largest comment its 16-bit length field can describe - and
+**every candidate is validated**: the comment length has to account for exactly
+the bytes after it. Two things force that:
+
+- The signature can appear *inside the archive comment*, and does. Python's
+  `zipfile` does an `rfind` for it and gives up when the arithmetic fails, so it
+  cannot open `python-comments.zip` at all - while unzip, bsdtar and 7-Zip read it
+  correctly. Add 22 more bytes behind the decoy, so that a whole record fits where
+  it sits, and unzip refuses it too while the other two still read it. The pair of
+  fixtures is one byte count apart and **no two of the four references answer both
+  the same way**.
+- A scan that looked further than the bound would find a signature inside a
+  *member's data*, which is a thing an attacker can put there for free.
+  `python-data-decoy.zip` has a whole plausible directory header and end record
+  inside one member, and every reference reads that archive - so a reader it breaks
+  is broken by its own scan.
+
+Where two records are both valid, **the one nearer the end wins**, which is what
+unzip and libarchive do. The format cannot distinguish them, so the choice is
+written down rather than left to whichever way a loop happened to run.
+
+**A zip must end where the stream ends.** Bytes *before* the archive are ordinary -
+a self-extracting stub is exactly that - but bytes after the record that its
+comment length does not cover make the archive unfindable by any conforming
+reader, and this one answers `GARC_ERR_CORRUPT` rather than scanning the whole
+file.
+
+### The base offset is discovered, not declared
+
+The directory says where it is; the scan finds where it actually is; the difference
+is how many bytes sit in front of the archive without being counted, and every
+offset in the file is short by that much. `garc_zip_base_offset()` reports it
+rather than applying it silently, because it is the one number here this library
+worked out rather than read.
+
+**One consequence is worth knowing rather than fixing:** an archive whose declared
+directory *size* is wrong is indistinguishable from one with a stub, because both
+show up as the same subtraction. The reader concludes there is a stub, shifts every
+offset, and lands somewhere that is not a local header - so it fails closed, with a
+signature mismatch rather than a size complaint. The bound that *is* a size check
+catches the other shape: an entry whose own name or extra length runs it past the
+end of the directory.
+
+### Seeking, which is required, and the refusal that says so
+
+Reading a zip needs a seekable stream: the answer to "what is in this" is at the
+far end of the file. A stream whose first bytes are a zip signature and which
+cannot seek is **`GARC_ERR_NOT_SEEKABLE`**, not `GARC_ERR_FORMAT` - a caller told
+"not an archive" about a file every other tool opens would go looking for the
+wrong thing, and the fix is only discoverable from the status. There is no
+streaming mode, and adding one would mean trusting the local headers.
+
+### zip64, which is per field and not per archive
+
+A size, a compressed size or an offset that does not fit its 32-bit field holds
+`0xFFFFFFFF`, and the real value is in a 0x0001 extra field - **only for the
+fields that hold the marker, in the specification's order**. `zip -fz` writes an
+eight-byte field for an archive where only the uncompressed size was marked, so a
+reader that consumed the values positionally, or that assumed sixteen bytes, gets
+this member's size out of the wrong eight. A marker with no field to supply it is
+refused rather than read as 4 GiB minus one.
+
+The archive-level records are a separate question from the member-level fields, and
+`garc_zip_has_zip64_end_record()` is separate from
+`garc_zip_member_used_zip64()`: Python's `force_zip64` writes the member's fields
+into the **local header only**, leaving a directory that needs none and no zip64
+end record at all.
+
+The locator is looked for whenever there is room for one, not only when a field
+holds a marker - because `zip -fz` writes the zip64 records for an archive whose
+32-bit counts would all have fitted, and those counts are right, so a reader that
+waited for a marker would pass on that archive until the one where they are not.
+
+### Methods and encryption, which are numbers a refusal has to name
+
+Method 0 is read. 8, 9, 12, 14, 93 and 98 are refused with
+`GARC_ERR_UNSUPPORTED`, and `garc_zip_member_method()` with
+`garc_zip_method_string()` say which - so the refusal is a to-do list rather than
+a dead end. unzip 6.00 refuses 14 and 99 itself, with "need PK compat. v6.3", so
+refusing them here is the format's age rather than conservatism.
+
+Encryption is **two schemes and not a bit**: ZipCrypto is broken and will be read
+and never written, WinZip AES is sound and needs a library this one does not yet
+depend on. "Unsupported" alone cannot tell a caller which they are looking at, nor
+whether a password could ever help. A member's metadata is in the clear in both
+schemes, at every password strength - zip cannot hide which files exist, and 7z's
+encrypted header can.
+
+That a member's *metadata* is readable and its *data* is not is an **ordinary
+state** in zip rather than a failure: an archive with one bzip2 member is still an
+archive to walk. So the refusal lives on the read rather than on the walk, and
+`garc_read_member()` answers it before the size check - a zero-length member of an
+unreadable kind must not read as a successful end of data.
+
+### Times, modes and types, each from the field that is allowed to say
+
+**Three fields can carry an mtime** and the most precise wins: the 0x000a NTFS
+field (100-nanosecond intervals since 1601, which 7-Zip writes in the directory
+only), then the 0x5455 extended timestamp (epoch seconds), then the MS-DOS field.
+`GARC_Member.mtime_source` says which answered, because they can disagree.
+
+The DOS field **carries no time zone and never has**, so converting it is a
+decision: this library reads it as UTC and `GARC_TIME_ZIP_DOS` is how a caller
+knows that is what happened. Reading the host's zone instead would make one
+archive answer two ways. An out-of-range field - a date of zero has month 0 and
+day 0 - is reported as *no* time rather than as the date the arithmetic would
+invent.
+
+A **mode** is only meaningful when `version made by`'s high byte says Unix. On a
+DOS or Windows archive that half of `external_file_attributes` is zero rather than
+absent, so a reader that read it unconditionally would report a mode of 0000 for
+every member of a perfectly ordinary zip.
+
+A **type** has three sources in order: a name ending in `/`, which is the
+convention every tool follows and the only one a DOS archive has; the DOS
+directory attribute bit; and then the Unix mode's `S_IFMT`, which is the only
+place a symlink is distinguishable at all, since zip has no type field. There are
+no hard links in zip.
+
+A **symlink's target is the member's data**, so reporting one means reading data
+during the walk. This library does that eagerly where it is cheap and certain -
+stored, unencrypted, and no longer than a name is allowed to be - and leaves
+`link_target` NULL otherwise. The alternative was reporting no target for any zip
+symlink, which would leave the filesystem layer of phase F unable to ask the
+question it exists to ask.
+
+### Duplicate names are reported, not resolved
+
+Two members may declare the same name, and every reference accepts such an archive
+and reports both. So does this: silently picking one would be deciding which of
+two answers a caller wanted, and the two have different contents.
+`garc_find()` returns the first, which is the same rule the tar reader follows.
+
+## 8. The result vocabulary, and its two departures
 
 CONVENTIONS.md section 5 fixes the result vocabulary. This library departs
 twice, and both departures are in that document's table.
@@ -424,7 +588,7 @@ phase A can return, so every value is reachable and every row of
 `garc_result_string()` is exercised — a string table with unreachable rows is a
 table nobody can test.
 
-## 8. The stream
+## 9. The stream
 
 **Offsets and sizes are `uint64_t`, not `size_t`.** A zip64 archive may exceed
 4 GiB and declare a member that does, and `size_t` is 32 bits on a 32-bit host:
@@ -477,7 +641,7 @@ where the archive ran out. The fuzz harness found this on its first run by
 asserting one rule for both paths; two paths meant to be interchangeable have
 to say where they are not.
 
-## 9. The sink, which is not the stream with a `write` added
+## 10. The sink, which is not the stream with a `write` added
 
 Bytes leave through `GARC_Sink`, a separate type. The alternative - one
 `GARC_Stream` with a `write` callback beside `read` - was refused for a reason
@@ -529,7 +693,7 @@ computes padding from, so counting a refused write would pad the next member to
 the wrong boundary - and every reader would then report the damage at a header
 some distance after the cause.
 
-## 10. Writing tar, which is one header and a record for the rest
+## 11. Writing tar, which is one header and a record for the rest
 
 The writer emits **pax**: a ustar header with every field filled in, and an
 extended record only for what ustar cannot say. A reader that knows only
@@ -675,7 +839,7 @@ Both are asserted rather than absorbed into a tolerance:
   `GARC_TIME_PAX_DECIMAL` whatever was asked. The writer's fuzz harness found that
   on its first run, by asserting that it could not happen.
 
-## 11. Testing
+## 12. Testing
 
 **Four stream shapes, not one.** Seekability and known-size are two independent
 properties, so there are four combinations and a memory stream is one of them.

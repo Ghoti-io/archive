@@ -39,5 +39,6 @@
 #include <ghoti.io/archive/tar.h>
 #include <ghoti.io/archive/version.h>
 #include <ghoti.io/archive/writer.h>
+#include <ghoti.io/archive/zip.h>
 
 #endif // GHOTI_IO_GARC_ARCHIVE_H
