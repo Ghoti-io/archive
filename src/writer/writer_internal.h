@@ -124,6 +124,30 @@ typedef struct {
   GARC_Buffer extra;
   /** Whether this member's records carry zip64 fields. */
   int used_zip64;
+  /**
+   * Whether this member is WinZip AES.
+   *
+   * A directory is never encrypted. A file, an empty file and a symlink are,
+   * when @ref password has been set. The header method is then 99 and
+   * @ref method stays the real compression method.
+   */
+  int aes;
+  /** Non-zero once any member of this archive was written as AES. */
+  int wrote_aes;
+  /** The password, copied at create and wiped on release. NULL when unset. */
+  uint8_t * password;
+  /** Length of @ref password. Zero with @ref have_password is an empty password. */
+  size_t password_length;
+  /** Whether a password was set. Distinct from a zero @ref password_length. */
+  int have_password;
+  /** 1, 2 or 3 when @ref have_password is set. 0 otherwise. */
+  uint8_t aes_strength;
+  /**
+   * CTR and HMAC for the member being written, or NULL.
+   *
+   * Owned. Wiped by finish and by release.
+   */
+  struct GARC_Zip_Aes * aes_state;
   /** @} */
 } GARC_Zip_Write_State;
 
@@ -199,6 +223,19 @@ GARC_Result garc_tar_write_member(
  * @return GARC_OK, or GARC_ERR_IO.
  */
 GARC_Result garc_tar_write_close_member(GARC_Writer * writer);
+
+/**
+ * Copy a zip writer's password and resolve its AES strength.
+ *
+ * @param writer The writer.
+ * @param password Password bytes. NULL only when @p length is 0, which is an
+ *   empty password and still encrypts.
+ * @param length Its length.
+ * @param bits 128, 192 or 256. Already resolved from a 0 meaning 256.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID, or ::GARC_ERR_OOM.
+ */
+GARC_Result garc_zip_write_adopt_password(GARC_Writer * writer,
+    const void * password, size_t length, uint32_t bits);
 
 /**
  * Write one zip member's local header, and remember what its directory entry and

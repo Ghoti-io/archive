@@ -55,6 +55,12 @@ void garc_writer_options_default(GARC_Writer_Options * options) {
   options->zip_force_zip64 = 0;
   // Stored, which is also this field's zero. GARC_Writer_Options argues it.
   options->zip_method = GARC_ZIP_METHOD_STORED;
+  // No password. A zero-filled struct agrees: the pointer and the length are
+  // both zero, and that is unencrypted. Bits of 0 mean AES-256 only once a
+  // password is set.
+  options->zip_password = NULL;
+  options->zip_password_length = 0;
+  options->zip_aes_bits = 0;
   // No record padding. bsdtar's answer rather than GNU tar's: 10240 bytes was a
   // tape record, every reader accepts either, and this library's archives are
   // built in memory and handed to a caller far more often than they are written
@@ -160,6 +166,18 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
         // truncated archive behind it.
         return GARC_ERR_UNSUPPORTED;
     }
+    if (!resolved.zip_password && resolved.zip_password_length) {
+      return GARC_ERR_INVALID;
+    }
+    switch (resolved.zip_aes_bits) {
+      case 0u:
+      case 128u:
+      case 192u:
+      case 256u:
+        break;
+      default:
+        return GARC_ERR_INVALID;
+    }
     // zip has no variants and tar_variant is meaningless here, so it is not
     // checked: a caller copying an archive from tar to zip should not have to
     // clear a field that describes the format they are no longer writing.
@@ -183,6 +201,21 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
   writer->allocator = allocator;
   writer->format = format;
   writer->options = resolved;
+
+  if (format == GARC_FORMAT_ZIP && resolved.zip_password) {
+    const uint32_t bits
+        = resolved.zip_aes_bits ? resolved.zip_aes_bits : 256u;
+    const GARC_Result adopted = garc_zip_write_adopt_password(
+        writer, resolved.zip_password, resolved.zip_password_length, bits);
+    if (adopted != GARC_OK) {
+      garc_writer_destroy(writer);
+      return adopted;
+    }
+    // The caller's pointer is not the copy. Drop it so a later use of the
+    // options struct cannot read a buffer the caller has freed.
+    writer->options.zip_password = NULL;
+    writer->options.zip_password_length = 0;
+  }
 
   *out_writer = writer;
   return GARC_OK;

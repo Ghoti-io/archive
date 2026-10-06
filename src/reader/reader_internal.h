@@ -232,20 +232,43 @@ typedef struct {
   /**
    * The three ZipCrypto key words, with the password already mixed in.
    *
-   * **The password itself is never kept.** Its only role is to produce these,
-   * and every member starts from this same state, so storing the derived words
-   * means the plaintext password is not in this library's memory for the life of
-   * the archive. It also makes an empty password representable, which a
-   * zero-length buffer would not be - hence @ref have_password beside it rather
-   * than a length.
+   * Derived at ::garc_zip_set_password() and wiped on release. ZipCrypto still
+   * needs nothing else. WinZip AES cannot be derived at that call: each member
+   * has its own salt, so the password is kept in @ref password until release.
    *
    * Set by ::garc_zip_set_password() and deliberately untouched by
    * ::garc_zip_rewind(): a password is a property of the archive, not of where
-   * the walk is.
+   * the walk is. An empty password is @ref have_password with
+   * @ref password_length 0, which is not the same as never having called it.
    */
   uint32_t crypt_keys[3];
   /** Whether ::garc_zip_set_password() has been called. */
   int have_password;
+  /**
+   * The password bytes, copied at ::garc_zip_set_password() and wiped on release.
+   *
+   * NULL when @ref password_length is 0. Untouched by ::garc_zip_rewind().
+   */
+  uint8_t * password;
+  /** Length of @ref password. Zero with @ref have_password set is empty. */
+  size_t password_length;
+  /**
+   * WinZip AES version from the 0x9901 field. 1 is AE-1, 2 is AE-2, 0 is not
+   * an AES member.
+   */
+  uint16_t aes_version;
+  /** WinZip AES strength byte: 1, 2 or 3. Zero when this member is not AES. */
+  uint8_t aes_strength;
+  /** The real compression method from 0x9901. The header method stays 99. */
+  uint16_t aes_method;
+  /**
+   * Whether this member's HMAC matched.
+   *
+   * Stays 0 until the authentication code has been checked and agreed. A 16-bit
+   * verifier can pass for a wrong password, so a failure here is reported as
+   * ::GARC_ERR_PASSWORD_OR_CORRUPT when the member is over.
+   */
+  int aes_auth_ok;
   /** @} */
 
   /**

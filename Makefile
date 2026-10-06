@@ -364,9 +364,22 @@ endif
 endif
 INCLUDE += $(COMPRESS_CFLAGS)
 
+# ghoti.io-security, for WinZip AES: PBKDF2, AES-CTR and HMAC. A hard dependency,
+# same shape as compress above. ZipCrypto does not use it; AES cannot be built
+# without it, and there is no feature gate that leaves the symbols unlinked.
+SECURITY_PC ?= ghoti.io-security$(BRANCH)
+SECURITY_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(SECURITY_PC) 2>/dev/null)
+SECURITY_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(SECURITY_PC) 2>/dev/null)
+ifeq ($(strip $(SECURITY_CFLAGS)),)
+ifndef SKIP_DEP_CHECK
+$(error ghoti.io-security was not found by pkg-config. Run ./bootstrap.sh at the root of the workspace - two levels up, the directory holding libs/ - to build and install the suite into a local prefix, then pass the same PREFIX here - or point PKG_CONFIG_PATH at the directory holding its .pc file. There is deliberately no sibling-checkout fallback, for the reason cutil's error above gives.)
+endif
+endif
+INCLUDE += $(SECURITY_CFLAGS)
+
 # One variable for "the libraries this links", so that a rule cannot pick up one
 # dependency and miss the other. Every link line below reads this.
-DEP_LIBS := $(CUTIL_LIBS) $(COMPRESS_LIBS)
+DEP_LIBS := $(CUTIL_LIBS) $(COMPRESS_LIBS) $(SECURITY_LIBS)
 
 # Automatically collect all .c source files under the src directory.
 SOURCES := $(shell find src -type f -name '*.c')
@@ -1353,7 +1366,7 @@ LDCONF_INSTALL_PATH ?= /etc/ld.so.conf.d
 # What goes in the .pc Requires: field. Built from the same variables the
 # compile uses, so a dependency on another branch cannot be named one way for
 # the build and another way for consumers.
-PC_REQUIRES := $(CUTIL_PC) $(COMPRESS_PC)
+PC_REQUIRES := $(CUTIL_PC) $(COMPRESS_PC) $(SECURITY_PC)
 
 # Where this project's own .pc file is installed.
 PKGCONFIG_INSTALL_PATH ?= $(PC_INSTALL_PATH)

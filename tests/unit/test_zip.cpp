@@ -31,6 +31,8 @@
 
 #include <gtest/gtest.h>
 
+#include <ghoti.io/security/sha256.h>
+
 #include "test_helpers.h"
 #include "zip_manifest.h"
 
@@ -172,6 +174,96 @@ std::string read_all(GARC_Archive * archive) {
       && got) {
     out.append(buffer, got);
   }
+  return out;
+}
+
+/**
+ * Read a member and keep the status of the call that ends it.
+ *
+ * read_all() drops that status. AES reports the HMAC on the zero-byte call,
+ * so a test that only kept the bytes would pass a member whose tag did not
+ * match.
+ */
+std::string read_checked(GARC_Archive * archive, GARC_Result * status) {
+  std::string out;
+  char buffer[512];
+  size_t got = 0;
+  GARC_Result result;
+  while ((result = garc_read_member(archive, buffer, sizeof(buffer), &got))
+          == GARC_OK
+      && got) {
+    out.append(buffer, got);
+  }
+  *status = result;
+  return out;
+}
+
+/** Two stored AES members, so a password set once can be used for the second. */
+std::vector<uint8_t> two_aes_members() {
+  std::vector<uint8_t> bytes;
+  GARC_Sink * sink = nullptr;
+  if (garc_sink_create_memory(&sink) != GARC_OK) {
+    return bytes;
+  }
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_password = kCorpusPassword;
+  options.zip_password_length = std::strlen(kCorpusPassword);
+  GARC_Writer * writer = nullptr;
+  if (garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer) != GARC_OK) {
+    garc_sink_destroy(sink);
+    return bytes;
+  }
+  const char * names[] = {"one.txt", "two.txt"};
+  const char * bodies[] = {"one\n", "two\n"};
+  for (int i = 0; i < 2; ++i) {
+    GARC_Member member;
+    std::memset(&member, 0, sizeof(member));
+    member.name = names[i];
+    member.name_length = std::strlen(names[i]);
+    member.type = GARC_MEMBER_FILE;
+    member.size = std::strlen(bodies[i]);
+    member.mode = 0644;
+    member.mode_valid = 1;
+    member.mtime_seconds = 1000000000;
+    member.mtime_source = GARC_TIME_ZIP_DOS;
+    if (garc_writer_add(writer, &member) != GARC_OK
+        || garc_writer_write(writer, bodies[i], member.size) != GARC_OK) {
+      garc_writer_destroy(writer);
+      garc_sink_destroy(sink);
+      return {};
+    }
+  }
+  if (garc_writer_finish(writer) != GARC_OK) {
+    garc_writer_destroy(writer);
+    garc_sink_destroy(sink);
+    return {};
+  }
+  const void * raw = nullptr;
+  size_t size = 0;
+  if (garc_sink_data(sink, &raw, &size) == GARC_OK && raw && size) {
+    const uint8_t * data = static_cast<const uint8_t *>(raw);
+    bytes.assign(data, data + size);
+  }
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  return bytes;
+}
+
+/** `sha256:<hex>/<length>`, the shape of a decrypted.tsv digest column. */
+std::string sha256_column(const std::string & bytes) {
+  unsigned char digest[GSEC_SHA256_DIGEST_LEN];
+  if (gsec_sha256(bytes.data(), bytes.size(), digest) != GSEC_OK) {
+    return {};
+  }
+  static const char hex[] = "0123456789abcdef";
+  std::string out = "sha256:";
+  for (size_t i = 0; i < sizeof(digest); ++i) {
+    out.push_back(hex[digest[i] >> 4]);
+    out.push_back(hex[digest[i] & 0x0fu]);
+  }
+  out.push_back('/');
+  out += std::to_string(bytes.size());
   return out;
 }
 
@@ -637,7 +729,7 @@ TEST(ZipCorpus, EveryDeflatedMemberInTheCorpusReadsAndItsCrcVerifies) {
   // And the encrypted members are in it rather than skipped past, which is what
   // makes this test cover the cipher as well as the codec.
   EXPECT_GE(encrypted, 4u);
-  EXPECT_GE(unsupported, 5u) << "bzip2, lzma, ppmd, deflate64, AES, ZipCrypto";
+  EXPECT_GE(unsupported, 5u) << "bzip2, lzma, ppmd, deflate64";
 }
 
 TEST(Zip, EveryCodecGatedMethodRefusesWithItsNumber) {
@@ -792,21 +884,21 @@ TEST(ZipCrypto, EveryEncryptedMemberReadsWhatThreeProgramsDecrypt) {
                             : GARC_ZIP_ENCRYPTION_ZIPCRYPTO) << where;
 
     if (!row.have_plaintext) {
-      // AES, which no password reaches in this cut. The refusal has to name the
-      // scheme rather than the password, because a password is not what is
-      // missing - and this is the row that says so.
-      char buffer[64];
-      size_t got = 0;
-      EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
-          GARC_ERR_UNSUPPORTED) << where;
-      ++refused;
+      // AES. Python and unzip refuse method 99, so the plaintext column is `-`
+      // and the sevenzip column is the digest this read has to match. The
+      // header method stays 99; the comparison is the bytes, not that number.
+      GARC_Result status = GARC_ERR_INTERNAL;
+      const std::string bytes = read_checked(fixture.archive(), &status);
+      EXPECT_EQ(status, GARC_OK) << where << ": " << garc_result_string(status);
+      EXPECT_EQ(sha256_column(bytes), row.sevenzip) << where;
+      ++compared;
       continue;
     }
     EXPECT_EQ(read_all(fixture.archive()), row.plaintext) << where;
     ++compared;
   }
-  EXPECT_EQ(compared, 4u);
-  EXPECT_EQ(refused, 1u);
+  EXPECT_EQ(compared, 5u);
+  EXPECT_EQ(refused, 0u);
 }
 
 TEST(ZipCrypto, TheCheckByteComesFromTheDosTimeWhenThereIsADataDescriptor) {
@@ -969,12 +1061,79 @@ TEST(Zip, WinZipAesIsNamedAndItsRealMethodIsNotLost) {
   EXPECT_EQ(garc_zip_member_encryption(fixture.archive()),
       GARC_ZIP_ENCRYPTION_AES);
   EXPECT_STREQ(garc_zip_method_string(GARC_ZIP_METHOD_AES), "WinZip AES");
-  // unzip 6.00 refuses this member too, with "need PK compat. v5.1", so the
-  // refusal is the format's age rather than this library being conservative.
+  // The walk succeeds. The bytes need a password, and the refusal says that
+  // rather than that the method is unknown.
   char buffer[16];
   size_t got = 0;
   EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
-      GARC_ERR_UNSUPPORTED);
+      GARC_ERR_PASSWORD_REQUIRED);
+  EXPECT_EQ(got, 0u);
+}
+
+TEST(Zip, AWrongPasswordOnWinZipAesIsRejectedAndTheWalkContinues) {
+  Fixture fixture("sevenzip-aes.zip");
+  ASSERT_EQ(fixture.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "not-the-password", 16u),
+      GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
+  EXPECT_EQ(garc_zip_member_method(fixture.archive()), GARC_ZIP_METHOD_AES);
+  char buffer[16];
+  size_t got = 1;
+  EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
+      GARC_ERR_PASSWORD_REJECTED);
+  EXPECT_EQ(got, 0u);
+}
+
+TEST(Zip, ASecondAesPasswordReplacesTheFirst) {
+  Fixture fixture("sevenzip-aes.zip");
+  ASSERT_EQ(fixture.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "not-the-password", 16u),
+      GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
+
+  char buffer[64];
+  size_t got = 0;
+  ASSERT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
+      GARC_ERR_PASSWORD_REJECTED);
+
+  ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+                std::strlen(kCorpusPassword)),
+      GARC_OK);
+  ASSERT_EQ(garc_find(fixture.archive(), "hello.txt", 9u, &member), GARC_OK);
+  GARC_Result status = GARC_ERR_INTERNAL;
+  EXPECT_EQ(read_checked(fixture.archive(), &status), "hello, archive\n");
+  EXPECT_EQ(status, GARC_OK);
+}
+
+TEST(Zip, ASecondAesMemberDecryptsWithThePasswordAlreadySet) {
+  const std::vector<uint8_t> bytes = two_aes_members();
+  ASSERT_FALSE(bytes.empty());
+  BufferSource source(bytes.data(), bytes.size(), true, true);
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(
+                archive, kCorpusPassword, std::strlen(kCorpusPassword)),
+      GARC_OK);
+
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(archive, &member), GARC_OK);
+  EXPECT_EQ(member_name(member), "one.txt");
+  GARC_Result status = GARC_ERR_INTERNAL;
+  EXPECT_EQ(read_checked(archive, &status), "one\n");
+  EXPECT_EQ(status, GARC_OK);
+
+  ASSERT_EQ(garc_next(archive, &member), GARC_OK);
+  EXPECT_EQ(member_name(member), "two.txt");
+  status = GARC_ERR_INTERNAL;
+  EXPECT_EQ(read_checked(archive, &status), "two\n");
+  EXPECT_EQ(status, GARC_OK);
+
+  garc_close(archive);
+  garc_stream_destroy(stream);
 }
 
 //-----------------------------------------------------------------------------

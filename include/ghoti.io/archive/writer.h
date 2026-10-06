@@ -207,6 +207,38 @@ typedef struct GARC_Writer_Options {
   GARC_Zip_Method zip_method;
 
   /**
+   * Password for WinZip AES, or NULL when the archive is not encrypted.
+   *
+   * NULL with ::zip_password_length 0 is no encryption, which is what a
+   * zero-filled struct does and what NULL options do. A non-NULL pointer with
+   * length 0 is an empty password and does encrypt. NULL with a non-zero
+   * length is ::GARC_ERR_INVALID from ::garc_writer_create(). The bytes are
+   * copied into the writer; the caller may free them when create returns.
+   *
+   * A directory is never encrypted. A file, an empty file, and a symlink
+   * target are, when this is set. ZipCrypto is not produced.
+   */
+  const void * zip_password;
+
+  /**
+   * Length of ::zip_password in bytes.
+   *
+   * Zero with a NULL ::zip_password is no encryption. Zero with a non-NULL
+   * pointer is an empty password.
+   */
+  size_t zip_password_length;
+
+  /**
+   * AES key size in bits for an encrypted member.
+   *
+   * 0, 128, 192 or 256. 0 means 256 when a password is set, and means nothing
+   * when it is not. Any other value is ::GARC_ERR_INVALID from
+   * ::garc_writer_create(). Ignored for tar. A zero-filled struct leaves this
+   * 0, so an unencrypted archive stays unencrypted.
+   */
+  uint32_t zip_aes_bits;
+
+  /**
    * Write zip64 fields on every member, whether or not they are needed.
    *
    * **Off by default, and the default is the rule the format wants**: a zip64

@@ -44,12 +44,12 @@
  * Three things about the shape of this file, each of which could have gone the
  * other way:
  *
- * **The keys are derived at ::garc_zip_set_password() and the password is never
- * kept.** The three words after the password has been mixed in are all any
- * member needs - the password's only role is to produce them - so storing them
- * instead means the plaintext password is not sitting in this library's memory
- * for the life of the archive. It also makes an empty password representable,
- * which "a zero-length buffer" would not be.
+ * **The keys are derived at ::garc_zip_set_password().** The three words after
+ * the password has been mixed in are all any ZipCrypto member needs. The
+ * password itself is kept beside them, because a WinZip AES member has its own
+ * salt and cannot be derived until that salt is read; that copy lives in the
+ * zip reader, not in this file. An empty password stays distinct from no
+ * password, which a missing buffer would not be.
  *
  * **Decryption is a stream, not a transform.** A member's plaintext is its
  * *compressed* bytes, so for a deflated member the layering is

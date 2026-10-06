@@ -150,14 +150,15 @@ static char BIG[3000];
 static char NOISE[3000];
 
 /**
- * **Six encodings of one member list**, which is what the gate compares against
+ * **Seven encodings of one member list**, which is what the gate compares against
  * each other and against the references.
  *
- * The encodings differ in nothing but their encoding, which is what makes "all six
- * read the same" a statement about the writer rather than about six different
- * inputs. `pipe.zip` is the streaming form reached the way a caller reaches it by
- * accident - a sink with no `patch`, which is what a socket is - and it must come
- * out identical to asking for descriptors outright.
+ * The encodings differ in nothing but their encoding, which is what makes "all
+ * seven read the same" a statement about the writer rather than about seven
+ * different inputs. `pipe.zip` is the streaming form reached the way a caller
+ * reaches it by accident - a sink with no `patch`, which is what a socket is -
+ * and it must come out identical to asking for descriptors outright. `aes.zip`
+ * is the same stored members with a password, written as WinZip AES.
  */
 static const struct {
   const char * name;
@@ -165,28 +166,34 @@ static const struct {
   int patchable;
   int force_zip64;
   GARC_Zip_Method method;
+  int aes;
   const char * purpose;
 } ARCHIVES[] = {
-  {"local.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_STORED,
+  {"local.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_STORED, 0,
       "sizes and CRC filled into each local header, which needs a patchable sink"},
-  {"descriptor.zip", GARC_ZIP_SIZES_DESCRIPTOR, 1, 0, GARC_ZIP_METHOD_STORED,
+  {"descriptor.zip", GARC_ZIP_SIZES_DESCRIPTOR, 1, 0, GARC_ZIP_METHOD_STORED, 0,
       "sizes and CRC in a data descriptor after each member, flag bit 3 set"},
-  {"pipe.zip", GARC_ZIP_SIZES_AUTO, 0, 0, GARC_ZIP_METHOD_STORED,
+  {"pipe.zip", GARC_ZIP_SIZES_AUTO, 0, 0, GARC_ZIP_METHOD_STORED, 0,
       "the same descriptors, reached by a sink that cannot patch rather than by "
       "asking"},
-  {"zip64.zip", GARC_ZIP_SIZES_LOCAL, 1, 1, GARC_ZIP_METHOD_STORED,
+  {"zip64.zip", GARC_ZIP_SIZES_LOCAL, 1, 1, GARC_ZIP_METHOD_STORED, 0,
       "zip64 fields on every member plus a zip64 end record and locator"},
   // **Deflate, both ways the sizes can be written**, because those are the two
   // places a compressed size goes and it is a different number from the
   // uncompressed one in both. A stored archive cannot tell them apart: its two
   // sizes are the same number, so a writer that put the wrong one in the local
   // header would pass every stored archive here.
-  {"deflate.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_DEFLATE,
+  {"deflate.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_DEFLATE, 0,
       "deflated members with the compressed size patched into each local header"},
   {"deflate-descriptor.zip", GARC_ZIP_SIZES_DESCRIPTOR, 1, 0,
-      GARC_ZIP_METHOD_DEFLATE,
+      GARC_ZIP_METHOD_DEFLATE, 0,
       "deflated members with the compressed size in a data descriptor"},
+  {"aes.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_STORED, 1,
+      "the stored members, encrypted with WinZip AES and the corpus password"},
 };
+
+/** The password `aes.zip` is written and read with. The corpus uses the same one. */
+static const char AES_PASSWORD[] = "ghoti-password";
 
 #define ARCHIVE_COUNT (sizeof(ARCHIVES) / sizeof(*ARCHIVES))
 
@@ -293,11 +300,12 @@ static GARC_Result size_cb(void * ctx, uint64_t * out_size) {
  * @param patchable Whether to offer the sink a `patch` callback.
  * @param force_zip64 Whether to force zip64 fields.
  * @param method Which method to write the members with.
+ * @param aes Whether to encrypt with WinZip AES. A directory stays in the clear.
  * @return 0 on success.
  */
 static int write_one(const char * directory, const char * name,
     GARC_Zip_Sizes sizes, int patchable, int force_zip64,
-    GARC_Zip_Method method) {
+    GARC_Zip_Method method, int aes) {
   char path[1024];
   snprintf(path, sizeof(path), "%s/%s", directory, name);
   FILE * file = fopen(path, "wb");
@@ -327,6 +335,10 @@ static int write_one(const char * directory, const char * name,
   options.zip_sizes = sizes;
   options.zip_force_zip64 = force_zip64;
   options.zip_method = method;
+  if (aes) {
+    options.zip_password = AES_PASSWORD;
+    options.zip_password_length = sizeof(AES_PASSWORD) - 1u;
+  }
   GARC_Writer * writer = NULL;
   result = garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer);
   if (result != GARC_OK) {
@@ -391,11 +403,17 @@ static int write_one(const char * directory, const char * name,
     // stored, and so is a symlink. Spelled here rather than read back out of the
     // archive, because that is what makes this an intent row - a probe that asked
     // the archive would agree with it whatever the writer did.
-    const uint16_t expect = entry->type == GARC_MEMBER_FILE && size
-        ? (uint16_t)method : (uint16_t)GARC_ZIP_METHOD_STORED;
+    //
+    // AES writes method 99 and a CRC of 0 for everything except a directory.
+    // The real method stays in 0x9901, and AE-2 does not store the data CRC.
+    const int encrypt = aes && entry->type != GARC_MEMBER_DIRECTORY;
+    const uint16_t expect = encrypt ? (uint16_t)GARC_ZIP_METHOD_AES
+        : entry->type == GARC_MEMBER_FILE && size
+            ? (uint16_t)method : (uint16_t)GARC_ZIP_METHOD_STORED;
     print_row(name, i, entry->name, entry->name_length, type_name(entry->type),
         size, entry->mtime, entry->mode, entry->link,
-        entry->link ? strlen(entry->link) : 0u, expect, crc);
+        entry->link ? strlen(entry->link) : 0u, expect,
+        encrypt ? 0u : crc);
   }
 
   if (result == GARC_OK) {
@@ -447,6 +465,17 @@ static int read_one(const char * path) {
   // spelled the path.
   const char * slash = strrchr(path, '/');
   const char * name = slash ? slash + 1 : path;
+  if (strcmp(name, "aes.zip") == 0) {
+    result = garc_zip_set_password(
+        archive, AES_PASSWORD, sizeof(AES_PASSWORD) - 1u);
+    if (result != GARC_OK) {
+      fprintf(stderr, "%s: password: %s\n", name, garc_result_string(result));
+      garc_close(archive);
+      garc_stream_destroy(stream);
+      fclose(file);
+      return 1;
+    }
+  }
 
   size_t index = 0;
   const GARC_Member * member = NULL;
@@ -454,6 +483,8 @@ static int read_one(const char * path) {
     // Read the data through, so the CRC verdict arrives: a member that reads to
     // its end and reports GARC_OK is one whose bytes match the declared CRC.
     char buffer[4096];
+    char held[512];
+    size_t held_len = 0;
     size_t got = 0;
     uint64_t total = 0;
     GARC_Result data = GARC_OK;
@@ -462,6 +493,22 @@ static int read_one(const char * path) {
       while ((data = garc_read_member(archive, buffer, sizeof(buffer), &got))
               == GARC_OK
           && got) {
+        // An encrypted symlink has no link_target: the eager read is only for
+        // a stored, unencrypted member. The decrypted bytes are the target,
+        // and the intent row names that target, so they are what this row
+        // prints. Every target in this corpus fits in held.
+        if (member->type == GARC_MEMBER_SYMLINK) {
+          if (held_len + got > sizeof(held)) {
+            fprintf(stderr, "%s: member %zu: link target does not fit\n",
+                name, index);
+            garc_close(archive);
+            garc_stream_destroy(stream);
+            fclose(file);
+            return 1;
+          }
+          memcpy(held + held_len, buffer, got);
+          held_len += got;
+        }
         total += (uint64_t)got;
       }
     }
@@ -481,11 +528,16 @@ static int read_one(const char * path) {
       fclose(file);
       return 1;
     }
+    const char * link = member->link_target;
+    size_t link_length = member->link_target_length;
+    if (member->type == GARC_MEMBER_SYMLINK && !link) {
+      link = held;
+      link_length = held_len;
+    }
     print_row(name, index, member->name, member->name_length,
         type_name(member->type), member->size, member->mtime_seconds,
-        member->mode & 07777u, member->link_target,
-        member->link_target_length, garc_zip_member_method(archive),
-        garc_zip_member_crc32(archive));
+        member->mode & 07777u, link, link_length,
+        garc_zip_member_method(archive), garc_zip_member_crc32(archive));
     ++index;
   }
 
@@ -538,7 +590,7 @@ int main(int argc, char ** argv) {
   for (size_t i = 0; i < ARCHIVE_COUNT; ++i) {
     if (write_one(argv[2], ARCHIVES[i].name, ARCHIVES[i].sizes,
             ARCHIVES[i].patchable, ARCHIVES[i].force_zip64,
-            ARCHIVES[i].method)) {
+            ARCHIVES[i].method, ARCHIVES[i].aes)) {
       return 1;
     }
   }

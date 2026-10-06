@@ -36,6 +36,8 @@
 #include <ghoti.io/archive/macros.h>
 
 #include <ghoti.io/archive/zip.h>
+#include <ghoti.io/security/aes_ctr.h>
+#include <ghoti.io/security/hmac.h>
 #include <stdint.h>
 
 // GARC_Zip_State lives in reader_internal.h, beside tar's, because GARC_Archive
@@ -235,8 +237,9 @@ GARC_Result garc_zip_open(GARC_Archive * archive, uint64_t eocd_offset);
 /**
  * Derive the three ZipCrypto keys from a password.
  *
- * The password's only role is to produce these, so the caller keeps them and
- * forgets the password - see zip_crypt.c for why that is not merely tidy.
+ * ZipCrypto needs only these words afterwards. The password is still kept by
+ * the reader, because WinZip AES derives a key per member from that member's
+ * salt and cannot do it at this call.
  *
  * @param keys Receives the three words.
  * @param password The password bytes. May be NULL only when @p length is 0.
@@ -283,6 +286,215 @@ int garc_zip_crypt_header_ok(const uint8_t header[GARC_ZIP_CRYPT_HEADER_SIZE],
  */
 GARC_Result garc_zip_crypt_stream_create(const GARC_Allocator * allocator,
     GARC_Stream * inner, const uint32_t keys[3], GARC_Stream ** out_stream);
+
+/** WinZip AES authentication code length, the first bytes of HMAC-SHA-1. */
+#define GARC_ZIP_AES_AUTH_LEN 10u
+
+/** Password verifier length in a WinZip AES member. */
+#define GARC_ZIP_AES_VERIFIER_LEN 2u
+
+/**
+ * Salt, verifier and authentication code for a WinZip AES strength.
+ *
+ * Strength 1, 2 and 3 are AES-128, AES-192 and AES-256. Any other value,
+ * including 0, returns 0: there is no salt length to subtract, and the caller
+ * refuses the member before it asks for a password.
+ *
+ * @param strength The 0x9901 strength byte.
+ * @return Salt plus 2 plus 10, or 0 when @p strength is not 1, 2 or 3.
+ */
+size_t garc_zip_aes_framing(uint8_t strength);
+
+/**
+ * The 0x9901 strength byte for a key size in bits.
+ *
+ * @param bits 128, 192 or 256.
+ * @return 1, 2 or 3, or 0 when @p bits is none of those.
+ */
+uint8_t garc_zip_aes_strength(uint32_t bits);
+
+/**
+ * Derive the AES key, the HMAC key and the 2-byte verifier.
+ *
+ * PBKDF2-HMAC-SHA1, 1000 iterations. The derived material is split into the
+ * AES key, the HMAC key of the same length, then the verifier. The derived
+ * block is wiped before this returns. The caller wipes @p aes_key and
+ * @p hmac_key.
+ *
+ * @param password Password bytes. NULL only when @p password_len is 0.
+ * @param password_len Its length. Zero is an empty password.
+ * @param salt The member's salt.
+ * @param salt_len 8, 12 or 16.
+ * @param aes_key Receives @p key_len bytes.
+ * @param key_len 16, 24 or 32, matching @p salt_len.
+ * @param hmac_key Receives @p key_len bytes.
+ * @param verifier Receives the 2-byte verifier.
+ * @return ::GARC_OK, or ::GARC_ERR_INTERNAL when the derivation refuses.
+ */
+GARC_Result garc_zip_aes_derive(const void * password, size_t password_len,
+    const uint8_t * salt, size_t salt_len, uint8_t * aes_key, size_t key_len,
+    uint8_t * hmac_key, uint8_t verifier[GARC_ZIP_AES_VERIFIER_LEN]);
+
+/**
+ * Whether two verifiers are equal.
+ *
+ * Compared with gsec_equal(). The length is the 2-byte verifier.
+ *
+ * @param expected The derived verifier.
+ * @param actual The verifier from the member.
+ * @return Non-zero when they match.
+ */
+int garc_zip_aes_verifier_matches(
+    const uint8_t expected[GARC_ZIP_AES_VERIFIER_LEN],
+    const uint8_t actual[GARC_ZIP_AES_VERIFIER_LEN]);
+
+/**
+ * Whether an HMAC-SHA-1 of @p ciphertext matches the first 10 bytes of @p tag.
+ *
+ * The full digest is 20 bytes. This does not ask `security` for a truncated
+ * HMAC; it computes the digest and compares the prefix with gsec_equal().
+ * An empty ciphertext is a NULL @p ciphertext with @p ciphertext_len 0.
+ *
+ * @param hmac_key The HMAC key.
+ * @param key_len Its length.
+ * @param ciphertext The ciphertext, and nothing else. Not the salt or the
+ *   verifier.
+ * @param ciphertext_len Its length.
+ * @param tag The authentication code from the member.
+ * @param tag_len Its length. Anything other than 10 does not match.
+ * @return Non-zero when the prefix matches.
+ */
+int garc_zip_aes_auth_matches(const uint8_t * hmac_key, size_t key_len,
+    const uint8_t * ciphertext, size_t ciphertext_len, const uint8_t * tag,
+    size_t tag_len);
+
+/**
+ * A decrypting view of one WinZip AES member.
+ *
+ * @p inner is borrowed and is positioned at the first ciphertext byte. The
+ * stream reads only @p ciphertext_len bytes of ciphertext from it, then the
+ * 10-byte authentication code. HMAC failure does not fail the read that
+ * delivered the plaintext: it clears @p auth_ok, and the call that reports the
+ * member is over is what returns the status. @p auth_ok is set to 1 only when
+ * the code matches. It is left 0 until then, including when the ciphertext is
+ * not yet finished.
+ *
+ * @param allocator For the stream. NULL uses the default.
+ * @param inner Where the ciphertext and the authentication code come from.
+ * @param aes_key The AES key. Copied, and not wiped here.
+ * @param hmac_key The HMAC key. Copied, and not wiped here.
+ * @param key_len 16, 24 or 32.
+ * @param ciphertext_len How many ciphertext bytes follow. Zero still reads the
+ *   authentication code on the first read that asks for data; an empty member
+ *   checks the code in the setup instead and does not create a stream.
+ * @param auth_ok Set to 1 when the authentication code matches. Required.
+ * @param out_stream Receives the stream on success.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID, or ::GARC_ERR_OOM.
+ */
+GARC_Result garc_zip_aes_stream_create(const GARC_Allocator * allocator,
+    GARC_Stream * inner, const uint8_t * aes_key, const uint8_t * hmac_key,
+    size_t key_len, uint64_t ciphertext_len, int * auth_ok,
+    GARC_Stream ** out_stream);
+
+/**
+ * Key material for one member being written.
+ *
+ * Opaque. Salt and verifier are written by the caller from @p prefix. The
+ * object holds the CTR context and the HMAC, and wipes both when it is
+ * finished or destroyed.
+ */
+typedef struct GARC_Zip_Aes GARC_Zip_Aes;
+
+/**
+ * Draw a salt, derive the keys, and start CTR and HMAC for one member.
+ *
+ * The counter is the 16-byte little-endian integer 1. @p prefix receives the
+ * salt and then the 2-byte verifier, which is what the member's data starts
+ * with. The derived key block is wiped before this returns.
+ *
+ * @param allocator For the object. NULL uses the default.
+ * @param password Password bytes. NULL only when @p password_len is 0.
+ * @param password_len Its length.
+ * @param strength 1, 2 or 3.
+ * @param prefix Receives salt and verifier. Must hold 18 bytes.
+ * @param prefix_cap Capacity of @p prefix.
+ * @param prefix_len Receives how many bytes were written.
+ * @param out Receives the object on success.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID, ::GARC_ERR_IO when the salt cannot be
+ *   drawn, or ::GARC_ERR_OOM.
+ */
+GARC_Result garc_zip_aes_begin(const GARC_Allocator * allocator,
+    const void * password, size_t password_len, uint8_t strength,
+    uint8_t * prefix, size_t prefix_cap, size_t * prefix_len,
+    GARC_Zip_Aes ** out);
+
+/**
+ * Encrypt one slice and absorb the ciphertext into the HMAC.
+ *
+ * @param aes A live object from ::garc_zip_aes_begin().
+ * @param in Plaintext. NULL only when @p n is 0.
+ * @param out Ciphertext. May be @p in.
+ * @param n How many bytes.
+ * @return ::GARC_OK, or ::GARC_ERR_INVALID.
+ */
+GARC_Result garc_zip_aes_encrypt(
+    GARC_Zip_Aes * aes, const void * in, void * out, size_t n);
+
+/**
+ * A copy of the CTR and HMAC, so a failed sink write can put them back.
+ *
+ * The copy holds key material. Wipe it with ::garc_zip_aes_checkpoint_wipe()
+ * when the write succeeded, or with ::garc_zip_aes_restore() when it did not.
+ */
+typedef struct GARC_Zip_Aes_Checkpoint {
+  GSEC_Aes_Ctr ctr; ///< CTR state, including unused keystream.
+  GSEC_Hmac hmac;   ///< HMAC state, including the outer pad.
+} GARC_Zip_Aes_Checkpoint;
+
+/**
+ * Copy the CTR and HMAC from before a chunk is encrypted.
+ *
+ * @param aes A live writer object.
+ * @param saved Receives the copy.
+ */
+void garc_zip_aes_checkpoint(
+    const GARC_Zip_Aes * aes, GARC_Zip_Aes_Checkpoint * saved);
+
+/**
+ * Put the CTR and HMAC back and wipe the copy.
+ *
+ * @param aes The writer object the failed write advanced.
+ * @param saved The copy from ::garc_zip_aes_checkpoint(). Wiped.
+ */
+void garc_zip_aes_restore(GARC_Zip_Aes * aes, GARC_Zip_Aes_Checkpoint * saved);
+
+/**
+ * Wipe a checkpoint that is no longer needed.
+ *
+ * @param saved The copy. NULL is ignored.
+ */
+void garc_zip_aes_checkpoint_wipe(GARC_Zip_Aes_Checkpoint * saved);
+
+/**
+ * Finish the HMAC and wipe the keys.
+ *
+ * Writes the first 10 bytes of the digest. The object is finished and must
+ * still be destroyed.
+ *
+ * @param aes A live object.
+ * @param tag Receives ::GARC_ZIP_AES_AUTH_LEN bytes.
+ * @return ::GARC_OK, or ::GARC_ERR_INVALID.
+ */
+GARC_Result garc_zip_aes_finish(GARC_Zip_Aes * aes, uint8_t tag[GARC_ZIP_AES_AUTH_LEN]);
+
+/**
+ * Wipe and free an AES writer object. NULL is ignored.
+ *
+ * Safe after ::garc_zip_aes_finish(), and safe when finish was not called.
+ *
+ * @param aes The object.
+ */
+void garc_zip_aes_destroy(GARC_Zip_Aes * aes);
 
 /**
  * Read some of the current member's data, decompressing where it has to.

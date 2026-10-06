@@ -45,6 +45,10 @@ and all four shape what is compared:
   its name is compared only where the intended name has no backslash and no
   high byte. That is a predicate on the input, not a model of libarchive's
   quoting; a wrong model would compare the wrong string and pass.
+- **`unzip` 6.00 cannot read method 99.** `aes.zip` is WinZip AES. unzip,
+  bsdtar, Python's `zipfile` and both re-writers are not asked about it. 7-Zip
+  is, with the corpus password, which is the reference that can check the
+  authentication code.
 - **`bsdtar --format zip` deflates what it re-writes**, so every member of its
   round trip comes back as method 8 whatever it went in as. The size and the CRC
   are still compared, which makes it the strongest statement in this gate:
@@ -96,8 +100,13 @@ COLUMNS = ["archive", "index", "name", "type", "size", "mtime", "mode",
 # green while testing less. These two numbers are the one thing here that has to be
 # edited when a fixture is added, which is where somebody says out loud that the
 # corpus grew - an accidental shrink has no such edit anywhere.
-EXPECTED_ARCHIVES = 6
-EXPECTED_MEMBERS = 72
+EXPECTED_ARCHIVES = 7
+EXPECTED_MEMBERS = 84
+
+# unzip, bsdtar and Python's zipfile cannot read method 99. 7-Zip can, and it
+# is the one reference asked about this archive. The password is the corpus one.
+AES_ARCHIVE = "aes.zip"
+AES_PASSWORD = "ghoti-password"
 
 # What each reference is allowed to say while doing its job, matched whole.
 #
@@ -140,6 +149,15 @@ ROUNDTRIP_SKIP = {
     # predicate rather than a blanket skip.
     "python": (),
 }
+
+
+def without_aes(rows):
+    """Intent rows the references are not asked about.
+
+    `aes.zip` is method 99. unzip 6.00, bsdtar and Python's zipfile refuse it,
+    so a comparison against them is a comparison of the other six archives.
+    """
+    return [row for row in rows if row[0] != AES_ARCHIVE]
 
 
 def rows_from(text):
@@ -298,7 +316,12 @@ def inner(directory):
             ("bsdtar", ["bsdtar", "-tf"]),
             ("sevenzip", ["7z", "t", "-bso0", "-bsp0"])):
         for name in sources:
-            finished = subprocess.run(argv + [name], cwd=ours,
+            if name == AES_ARCHIVE and tool != "sevenzip":
+                continue
+            command = list(argv)
+            if name == AES_ARCHIVE:
+                command = ["7z", "t", "-p" + AES_PASSWORD, "-bso0", "-bsp0"]
+            finished = subprocess.run(command + [name], cwd=ours,
                 capture_output=True, stdin=subprocess.DEVNULL)
             verdicts.append("%s\t%s\t%d" % (tool, name, finished.returncode))
             for raw in finished.stderr.decode("utf-8", "replace").splitlines():
@@ -308,6 +331,8 @@ def inner(directory):
     # Names, from unzip, which prints them as bytes.
     names = []
     for name in sources:
+        if name == AES_ARCHIVE:
+            continue
         finished = subprocess.run(["unzip", "-Z1", name], cwd=ours,
             capture_output=True, stdin=subprocess.DEVNULL)
         if finished.returncode != 0:
@@ -335,6 +360,8 @@ def inner(directory):
     # Metadata, from Python, in the same shape.
     meta = []
     for name in sources:
+        if name == AES_ARCHIVE:
+            continue
         with zipfile.ZipFile(os.path.join(ours, name)) as handle:
             for index, info in enumerate(handle.infolist()):
                 # read() recomputes nothing, so testzip() is asked separately
@@ -374,6 +401,8 @@ def inner(directory):
     os.makedirs(bsdtar_out, exist_ok=True)
     os.makedirs(python_out, exist_ok=True)
     for name in sources:
+        if name == AES_ARCHIVE:
+            continue
         source = os.path.join(ours, name)
         finished = subprocess.run(
             ["bsdtar", "--format", "zip", "-cf",
@@ -568,9 +597,11 @@ def run(binary, work, ours):
         if status != "0":
             failures.append("%s refused %s (%s) - %s"
                 % (tool, name, status, purposes.get(name, "?")))
-    if verdicts != EXPECTED_ARCHIVES * 4:
-        failures.append("%d verdicts against %d archives times four references"
-            % (verdicts, EXPECTED_ARCHIVES))
+    # Six archives, four references, plus 7-Zip alone on aes.zip.
+    expected_verdicts = (EXPECTED_ARCHIVES - 1) * 4 + 1
+    if verdicts != expected_verdicts:
+        failures.append("%d verdicts against %d expected"
+            % (verdicts, expected_verdicts))
 
     # 2. Nothing any of them said while doing it.
     for line in read_tsv("warnings.tsv").splitlines():
@@ -579,7 +610,7 @@ def run(binary, work, ours):
             failures.append("%s said something about %s: %s" % (tool, name, text))
 
     # 3. The names, from the reference that prints bytes.
-    want_names = by_archive(intent)
+    want_names = by_archive(without_aes(intent))
     got_names = {}
     for line in read_tsv("names-unzip.tsv").splitlines():
         name, _index, printed = line.split("\t")
@@ -596,8 +627,9 @@ def run(binary, work, ours):
     counts.append(("names from unzip", sum(len(v) for v in got_names.values()), 0))
 
     # 4. libarchive's types, modes and links.
-    bsdtar_compared, bsdtar_skipped = compare(failures, "bsdtar", intent,
-        rows_from(read_tsv("rows-bsdtar.tsv")),
+    bsdtar_compared, bsdtar_skipped = compare(failures, "bsdtar",
+        without_aes(intent),
+        without_aes(rows_from(read_tsv("rows-bsdtar.tsv"))),
         not_asked=("size", "mtime", "method", "crc"),
         predicates={"name": lambda row: bsdtar_verbatim(column(row, "name"))})
     counts.append(("fields from bsdtar", bsdtar_compared, bsdtar_skipped))
@@ -608,7 +640,8 @@ def run(binary, work, ours):
     #    not. The data length against the declared size is the check that a member
     #    holds what it says.
     python_rows = rows_from(read_tsv("meta-python.tsv"))
-    py_compared, py_skipped = compare(failures, "pyzipfile", intent, python_rows,
+    py_compared, py_skipped = compare(failures, "pyzipfile",
+        without_aes(intent), python_rows,
         not_asked=("mtime", "type", "linkname"))
     counts.append(("fields from pyzipfile", py_compared, py_skipped))
     for row in python_rows:
@@ -633,7 +666,8 @@ def run(binary, work, ours):
         predicates = {"name": lambda row, f=verbatim: f(column(row, "name"))}
         if label == "bsdtar":
             predicates["method"] = deflated_only
-        compared, skipped = compare(failures, "%s round trip" % label, intent,
+        compared, skipped = compare(failures, "%s round trip" % label,
+            without_aes(intent),
             got, finding_skip=ROUNDTRIP_SKIP.get(label, ()),
             predicates=predicates)
         counts.append(("fields after %s re-wrote" % label, compared, skipped))
@@ -653,8 +687,9 @@ def run(binary, work, ours):
             "comparison is against them.\n")
         return 1
 
-    print("check-zip-writer: %d archives accepted by four references; %s"
-        % (EXPECTED_ARCHIVES,
+    print("check-zip-writer: %d archives, %s accepted by four references "
+        "and %s by 7-Zip; %s"
+        % (EXPECTED_ARCHIVES, EXPECTED_ARCHIVES - 1, AES_ARCHIVE,
             ", ".join("%d %s" % (count, what) for what, count, _ in counts)))
     skipped_total = sum(skipped for _, _, skipped in counts)
     # Only the exclusions that are findings about a reference. A column a

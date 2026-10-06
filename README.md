@@ -84,14 +84,18 @@ needs to know whether a password could ever help.
 **ZipCrypto is read and will never be written.** The traditional PKWARE cipher
 needs no cryptography library at all - it is three words mixed with CRC-32, which
 `compress` already has - and it is broken, which is a reason to read what exists in
-the world rather than a reason to refuse it. `garc_zip_set_password()` derives the
-keys and does not keep the password. A wrong one gets **three statuses and not
-one**: none supplied, rejected by the encryption header's single check byte, or
-"wrong password or corrupt member" after the CRC - and the third names two causes
-because ZipCrypto has no authentication tag, so nothing can separate them. WinZip
-AES waits for the `security` library and refuses by name until then. Nothing about
-a zip's *metadata* is encrypted at any password strength: a zip cannot hide which
-files exist.
+the world rather than a reason to refuse it. `garc_zip_set_password()` derives
+those keys and also keeps the password, because a WinZip AES member's salt is not
+known until that member is reached. A wrong ZipCrypto password gets **three
+statuses and not one**: none supplied, rejected by the encryption header's single
+check byte, or "wrong password or corrupt member" after the CRC - and the third
+names two causes because ZipCrypto has no authentication tag, so nothing can
+separate them. **WinZip AES is read and written.** A password on a zip writer
+produces AE-2, not ZipCrypto. The HMAC covers the ciphertext, and a tag that does
+not match is the same "wrong password or corrupt member" status, because the
+16-bit verifier can pass for the wrong password. The real compression method is
+answered before the password is asked. Nothing about a zip's *metadata* is
+encrypted at any password strength: a zip cannot hide which files exist.
 
 **Every member's CRC-32 is checked**, which tar has nothing like: reading a member
 to its end and getting `GARC_OK` means this reader and the writer agree about

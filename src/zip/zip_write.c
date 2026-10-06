@@ -62,8 +62,8 @@
  *
  * **What this writes, exhaustively, because "the minimum" is only a claim if it
  * is enumerated.** Per member: a local header, the data, a descriptor when the
- * discipline asks for one, and a central directory entry. Two extra fields, and
- * no others:
+ * discipline asks for one, and a central directory entry. Three extra fields,
+ * and no others:
  *
  * - **0x0001, zip64**, when a field needs it, as above.
  * - **0x5455, the extended timestamp**, carrying the mtime as an epoch second,
@@ -72,6 +72,10 @@
  *   silently rounds half of all times and cannot express one before 1980 at all.
  *   Writing it conditionally is what keeps "the minimum" true: an archive whose
  *   every mtime is an even second in range has no extra fields in it.
+ * - **0x9901, WinZip AES**, when a password is set, on a file, an empty file
+ *   or a symlink. Not on a directory. The header method is 99, the real method
+ *   is in the field, the framing is AE-2, and the CRC field is 0. ZipCrypto is
+ *   not written.
  *
  * No Ux, no Unix uid/gid (0x7875), no NTFS timestamp. A caller that needs an
  * owner in a zip cannot have one - the format has no field for it outside a
@@ -88,6 +92,7 @@
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
 #include <ghoti.io/cutil/allocator.h>
+#include <ghoti.io/security/secret.h>
 #include <limits.h>
 #include <stdint.h>
 #include <string.h>
@@ -103,6 +108,9 @@
 /** The value a 16-bit field holds for the same reason. */
 #define ZIP_MARKER16 0xFFFFu
 
+/** General purpose flag bit 0: the member is encrypted. */
+#define ZIP_FLAG_ENCRYPTED 0x0001u
+
 /** General purpose flag bit 3: the sizes are in a data descriptor. */
 #define ZIP_FLAG_DATA_DESCRIPTOR 0x0008u
 
@@ -117,6 +125,16 @@
 
 /** `version needed` for a record with a zip64 field in it. */
 #define ZIP_VERSION_NEEDED_ZIP64 45u
+
+/**
+ * `version needed` for a WinZip AES member.
+ *
+ * 5.1, whether or not the member also needs zip64. 51 is the higher of the two.
+ */
+#define ZIP_VERSION_NEEDED_AES 51u
+
+/** 0x9901 is an 11-byte extra: header, then a 7-byte AE-2 payload. */
+#define ZIP_AES_EXTRA_SIZE 11u
 
 /** The DOS `directory` attribute bit, in the low half of external attributes. */
 #define ZIP_DOS_DIRECTORY 0x10u
@@ -263,15 +281,80 @@ uint64_t garc_zip_deflate_bound(uint64_t size) {
  * @param writer The writer.
  * @param size The member's declared size.
  * @param method The method this member will be written with.
+ * @param encrypt Whether WinZip AES framing is added to the compressed size.
+ *   The salt, verifier and authentication code are part of that size, and the
+ *   header is written before they can be measured, so the bound includes them.
  * @return Non-zero when zip64 fields are needed.
  */
-static int zip_needs_zip64(
-    const GARC_Writer * writer, uint64_t size, uint16_t method) {
-  const uint64_t largest = method == GARC_ZIP_METHOD_DEFLATE
+static int zip_needs_zip64(const GARC_Writer * writer, uint64_t size,
+    uint16_t method, int encrypt) {
+  uint64_t largest = method == GARC_ZIP_METHOD_DEFLATE
       ? garc_zip_deflate_bound(size) : size;
+  if (encrypt) {
+    const uint64_t framing
+        = (uint64_t)garc_zip_aes_framing(writer->zip.aes_strength);
+    if (largest > UINT64_MAX - framing) {
+      largest = UINT64_MAX;
+    }
+    else {
+      largest += framing;
+    }
+  }
   return writer->options.zip_force_zip64
       || largest >= (uint64_t)ZIP_MARKER32
       || garc_sink_tell(writer->sink) >= (uint64_t)ZIP_MARKER32;
+}
+
+/**
+ * The version a reader needs for this member.
+ *
+ * AES is 51 even when the member is also zip64. Otherwise zip64 is 45 and a
+ * stored or deflated member is 20.
+ *
+ * @param zip The member being written.
+ * @return The version-needed field.
+ */
+static uint16_t zip_version_needed(const GARC_Zip_Write_State * zip) {
+  if (zip->aes) {
+    return ZIP_VERSION_NEEDED_AES;
+  }
+  if (zip->used_zip64) {
+    return ZIP_VERSION_NEEDED_ZIP64;
+  }
+  return ZIP_VERSION_NEEDED;
+}
+
+/**
+ * The method number written in the header.
+ *
+ * 99 when the member is AES. The real method stays in @ref
+ * GARC_Zip_Write_State::method and in the 0x9901 field.
+ *
+ * @param zip The member being written.
+ * @return The method field.
+ */
+static uint16_t zip_header_method(const GARC_Zip_Write_State * zip) {
+  return zip->aes ? (uint16_t)GARC_ZIP_METHOD_AES : zip->method;
+}
+
+/**
+ * Write an 11-byte WinZip AES extra field, AE-2.
+ *
+ * @param dest At least ::ZIP_AES_EXTRA_SIZE bytes.
+ * @param method The real compression method.
+ * @param strength 1, 2 or 3.
+ * @return ::ZIP_AES_EXTRA_SIZE.
+ */
+static size_t zip_put_aes_extra(
+    uint8_t * dest, uint16_t method, uint8_t strength) {
+  garc_zip_put16(dest, 0x9901u);
+  garc_zip_put16(dest + 2u, 7u);
+  garc_zip_put16(dest + 4u, 2u);
+  dest[6] = (uint8_t)'A';
+  dest[7] = (uint8_t)'E';
+  dest[8] = strength;
+  garc_zip_put16(dest + 9u, method);
+  return ZIP_AES_EXTRA_SIZE;
 }
 
 /**
@@ -322,9 +405,29 @@ static GARC_Result zip_deflate_emit(GARC_Writer * writer, size_t used) {
   if (!used) {
     return GARC_OK;
   }
+  GARC_Zip_Aes_Checkpoint saved;
+  if (zip->aes_state) {
+    // In place: the packed buffer is ciphertext from here on, and the HMAC
+    // covers that ciphertext rather than the deflate output. The checkpoint
+    // is the state from before this chunk, so a failed sink write can be
+    // retried on the same counter.
+    garc_zip_aes_checkpoint(zip->aes_state, &saved);
+    const GARC_Result encrypted
+        = garc_zip_aes_encrypt(zip->aes_state, zip->packed, zip->packed, used);
+    if (encrypted != GARC_OK) {
+      garc_zip_aes_restore(zip->aes_state, &saved);
+      return encrypted;
+    }
+  }
   const GARC_Result result = garc_sink_write(writer->sink, zip->packed, used);
   if (result != GARC_OK) {
+    if (zip->aes_state) {
+      garc_zip_aes_restore(zip->aes_state, &saved);
+    }
     return result;
+  }
+  if (zip->aes_state) {
+    garc_zip_aes_checkpoint_wipe(&saved);
   }
   zip->compressed += (uint64_t)used;
   return GARC_OK;
@@ -366,6 +469,11 @@ static GARC_Result zip_deflate_end(GARC_Writer * writer) {
 GARC_Result garc_zip_write_member(
     GARC_Writer * writer, const GARC_Member * member) {
   GARC_Zip_Write_State * zip = &writer->zip;
+
+  // A previous add() can fail after the salt is drawn and before the member
+  // is committed. have_member stays clear in that case, so close never runs.
+  garc_zip_aes_destroy(zip->aes_state);
+  zip->aes_state = NULL;
 
   if (!member->name || !member->name_length) {
     // The same refusal the tar writer makes, for the same reason: no writer
@@ -432,7 +540,11 @@ GARC_Result garc_zip_write_member(
       = writer->options.zip_method == GARC_ZIP_METHOD_DEFLATE && size
           && member->type != GARC_MEMBER_SYMLINK
       ? GARC_ZIP_METHOD_DEFLATE : GARC_ZIP_METHOD_STORED;
-  zip->used_zip64 = zip_needs_zip64(writer, size, zip->method);
+  // A directory has no data. A file, an empty file and a symlink do, and the
+  // real method above is what 0x9901 records even when the header says 99.
+  zip->aes = writer->zip.have_password
+      && member->type != GARC_MEMBER_DIRECTORY;
+  zip->used_zip64 = zip_needs_zip64(writer, size, zip->method, zip->aes);
   zip->zip64_offset = 0;
   if (zip->method == GARC_ZIP_METHOD_DEFLATE) {
     // Before the header, so that a member refused for want of an encoder is
@@ -444,6 +556,9 @@ GARC_Result garc_zip_write_member(
   }
 
   zip->flags = 0;
+  if (zip->aes) {
+    zip->flags |= ZIP_FLAG_ENCRYPTED;
+  }
   if (zip_name_needs_utf8_flag(member->name, member->name_length)) {
     zip->flags |= ZIP_FLAG_UTF8;
   }
@@ -517,7 +632,8 @@ GARC_Result garc_zip_write_member(
 
   // The extra field, built once and written into both records with the lengths
   // each of them needs.
-  uint8_t extra[32];
+  // zip64 (20) + UT (9) + 0x9901 (11) is 40. 32 cannot hold that.
+  uint8_t extra[48];
   size_t local_extra = 0;
   if (zip->used_zip64) {
     garc_zip_put16(extra + local_extra, 0x0001u);
@@ -526,11 +642,13 @@ GARC_Result garc_zip_write_member(
     garc_zip_put64(extra + local_extra + 12u, 0u); // Patched or descriptor-borne.
     local_extra = 20u;
   }
+  size_t ut_at = 0;
   if (want_ut) {
     // 0x5455: one flags byte saying which times follow, then the times. Only
     // mtime, which is bit 0 - this library has no atime or ctime to write, and a
     // field claiming times it does not carry is what makes Info-ZIP's UT nine
     // bytes in one record and five in the other.
+    ut_at = local_extra;
     garc_zip_put16(extra + local_extra, 0x5455u);
     garc_zip_put16(extra + local_extra + 2u, 5u);
     extra[local_extra + 4u] = 0x01u;
@@ -540,13 +658,21 @@ GARC_Result garc_zip_write_member(
         (uint32_t)(int32_t)member->mtime_seconds);
     local_extra += 9u;
   }
+  if (zip->aes) {
+    local_extra += zip_put_aes_extra(
+        extra + local_extra, zip->method, zip->aes_strength);
+  }
   // **The central entry's extra is a different length from the local one**, and it
   // is built here rather than at close so that the rule lives in one place. Its
-  // zip64 payload carries only the uncompressed size: the compressed size and the
-  // local offset are known by the time the directory is written and go in their
-  // own fields for real. Info-ZIP's `-fz` output has exactly this asymmetry, 16
-  // bytes of payload in the local header against 8 in the directory.
-  uint8_t central[32];
+  // zip64 payload starts as the uncompressed size. The compressed size is
+  // inserted immediately after it at close, when that size does not fit a
+  // 32-bit field. The local offset goes in its own field. Info-ZIP's `-fz`
+  // output has the 8-byte form when the compressed size does fit: 16 bytes of
+  // payload in the local header against 8 in the directory.
+  // zip64 (12) + UT (9) + 0x9901 (11) is 32, which fills the old array. The
+  // local header's zip64 payload is larger, and both arrays are sized for the
+  // sum rather than for whichever field is last.
+  uint8_t central[48];
   size_t central_extra = 0;
   if (zip->used_zip64) {
     garc_zip_put16(central + central_extra, 0x0001u);
@@ -557,16 +683,20 @@ GARC_Result garc_zip_write_member(
   if (want_ut) {
     // The same five payload bytes in both records, unlike Info-ZIP's nine-then-five
     // - it carries an atime in the local copy and this library has none to carry.
-    memcpy(central + central_extra, extra + local_extra - 9u, 9u);
+    // ut_at, not the tail: AES may already have been appended after UT.
+    memcpy(central + central_extra, extra + ut_at, 9u);
     central_extra += 9u;
+  }
+  if (zip->aes) {
+    central_extra += zip_put_aes_extra(
+        central + central_extra, zip->method, zip->aes_strength);
   }
 
   uint8_t header[GARC_ZIP_LOCAL_HEADER_SIZE];
   memcpy(header, ZIP_SIG_LOCAL, 4);
-  garc_zip_put16(header + 4u,
-      zip->used_zip64 ? ZIP_VERSION_NEEDED_ZIP64 : ZIP_VERSION_NEEDED);
+  garc_zip_put16(header + 4u, zip_version_needed(zip));
   garc_zip_put16(header + 6u, zip->flags);
-  garc_zip_put16(header + 8u, zip->method);
+  garc_zip_put16(header + 8u, zip_header_method(zip));
   garc_zip_put16(header + 10u, zip->dos_time);
   garc_zip_put16(header + 12u, zip->dos_date);
   // Zero here in every discipline: with a descriptor these stay zero, and with
@@ -613,6 +743,25 @@ GARC_Result garc_zip_write_member(
   memcpy(zip->extra.bytes, central, central_extra);
   zip->extra.length = central_extra;
 
+  if (zip->aes) {
+    uint8_t prefix[18];
+    size_t prefix_len = 0;
+    result = garc_zip_aes_begin(writer->allocator, zip->password,
+        zip->password_length, zip->aes_strength, prefix, sizeof(prefix),
+        &prefix_len, &zip->aes_state);
+    if (result != GARC_OK) {
+      return result;
+    }
+    result = garc_sink_write(writer->sink, prefix, prefix_len);
+    gsec_wipe(prefix, sizeof(prefix));
+    if (result != GARC_OK) {
+      garc_zip_aes_destroy(zip->aes_state);
+      zip->aes_state = NULL;
+      return result;
+    }
+    zip->compressed += (uint64_t)prefix_len;
+  }
+
   writer->data_remaining = size;
   writer->data_padding = 0; // zip pads nothing. Ever.
 
@@ -645,6 +794,35 @@ GARC_Result garc_zip_write_data(
       = gcomp_crc32_update(zip->running_crc, (const uint8_t *)data, size);
 
   if (zip->method == GARC_ZIP_METHOD_STORED) {
+    if (zip->aes_state) {
+      const uint8_t * in = (const uint8_t *)data;
+      size_t left = size;
+      uint8_t block[4096];
+      while (left) {
+        const size_t n = left > sizeof(block) ? sizeof(block) : left;
+        GARC_Zip_Aes_Checkpoint saved;
+        garc_zip_aes_checkpoint(zip->aes_state, &saved);
+        const GARC_Result encrypted
+            = garc_zip_aes_encrypt(zip->aes_state, in, block, n);
+        if (encrypted != GARC_OK) {
+          garc_zip_aes_restore(zip->aes_state, &saved);
+          gsec_wipe(block, sizeof(block));
+          return encrypted;
+        }
+        const GARC_Result written = garc_sink_write(writer->sink, block, n);
+        gsec_wipe(block, n);
+        if (written != GARC_OK) {
+          garc_zip_aes_restore(zip->aes_state, &saved);
+          return written;
+        }
+        garc_zip_aes_checkpoint_wipe(&saved);
+        zip->compressed += (uint64_t)n;
+        in += n;
+        left -= n;
+      }
+      zip->running_crc = crc;
+      return GARC_OK;
+    }
     const GARC_Result result = garc_sink_write(writer->sink, data, size);
     if (result != GARC_OK) {
       return result;
@@ -753,6 +931,42 @@ static GARC_Result zip_patch_header(GARC_Writer * writer, uint32_t crc) {
       writer->sink, zip->zip64_offset, payload, sizeof(payload));
 }
 
+/**
+ * Record a compressed size that does not fit the central entry's 32-bit field.
+ *
+ * The extra was built with an 8-byte zip64 payload, the uncompressed size. The
+ * compressed size is known only now. When it does not fit, the 32-bit field is
+ * the marker and the full size follows the uncompressed size, so the payload
+ * grows from 8 bytes to 16. A reader substitutes a zip64 value only for a field
+ * that holds the marker; a truncated 32-bit value would be kept.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK, or ::GARC_ERR_OOM.
+ */
+static GARC_Result zip_central_fit_compressed(GARC_Writer * writer) {
+  GARC_Zip_Write_State * zip = &writer->zip;
+  if (zip->compressed < (uint64_t)ZIP_MARKER32) {
+    return GARC_OK;
+  }
+  uint8_t * extra = (uint8_t *)zip->extra.bytes;
+  if (!extra || zip->extra.length < 12u || garc_zip_le16(extra) != 0x0001u
+      || garc_zip_le16(extra + 2u) != 8u) {
+    return GARC_OK;
+  }
+  const size_t length = zip->extra.length;
+  const GARC_Result grown
+      = garc_buffer_grow(writer->allocator, &zip->extra, length + 8u);
+  if (grown != GARC_OK) {
+    return grown;
+  }
+  extra = (uint8_t *)zip->extra.bytes;
+  memmove(extra + 20u, extra + 12u, length - 12u);
+  garc_zip_put16(extra + 2u, 16u);
+  garc_zip_put64(extra + 12u, zip->compressed);
+  zip->extra.length = length + 8u;
+  return GARC_OK;
+}
+
 GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
   GARC_Zip_Write_State * zip = &writer->zip;
 
@@ -766,30 +980,57 @@ GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
       return ended;
     }
   }
+  if (zip->aes_state) {
+    uint8_t tag[GARC_ZIP_AES_AUTH_LEN];
+    GARC_Result sealed = garc_zip_aes_finish(zip->aes_state, tag);
+    if (sealed != GARC_OK) {
+      garc_zip_aes_destroy(zip->aes_state);
+      zip->aes_state = NULL;
+      return sealed;
+    }
+    sealed = garc_sink_write(writer->sink, tag, sizeof(tag));
+    gsec_wipe(tag, sizeof(tag));
+    garc_zip_aes_destroy(zip->aes_state);
+    zip->aes_state = NULL;
+    if (sealed != GARC_OK) {
+      return sealed;
+    }
+    zip->compressed += (uint64_t)sizeof(tag);
+    zip->wrote_aes = 1;
+  }
   const uint32_t crc = gcomp_crc32_finalize(zip->running_crc);
+  // AE-2 stores a CRC of 0. The real checksum is the HMAC, and a reader of
+  // AE-2 does not treat that 0 as a mismatch.
+  const uint32_t recorded = zip->aes ? 0u : crc;
 
   GARC_Result result = (zip->flags & ZIP_FLAG_DATA_DESCRIPTOR)
-      ? zip_write_descriptor(writer, crc)
-      : zip_patch_header(writer, crc);
+      ? zip_write_descriptor(writer, recorded)
+      : zip_patch_header(writer, recorded);
   if (result != GARC_OK) {
     return result;
   }
 
   // The central entry, which is what a reader will believe. Its sizes are the
   // real ones in every discipline: a descriptor is for the *local* header's
-  // benefit, and the directory has never had an excuse.
+  // benefit, and the directory has never had an excuse. The compressed size
+  // includes the authentication code, so this is the first moment it is known.
+  result = zip_central_fit_compressed(writer);
+  if (result != GARC_OK) {
+    return result;
+  }
   const size_t extra_length = zip->extra.length;
+  const int compressed_marker = zip->compressed >= (uint64_t)ZIP_MARKER32;
   uint8_t entry[GARC_ZIP_CENTRAL_ENTRY_SIZE];
   memcpy(entry, ZIP_SIG_CENTRAL, 4);
   garc_zip_put16(entry + 4u, ZIP_VERSION_MADE_BY);
-  garc_zip_put16(entry + 6u,
-      zip->used_zip64 ? ZIP_VERSION_NEEDED_ZIP64 : ZIP_VERSION_NEEDED);
+  garc_zip_put16(entry + 6u, zip_version_needed(zip));
   garc_zip_put16(entry + 8u, zip->flags);
-  garc_zip_put16(entry + 10u, zip->method);
+  garc_zip_put16(entry + 10u, zip_header_method(zip));
   garc_zip_put16(entry + 12u, zip->dos_time);
   garc_zip_put16(entry + 14u, zip->dos_date);
-  garc_zip_put32(entry + 16u, crc);
-  garc_zip_put32(entry + 20u, (uint32_t)zip->compressed);
+  garc_zip_put32(entry + 16u, recorded);
+  garc_zip_put32(entry + 20u,
+      compressed_marker ? ZIP_MARKER32 : (uint32_t)zip->compressed);
   garc_zip_put32(entry + 24u,
       zip->used_zip64 ? ZIP_MARKER32 : (uint32_t)zip->declared);
   garc_zip_put16(entry + 28u, (uint16_t)zip->name.length);
@@ -843,7 +1084,8 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
     // bytes of signature and eight of the field are not in it.
     garc_zip_put64(record + 4u, GARC_ZIP_ZIP64_EOCD_SIZE - 12u);
     garc_zip_put16(record + 12u, ZIP_VERSION_MADE_BY);
-    garc_zip_put16(record + 14u, ZIP_VERSION_NEEDED_ZIP64);
+    garc_zip_put16(record + 14u, zip->wrote_aes ? ZIP_VERSION_NEEDED_AES
+                                               : ZIP_VERSION_NEEDED_ZIP64);
     garc_zip_put32(record + 16u, 0u); // This disk.
     garc_zip_put32(record + 20u, 0u); // The disk the directory starts on.
     garc_zip_put64(record + 24u, zip->entries);
@@ -893,9 +1135,38 @@ void garc_zip_write_release(GARC_Writer * writer) {
   // buffer would read a freed one the other way round.
   gcomp_encoder_destroy(writer->zip.encoder);
   gcu_allocator_free(writer->allocator, writer->zip.packed);
+  garc_zip_aes_destroy(writer->zip.aes_state);
+  writer->zip.aes_state = NULL;
+  if (writer->zip.password && writer->zip.password_length) {
+    gsec_wipe(writer->zip.password, writer->zip.password_length);
+  }
+  gcu_allocator_free(writer->allocator, writer->zip.password);
+  writer->zip.password = NULL;
+  writer->zip.password_length = 0;
   garc_buffer_free(writer->allocator, &writer->zip.central);
   garc_buffer_free(writer->allocator, &writer->zip.name);
   garc_buffer_free(writer->allocator, &writer->zip.extra);
+}
+
+GARC_Result garc_zip_write_adopt_password(GARC_Writer * writer,
+    const void * password, size_t length, uint32_t bits) {
+  const uint8_t strength = garc_zip_aes_strength(bits);
+  if (!writer || !strength || (!password && length)) {
+    return GARC_ERR_INVALID;
+  }
+  uint8_t * copy = NULL;
+  if (length) {
+    copy = (uint8_t *)gcu_allocator_malloc(writer->allocator, length);
+    if (!copy) {
+      return GARC_ERR_OOM;
+    }
+    memcpy(copy, password, length);
+  }
+  writer->zip.password = copy;
+  writer->zip.password_length = length;
+  writer->zip.have_password = 1;
+  writer->zip.aes_strength = strength;
+  return GARC_OK;
 }
 
 const char * garc_zip_sizes_string(GARC_Zip_Sizes sizes) {

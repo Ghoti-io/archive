@@ -43,6 +43,7 @@
 #include <ghoti.io/archive/zip.h>
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/cutil/allocator.h>
+#include <ghoti.io/security/secret.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -403,7 +404,11 @@ typedef struct {
   int ids_valid;              ///< Whether there was such a field.
   /** The method a WinZip AES member would have had, from its 0x9901 field. */
   uint16_t aes_real_method;
-  int have_aes;               ///< Whether a 0x9901 field was present.
+  /** 1 is AE-1, 2 is AE-2. Meaningful when @ref have_aes is set. */
+  uint16_t aes_version;
+  /** 1, 2 or 3. Meaningful when @ref have_aes is set. */
+  uint8_t aes_strength;
+  int have_aes;               ///< Whether a vendor-AE 0x9901 field was present.
 } Zip_Extra;
 
 /**
@@ -543,12 +548,12 @@ static GARC_Result zip_parse_extra(const uint8_t * bytes, size_t length,
         break;
       }
       case 0x9901u: {
-        // WinZip AES: the version, the vendor tag `AE`, the key strength, and
-        // **the method the member would have had** - because method 99 replaced
-        // it in the header. Phase H does the decryption; this is here so that the
-        // refusal can say AES rather than "unsupported", and so that the real
-        // method is not lost.
-        if (payload >= 7u) {
+        // WinZip AES: version, vendor `AE`, strength, and the real method.
+        // Method 99 replaced that method in the header. A field whose vendor
+        // is not AE is not this scheme.
+        if (payload >= 7u && value[2] == (uint8_t)'A' && value[3] == (uint8_t)'E') {
+          out->aes_version = garc_zip_le16(value);
+          out->aes_strength = value[4];
           out->aes_real_method = garc_zip_le16(value + 5u);
           out->have_aes = 1;
         }
@@ -820,24 +825,150 @@ static GARC_Result zip_setup_zipcrypto(GARC_Archive * archive,
   return GARC_OK;
 }
 
+/**
+ * Check a WinZip AES member and, when it has ciphertext, install its stream.
+ *
+ * The caller has already refused a compressed size shorter than the framing,
+ * and has already refused an unknown strength or version and an unsupported
+ * real method. An empty ciphertext is authenticated here, because a later read
+ * of zero bytes never calls the stream.
+ *
+ * @param archive The archive.
+ * @param data_offset Where the salt begins.
+ * @param compressed_size The compressed size, framing included.
+ * @param out_source Set to the decrypting stream when there is ciphertext.
+ * @return ::GARC_OK, with @ref GARC_Archive::data_refusal set when the password
+ *   is missing or the verifier disagrees. A read failure is returned as itself.
+ */
+static GARC_Result zip_setup_aes(GARC_Archive * archive, uint64_t data_offset,
+    uint64_t compressed_size, GARC_Stream ** out_source) {
+  GARC_Zip_State * zip = &archive->zip;
+  if (!zip->have_password) {
+    archive->data_refusal = GARC_ERR_PASSWORD_REQUIRED;
+    return GARC_OK;
+  }
+
+  size_t salt_len = 16u;
+  size_t key_len = 32u;
+  if (zip->aes_strength == 1u) {
+    salt_len = 8u;
+    key_len = 16u;
+  }
+  else if (zip->aes_strength == 2u) {
+    salt_len = 12u;
+    key_len = 24u;
+  }
+
+  uint8_t prefix[18];
+  GARC_Result result
+      = zip_read_at(archive, data_offset, prefix, salt_len + 2u);
+  if (result != GARC_OK) {
+    return result;
+  }
+
+  uint8_t aes_key[32];
+  uint8_t hmac_key[32];
+  uint8_t verifier[GARC_ZIP_AES_VERIFIER_LEN];
+  result = garc_zip_aes_derive(zip->password_length ? zip->password : NULL,
+      zip->password_length, prefix, salt_len, aes_key, key_len, hmac_key,
+      verifier);
+  if (result != GARC_OK) {
+    gsec_wipe(prefix, sizeof(prefix));
+    gsec_wipe(aes_key, sizeof(aes_key));
+    gsec_wipe(hmac_key, sizeof(hmac_key));
+    return result;
+  }
+  const int matches
+      = garc_zip_aes_verifier_matches(verifier, prefix + salt_len);
+  gsec_wipe(verifier, sizeof(verifier));
+  gsec_wipe(prefix, sizeof(prefix));
+  if (!matches) {
+    gsec_wipe(aes_key, sizeof(aes_key));
+    gsec_wipe(hmac_key, sizeof(hmac_key));
+    archive->data_refusal = GARC_ERR_PASSWORD_REJECTED;
+    return GARC_OK;
+  }
+
+  const uint64_t ciphertext = compressed_size - (uint64_t)salt_len - 2u
+      - (uint64_t)GARC_ZIP_AES_AUTH_LEN;
+  if (!ciphertext) {
+    uint8_t tag[GARC_ZIP_AES_AUTH_LEN];
+    result = zip_read_at(
+        archive, data_offset + salt_len + 2u, tag, sizeof(tag));
+    if (result != GARC_OK) {
+      gsec_wipe(aes_key, sizeof(aes_key));
+      gsec_wipe(hmac_key, sizeof(hmac_key));
+      return result;
+    }
+    zip->aes_auth_ok = garc_zip_aes_auth_matches(
+        hmac_key, key_len, NULL, 0u, tag, sizeof(tag));
+    gsec_wipe(tag, sizeof(tag));
+    gsec_wipe(aes_key, sizeof(aes_key));
+    gsec_wipe(hmac_key, sizeof(hmac_key));
+    return GARC_OK;
+  }
+
+  result = garc_zip_aes_stream_create(archive->allocator, archive->stream,
+      aes_key, hmac_key, key_len, ciphertext, &zip->aes_auth_ok, &zip->crypt);
+  gsec_wipe(aes_key, sizeof(aes_key));
+  gsec_wipe(hmac_key, sizeof(hmac_key));
+  if (result != GARC_OK) {
+    return result;
+  }
+  *out_source = zip->crypt;
+  return GARC_OK;
+}
+
 GARC_Result garc_zip_read(
     GARC_Archive * archive, void * buffer, size_t capacity, size_t * out_read) {
   GARC_Zip_State * zip = &archive->zip;
 
   if (!archive->data_remaining) {
     *out_read = 0;
+    // Uncompressed size 0 returns here before any read of the decrypting
+    // stream. The HMAC is checked in setup only when the ciphertext is empty
+    // too. A compressed member can declare no output and still have
+    // ciphertext, and that tag has to be checked before a successful read.
+    if (zip->aes_version && zip->crypt && !zip->aes_auth_ok) {
+      uint8_t discard[4096];
+      for (;;) {
+        size_t drained = 0;
+        const GARC_Result pulled = garc_stream_read(
+            zip->crypt, discard, sizeof(discard), &drained);
+        gsec_wipe(discard, sizeof(discard));
+        if (pulled != GARC_OK) {
+          return pulled;
+        }
+        if (!drained) {
+          break;
+        }
+      }
+    }
     if (zip->crc_active) {
       // **The verdict, on the call that says the member is over.** Cleared first,
       // so a caller that keeps calling gets the answer once rather than on every
       // call, and so that a second read after a refusal does not re-refuse.
       zip->crc_active = 0;
+      if (zip->aes_version) {
+        // The HMAC is the authentication. A 16-bit verifier can pass for the
+        // wrong password, once in 65536, so a tag that does not match is not
+        // named as either cause. AE-2 stores a CRC of 0 and does not check it;
+        // a stored 0 is not a mismatch. AE-1 still falls through to the CRC.
+        if (!zip->aes_auth_ok) {
+          return GARC_ERR_PASSWORD_OR_CORRUPT;
+        }
+        if (zip->aes_version >= 2u) {
+          return GARC_OK;
+        }
+      }
       if (gcomp_crc32_finalize(zip->running_crc) != zip->crc32) {
-        // **For an encrypted member the cause cannot be named**, and the status
-        // says so rather than picking one. ZipCrypto has no authentication tag,
-        // so a key that got past the check byte - one wrong password in 256 - and
-        // a damaged ciphertext produce the same observation. Reporting
-        // GARC_ERR_CORRUPT here would send a caller looking for a damaged file
-        // when the answer is usually the password they typed.
+        // ZipCrypto has no authentication tag, so a key that got past the
+        // check byte and a damaged ciphertext are the same observation.
+        // AE-1's HMAC already matched; a CRC that disagrees after that is
+        // damage to the plaintext, which is ::GARC_ERR_CORRUPT.
+        if (zip->aes_version) {
+          return GARC_ERR_CORRUPT;
+        }
         return zip->crypt ? GARC_ERR_PASSWORD_OR_CORRUPT : GARC_ERR_CORRUPT;
       }
     }
@@ -932,6 +1063,10 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   zip->extra_length = 0;
   zip->used_zip64 = 0;
   zip->encryption = GARC_ZIP_ENCRYPTION_NONE;
+  zip->aes_version = 0;
+  zip->aes_strength = 0;
+  zip->aes_method = 0;
+  zip->aes_auth_ok = 0;
 
   uint8_t entry[GARC_ZIP_CENTRAL_ENTRY_SIZE];
   GARC_Result result = zip_read_at(archive, zip->cursor, entry, sizeof(entry));
@@ -999,7 +1134,8 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   }
   zip->name.length = name_length;
 
-  Zip_Extra extra = {0, 0u, GARC_TIME_NONE, 0, 0, 0, 0u, 0};
+  Zip_Extra extra;
+  memset(&extra, 0, sizeof(extra));
   if (extra_length) {
     result = garc_buffer_grow(archive->allocator, &zip->extra, extra_length);
     if (result != GARC_OK) {
@@ -1033,6 +1169,13 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
     zip->encryption = (zip->method == GARC_ZIP_METHOD_AES && extra.have_aes)
         ? GARC_ZIP_ENCRYPTION_AES
         : GARC_ZIP_ENCRYPTION_ZIPCRYPTO;
+  }
+  if (zip->encryption == GARC_ZIP_ENCRYPTION_AES) {
+    // method stays 99. garc_zip_member_method() reports that, and the codec
+    // is chosen from the real method below.
+    zip->aes_version = extra.aes_version;
+    zip->aes_strength = extra.aes_strength;
+    zip->aes_method = extra.aes_real_method;
   }
 
   // Where the member's data is. The offsets in the file count from the archive's
@@ -1123,16 +1266,21 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   archive->data_remaining = size;
   archive->data_padding = 0;
   archive->data_refusal = GARC_OK;
-  const char * codec_name = zip_codec_name(zip->method);
+
+  // Method 99 stays in zip->method so garc_zip_member_method() keeps reporting
+  // it. The codec is the real method from 0x9901.
+  const uint16_t body = zip->encryption == GARC_ZIP_ENCRYPTION_AES
+      ? zip->aes_method : zip->method;
+  const char * codec_name = zip_codec_name(body);
 
   uint64_t payload = compressed_size;
   GARC_Stream * source = archive->stream;
 
   // **Every structural check happens before the password, and none of them
-  // depends on it.** An encrypted member is at least its own encryption header
-  // long, and a stored member's two sizes are one number; both are facts about the
-  // archive rather than about the caller's secret, so both are checked whether or
-  // not one was supplied.
+  // depends on it.** An encrypted member is at least its own framing long, and
+  // a stored member's two sizes are one number; both are facts about the
+  // archive rather than about the caller's secret, so both are checked whether
+  // or not one was supplied.
   //
   // This is a defect the fuzz harness found, by walking one archive twice - once
   // with a password and once without - and comparing the members. The length check
@@ -1140,27 +1288,43 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   // set, so the same archive was a corrupt one to a caller who had the password
   // and a walkable one to a caller who did not. A refusal that arrives only for
   // some callers is worse than either answer.
+  int aes_known = 0;
   if (zip->encryption == GARC_ZIP_ENCRYPTION_ZIPCRYPTO) {
     if (compressed_size < GARC_ZIP_CRYPT_HEADER_SIZE) {
       return GARC_ERR_CORRUPT;
     }
     payload = compressed_size - GARC_ZIP_CRYPT_HEADER_SIZE;
   }
-  if (zip->method == GARC_ZIP_METHOD_STORED && payload != size) {
+  else if (zip->encryption == GARC_ZIP_ENCRYPTION_AES) {
+    const size_t framing = garc_zip_aes_framing(zip->aes_strength);
+    aes_known = framing != 0u
+        && (zip->aes_version == 1u || zip->aes_version == 2u);
+    if (aes_known && compressed_size < (uint64_t)framing) {
+      return GARC_ERR_CORRUPT;
+    }
+    if (aes_known) {
+      payload = compressed_size - (uint64_t)framing;
+    }
+  }
+  if ((zip->encryption != GARC_ZIP_ENCRYPTION_AES || aes_known)
+      && body == GARC_ZIP_METHOD_STORED && payload != size) {
     // Stored means the two sizes are one number - the *payload*, which for an
-    // encrypted member is the compressed size less its encryption header. A member
-    // that says otherwise describes something the method cannot do, and both
-    // numbers are things a reader seeks by.
+    // encrypted member is the compressed size less its framing. A member that
+    // says otherwise describes something the method cannot do, and both numbers
+    // are things a reader seeks by. An AES member whose strength or version is
+    // not one this library reads is refused as unsupported below, and that
+    // refusal is not turned into a size check against the unadjusted payload.
     return GARC_ERR_CORRUPT;
   }
 
-  // **The method is answered before the password, and the order is the point.**
-  // A member this library has no codec for is refused whatever the password, so
-  // asking for one first would send a caller to a prompt and then refuse them
-  // anyway. WinZip AES is in this arm rather than one of its own: method 99 has no
-  // codec here either, and garc_zip_member_encryption() is what tells a caller
-  // that what it is waiting for is AES rather than bzip2.
-  if (zip->method != GARC_ZIP_METHOD_STORED && !codec_name) {
+  // **The real method is answered before the password, and the order is the
+  // point.** A member this library has no codec for is refused whatever the
+  // password, so asking for one first would send a caller to a prompt and then
+  // refuse them anyway.
+  if (zip->encryption == GARC_ZIP_ENCRYPTION_AES && !aes_known) {
+    archive->data_refusal = GARC_ERR_UNSUPPORTED;
+  }
+  else if (body != GARC_ZIP_METHOD_STORED && !codec_name) {
     archive->data_refusal = GARC_ERR_UNSUPPORTED;
   }
   else if (zip->encryption == GARC_ZIP_ENCRYPTION_ZIPCRYPTO) {
@@ -1169,19 +1333,20 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
       return result;
     }
   }
-  // **There is no arm for WinZip AES here, and that is not an omission.** A member
-  // is classified as AES only when its method field is 99, and 99 is a method
-  // zip_codec_name() does not name - so the arm above has already refused it. An
-  // `else if` for it would be a branch no input could take, which reads as an
-  // untested path rather than as an impossible one.
+  else if (zip->encryption == GARC_ZIP_ENCRYPTION_AES) {
+    result = zip_setup_aes(archive, data_offset, compressed_size, &source);
+    if (result != GARC_OK) {
+      return result;
+    }
+  }
 
   if (archive->data_refusal != GARC_OK) {
-    // Already refused: a method with no codec, or a ZipCrypto member with no
-    // password or a password the check byte rejected. Nothing below applies, and
+    // Already refused: a method with no codec, or an encrypted member with no
+    // password or a password the verifier rejected. Nothing below applies, and
     // in particular no decoder is created - a member whose bytes a caller cannot
     // have does not need one, and creating it would decompress ciphertext.
   }
-  else if (zip->method == GARC_ZIP_METHOD_STORED) {
+  else if (body == GARC_ZIP_METHOD_STORED) {
     if (source == archive->stream) {
       // Only when the bytes come straight from the archive. An encrypted member's
       // stream has already been positioned past the encryption header, and
@@ -1242,6 +1407,10 @@ void garc_zip_rewind(GARC_Archive * archive) {
   garc_stream_destroy(archive->zip.crypt);
   archive->zip.crypt = NULL;
   archive->zip.crc_active = 0;
+  archive->zip.aes_version = 0;
+  archive->zip.aes_strength = 0;
+  archive->zip.aes_method = 0;
+  archive->zip.aes_auth_ok = 0;
   archive->zip.cursor = archive->zip.central_offset;
   archive->zip.entries_seen = 0;
   // The password is not cleared here. It is the archive's, like the base offset
@@ -1255,9 +1424,17 @@ void garc_zip_release(GARC_Archive * archive) {
   zip->codec = NULL;
   garc_stream_destroy(zip->crypt);
   zip->crypt = NULL;
-  // The derived keys are wiped: they are equivalent to the caller's password for
-  // this archive, and garc_close() is the last moment anything here can do that.
-  memset(zip->crypt_keys, 0, sizeof(zip->crypt_keys));
+  // The password and the derived keys are wiped: both are the caller's secret
+  // for this archive, and garc_close() is the last moment anything here can do
+  // that. ZipCrypto keys are still derived at set_password; the password is
+  // kept beside them because an AES member's salt is not known until then.
+  if (zip->password && zip->password_length) {
+    gsec_wipe(zip->password, zip->password_length);
+  }
+  gcu_allocator_free(archive->allocator, zip->password);
+  zip->password = NULL;
+  zip->password_length = 0;
+  gsec_wipe(zip->crypt_keys, sizeof(zip->crypt_keys));
   zip->have_password = 0;
   GARC_Buffer * const buffers[4] = {
     &zip->comment,
@@ -1375,10 +1552,25 @@ GARC_Result garc_zip_set_password(
   if (!password && length) {
     return GARC_ERR_INVALID;
   }
-  // Derived here and the password forgotten. See zip.h: the three words are all
-  // any member needs, so this is the only moment the caller's bytes are read.
-  garc_zip_crypt_derive(archive->zip.crypt_keys, password, length);
-  archive->zip.have_password = 1;
+  GARC_Zip_State * zip = &archive->zip;
+  uint8_t * copy = NULL;
+  if (length) {
+    copy = (uint8_t *)gcu_allocator_malloc(archive->allocator, length);
+    if (!copy) {
+      return GARC_ERR_OOM;
+    }
+    memcpy(copy, password, length);
+  }
+  if (zip->password && zip->password_length) {
+    gsec_wipe(zip->password, zip->password_length);
+  }
+  gcu_allocator_free(archive->allocator, zip->password);
+  zip->password = copy;
+  zip->password_length = length;
+  // ZipCrypto keys are still derived here. AES derives per member, from this
+  // copy and that member's salt. An empty password is a copy of length 0.
+  garc_zip_crypt_derive(zip->crypt_keys, password, length);
+  zip->have_password = 1;
   return GARC_OK;
 }
 

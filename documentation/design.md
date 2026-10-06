@@ -556,12 +556,13 @@ status has already been given them.
 
 ### Encryption, which is two answers rather than one
 
-Encryption is **two schemes and not a bit**: ZipCrypto is broken and will be read
-and never written, WinZip AES is sound and needs a library this one does not yet
-depend on. "Unsupported" alone cannot tell a caller which they are looking at, nor
-whether a password could ever help. A member's metadata is in the clear in both
-schemes, at every password strength - zip cannot hide which files exist, and 7z's
-encrypted header can.
+Encryption is **two schemes and not a bit**: ZipCrypto is broken and is read and
+never written. WinZip AES is read and written, and `security` is a dependency of
+this library for that, with no feature gate. "Unsupported" alone cannot tell a
+caller which they are looking at, nor whether a password could ever help. A
+member's metadata is in the clear in both schemes, at every password strength -
+zip cannot hide which files exist, and 7z's encrypted header can. AES wraps the
+compressed bytes. `compress` is unchanged.
 
 That a member's *metadata* is readable and its *data* is not is an **ordinary
 state** in zip rather than a failure: an archive with one bzip2 member is still an
@@ -586,12 +587,12 @@ because no option name makes shipping a cipher we know is broken honest.
 
 Three decisions worth arguing about:
 
-**The password is derived and not kept.** Every member starts from the same
-three words, so those are stored and the caller's bytes are read once. A memory
-disclosure then hands over key material for one archive rather than a password that
-may be reused elsewhere, and an empty password becomes representable - which a
-zero-length buffer would not be, and which is a distinct answer from never having
-supplied one.
+**ZipCrypto's keys are derived at `garc_zip_set_password()`, and the password is
+kept beside them.** Every ZipCrypto member starts from the same three words, so
+those are stored at the call. An AES member has its own salt, which is not known
+until the member is reached, so the password bytes are copied and wiped on
+release. An empty password is a call with length 0, which is distinct from never
+having called it.
 
 **Decryption is a stream, not a transform.** ZipCrypto encrypts the *compressed*
 bytes, so for a deflated member the layering is decrypt-then-inflate: the decrypting
@@ -614,8 +615,13 @@ The third names two causes on purpose. ZipCrypto has no authentication tag, so a
 key that got past the check byte and a corrupted ciphertext produce the same
 observation; reporting `GARC_ERR_CORRUPT` would claim the data is at fault and
 `GARC_ERR_PASSWORD_REJECTED` would claim the password is, and both would be a guess
-dressed as a finding. WinZip AES is what fixed this, with an HMAC, and phase H is
-where this stops being the only answer available.
+dressed as a finding. WinZip AES authenticates the ciphertext with an HMAC-SHA1,
+and the member stores the first 10 bytes of the digest. The verifier in front of
+the ciphertext is 16 bits, so a wrong password can pass it and then fail the
+HMAC. That failure is `GARC_ERR_PASSWORD_OR_CORRUPT` for the same reason the CRC
+disagreement is: the caller cannot tell a wrong password from a damaged member.
+AE-2 stores a CRC of 0 and does not check it. AE-1 still checks the CRC, and a
+mismatch is the same status.
 
 **The check byte has two conventions and the corpus decided which to implement.**
 APPNOTE says the twelfth header byte is the high byte of the member's CRC-32.
@@ -629,12 +635,15 @@ when bit 3 is set, which is what unzip does - and the test that pins it is a pai
 built archives differing in that bit alone, because no writer here produces the
 APPNOTE convention at all.
 
-**The method is answered before the password**, which is a choice rather than an
-accident. A member whose method has no codec here can only be refused, so asking
-for a password first would send a caller to a prompt and refuse them anyway. WinZip
-AES falls in that arm - method 99 has no codec either - and
-`garc_zip_member_encryption()` is what says the thing being waited for is AES rather
-than bzip2.
+**The real method is answered before the password**, which is a choice rather than
+an accident. A member whose method has no codec here can only be refused, so
+asking for a password first would send a caller to a prompt and refuse them
+anyway. For WinZip AES the header method stays 99, which is what
+`garc_zip_member_method()` reports, and the real method is the last two bytes of
+the 0x9901 field. That real method is what selects the codec. An unsupported one
+is `GARC_ERR_UNSUPPORTED` with no password prompt. A compressed size shorter than
+the salt, the verifier and the authentication code is `GARC_ERR_CORRUPT`, and
+that check does not depend on a password either.
 
 ### Times, modes and types, each from the field that is allowed to say
 

@@ -131,18 +131,18 @@ typedef enum {
    */
   GARC_ERR_PASSWORD_REJECTED,
   /**
-   * An encrypted member's CRC-32 disagreed after its check byte agreed.
+   * An encrypted member did not come out right, and the cause is ambiguous.
    *
    * **A status that names two causes, because nothing can separate them.**
-   * ZipCrypto has no authentication tag: a wrong key and a corrupted ciphertext
-   * produce the same observation, which is a member whose bytes are not the ones
-   * the archive's CRC describes. Reporting ::GARC_ERR_CORRUPT would claim the
-   * data is at fault and reporting ::GARC_ERR_PASSWORD_REJECTED would claim the
+   * ZipCrypto has no authentication tag: a wrong key that got past the one-byte
+   * check and a corrupted ciphertext produce the same observation, a member
+   * whose bytes are not the ones the archive's CRC describes. WinZip AES does
+   * have an HMAC, and a failure of that code is this status too: the verifier
+   * in front of the ciphertext is 16 bits, so a wrong password can pass it,
+   * once in 65536, and then fails the HMAC. Reporting ::GARC_ERR_CORRUPT
+   * would claim the data is at fault and reporting
+   * ::GARC_ERR_PASSWORD_REJECTED would claim the
    * password is; both would be a guess dressed as a finding.
-   *
-   * This is the case WinZip AES fixed by adding an HMAC, and phase H is where
-   * this status stops being the only answer available for an encrypted member
-   * that does not come out right.
    */
   GARC_ERR_PASSWORD_OR_CORRUPT,
 

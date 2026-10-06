@@ -483,7 +483,9 @@ GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,
     // compressed with a method there is no codec for, or encrypted. Answered
     // before the size check below, because a *zero-length* member of such a kind
     // would otherwise read as a successful end of data and a caller would
-    // conclude the file was empty.
+    // conclude the file was empty. No bytes were produced, so the count is 0
+    // rather than whatever the caller last stored there.
+    *out_read = 0;
     return archive->data_refusal;
   }
 

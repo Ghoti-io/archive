@@ -39,6 +39,7 @@
 #include <gtest/gtest.h>
 
 #include <ghoti.io/compress/compress.h>
+#include <ghoti.io/compress/crc32.h>
 
 #include "test_helpers.h"
 #include "zip/zip_internal.h"
@@ -90,7 +91,9 @@ class Built {
 public:
   explicit Built(GARC_Zip_Sizes sizes = GARC_ZIP_SIZES_AUTO,
       bool force_zip64 = false,
-      GARC_Zip_Method method = GARC_ZIP_METHOD_STORED) {
+      GARC_Zip_Method method = GARC_ZIP_METHOD_STORED,
+      const void * password = nullptr, size_t password_length = 0,
+      uint32_t aes_bits = 0) {
     if (garc_sink_create_memory(&sink_) != GARC_OK) {
       return;
     }
@@ -99,6 +102,9 @@ public:
     options.zip_sizes = sizes;
     options.zip_force_zip64 = force_zip64 ? 1 : 0;
     options.zip_method = method;
+    options.zip_password = password;
+    options.zip_password_length = password_length;
+    options.zip_aes_bits = aes_bits;
     create_result_
         = garc_writer_create(sink_, GARC_FORMAT_ZIP, &options, &writer_);
   }
@@ -159,6 +165,7 @@ struct ReadBack {
   uint16_t method = 0;
   uint16_t flags = 0;
   uint32_t crc = 0;
+  GARC_Zip_Encryption encryption = GARC_ZIP_ENCRYPTION_NONE;
   bool used_zip64 = false;
   /**
    * The *central* extra field's length, captured during the walk.
@@ -177,7 +184,8 @@ struct ReadBack {
 /** What was written, as this library's own reader sees it. */
 class Roundtrip {
 public:
-  explicit Roundtrip(const std::vector<uint8_t> & bytes)
+  explicit Roundtrip(const std::vector<uint8_t> & bytes,
+      const void * password = nullptr, size_t password_length = 0)
       : bytes_(bytes), source_(bytes_.data(), bytes_.size(), true, true) {
     if (garc_stream_create_callback(source_.callbacks(), &stream_) != GARC_OK) {
       return;
@@ -185,6 +193,12 @@ public:
     open_result_ = garc_open(stream_, nullptr, &archive_);
     if (open_result_ != GARC_OK) {
       return;
+    }
+    if (password) {
+      if (garc_zip_set_password(archive_, password, password_length)
+          != GARC_OK) {
+        return;
+      }
     }
     const GARC_Member * member = nullptr;
     GARC_Result result;
@@ -204,6 +218,7 @@ public:
       seen.method = garc_zip_member_method(archive_);
       seen.flags = garc_zip_member_flags(archive_);
       seen.crc = garc_zip_member_crc32(archive_);
+      seen.encryption = garc_zip_member_encryption(archive_);
       seen.used_zip64 = garc_zip_member_used_zip64(archive_) != 0;
       seen.extra_length = garc_zip_member_extra_length(archive_);
 
@@ -292,6 +307,13 @@ std::vector<Spec> corpus() {
 uint32_t le32(const std::vector<uint8_t> & bytes, size_t at) {
   return (uint32_t)bytes[at] | ((uint32_t)bytes[at + 1] << 8)
       | ((uint32_t)bytes[at + 2] << 16) | ((uint32_t)bytes[at + 3] << 24);
+}
+
+void put32(std::vector<uint8_t> & bytes, size_t at, uint32_t value) {
+  bytes[at] = (uint8_t)value;
+  bytes[at + 1u] = (uint8_t)(value >> 8);
+  bytes[at + 2u] = (uint8_t)(value >> 16);
+  bytes[at + 3u] = (uint8_t)(value >> 24);
 }
 
 uint16_t le16(const std::vector<uint8_t> & bytes, size_t at) {
@@ -1414,8 +1436,517 @@ TEST(ZipWrite, TheDefaultMethodIsStoredAndIsAlsoTheZeroValue) {
   std::memset(&options, 0xFF, sizeof(options));
   garc_writer_options_default(&options);
   EXPECT_EQ(options.zip_method, GARC_ZIP_METHOD_STORED);
+  EXPECT_EQ(options.zip_password, nullptr);
+  EXPECT_EQ(options.zip_password_length, 0u);
+  EXPECT_EQ(options.zip_aes_bits, 0u);
   EXPECT_EQ((int)GARC_ZIP_METHOD_STORED, 0);
   EXPECT_STREQ(garc_zip_method_string(GARC_ZIP_METHOD_DEFLATE), "deflate");
+}
+
+//-----------------------------------------------------------------------------
+// WinZip AES. ZipCrypto is not written.
+//-----------------------------------------------------------------------------
+
+const char kAesPassword[] = "ghoti-password";
+
+/** How many 0x9901 fields an archive carries, and whether they are AE-2. */
+size_t count_aes_extras(const std::vector<uint8_t> & bytes, uint8_t strength,
+    uint16_t method) {
+  size_t found = 0;
+  for (size_t at = 0; at + 11u <= bytes.size(); ++at) {
+    if (bytes[at] != 0x01u || bytes[at + 1u] != 0x99u || bytes[at + 2u] != 0x07u
+        || bytes[at + 3u] != 0x00u) {
+      continue;
+    }
+    EXPECT_EQ(bytes[at + 4u], 2u);
+    EXPECT_EQ(bytes[at + 5u], 0u);
+    EXPECT_EQ(bytes[at + 6u], (uint8_t)'A');
+    EXPECT_EQ(bytes[at + 7u], (uint8_t)'E');
+    EXPECT_EQ(bytes[at + 8u], strength);
+    EXPECT_EQ(le16(bytes, at + 9u), method);
+    ++found;
+    at += 10u;
+  }
+  return found;
+}
+
+size_t central_offset_of(const std::vector<uint8_t> & bytes) {
+  // No comment, so the end record is the last 22 bytes.
+  return le32(bytes, bytes.size() - 22u + 16u);
+}
+
+TEST(ZipWrite, APasswordRoundTripsStoredAndDeflatedMembers) {
+  const GARC_Zip_Method methods[]
+      = {GARC_ZIP_METHOD_STORED, GARC_ZIP_METHOD_DEFLATE};
+  for (GARC_Zip_Method method : methods) {
+    SCOPED_TRACE(garc_zip_method_string((uint16_t)method));
+    Spec file;
+    file.name = "hello.txt";
+    file.data = "hello, archive\n";
+    Built built(GARC_ZIP_SIZES_AUTO, false, method, kAesPassword,
+        std::strlen(kAesPassword));
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    ASSERT_EQ(built.add(file), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+
+    const std::vector<uint8_t> bytes = built.bytes();
+    EXPECT_EQ(le16(bytes, 4u), 51u);
+    EXPECT_EQ(le16(bytes, 6u) & 0x0001u, 0x0001u);
+    EXPECT_EQ(le16(bytes, 8u), (uint16_t)GARC_ZIP_METHOD_AES);
+    EXPECT_EQ(le32(bytes, 14u), 0u);
+    const size_t central = central_offset_of(bytes);
+    ASSERT_LT(central + 46u, bytes.size());
+    EXPECT_EQ(le16(bytes, central + 6u), 51u);
+    EXPECT_EQ(le16(bytes, central + 10u), (uint16_t)GARC_ZIP_METHOD_AES);
+    EXPECT_EQ(le32(bytes, central + 16u), 0u);
+    EXPECT_EQ(count_aes_extras(bytes, 3u, (uint16_t)method), 2u);
+
+    Roundtrip trip(bytes, kAesPassword, std::strlen(kAesPassword));
+    ASSERT_EQ(trip.open_result(), GARC_OK);
+    ASSERT_EQ(trip.walk_result(), GARC_END);
+    ASSERT_EQ(trip.members().size(), 1u);
+    EXPECT_EQ(trip.members()[0].data, file.data);
+    EXPECT_EQ(trip.members()[0].read_result, GARC_OK);
+    EXPECT_EQ(trip.members()[0].method, (uint16_t)GARC_ZIP_METHOD_AES);
+    EXPECT_EQ(trip.members()[0].encryption, GARC_ZIP_ENCRYPTION_AES);
+    EXPECT_EQ(trip.members()[0].crc, 0u);
+    EXPECT_EQ(trip.members()[0].flags & 0x0001u, 0x0001u);
+  }
+}
+
+TEST(ZipWrite, AnEmptyFileAndASymlinkAreEncryptedAndADirectoryIsNot) {
+  Built built(GARC_ZIP_SIZES_AUTO, false, GARC_ZIP_METHOD_STORED, kAesPassword,
+      std::strlen(kAesPassword));
+  ASSERT_EQ(built.create_result(), GARC_OK);
+
+  Spec empty;
+  empty.name = "empty";
+  Spec directory;
+  directory.name = "notes/";
+  directory.type = GARC_MEMBER_DIRECTORY;
+  directory.mode = 0755;
+  Spec link;
+  link.name = "link-to-hello";
+  link.type = GARC_MEMBER_SYMLINK;
+  link.link = "hello.txt";
+  link.mode = 0777;
+  ASSERT_EQ(built.add(empty), GARC_OK);
+  ASSERT_EQ(built.add(directory), GARC_OK);
+  ASSERT_EQ(built.add(link), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+
+  Roundtrip trip(built.bytes(), kAesPassword, std::strlen(kAesPassword));
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.walk_result(), GARC_END);
+  ASSERT_EQ(trip.members().size(), 3u);
+
+  EXPECT_EQ(trip.members()[0].encryption, GARC_ZIP_ENCRYPTION_AES);
+  EXPECT_EQ(trip.members()[0].method, (uint16_t)GARC_ZIP_METHOD_AES);
+  EXPECT_EQ(trip.members()[0].compressed_size, 28u);
+  EXPECT_EQ(trip.members()[0].read_result, GARC_OK);
+  EXPECT_EQ(trip.members()[0].data, "");
+  EXPECT_EQ(trip.members()[0].crc, 0u);
+
+  EXPECT_EQ(trip.members()[1].encryption, GARC_ZIP_ENCRYPTION_NONE);
+  EXPECT_EQ(trip.members()[1].method, (uint16_t)GARC_ZIP_METHOD_STORED);
+  EXPECT_EQ(trip.members()[1].type, GARC_MEMBER_DIRECTORY);
+
+  EXPECT_EQ(trip.members()[2].encryption, GARC_ZIP_ENCRYPTION_AES);
+  EXPECT_EQ(trip.members()[2].type, GARC_MEMBER_SYMLINK);
+  EXPECT_TRUE(trip.members()[2].link.empty());
+  EXPECT_EQ(trip.members()[2].data, link.link);
+  EXPECT_EQ(trip.members()[2].read_result, GARC_OK);
+  EXPECT_EQ(trip.members()[2].crc, 0u);
+}
+
+TEST(ZipWrite, Aes128AndAes192RoundTrip) {
+  const struct {
+    uint32_t bits;
+    uint8_t strength;
+    uint64_t framing;
+  } cases[] = {{128u, 1u, 8u + 2u + 10u}, {192u, 2u, 12u + 2u + 10u}};
+  for (const auto & one : cases) {
+    SCOPED_TRACE(one.bits);
+    Spec file;
+    file.name = "hello.txt";
+    file.data = "hello, archive\n";
+    Built built(GARC_ZIP_SIZES_AUTO, false, GARC_ZIP_METHOD_STORED, kAesPassword,
+        std::strlen(kAesPassword), one.bits);
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    ASSERT_EQ(built.add(file), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+    EXPECT_EQ(count_aes_extras(built.bytes(), one.strength,
+                  (uint16_t)GARC_ZIP_METHOD_STORED),
+        2u);
+    Roundtrip trip(built.bytes(), kAesPassword, std::strlen(kAesPassword));
+    ASSERT_EQ(trip.walk_result(), GARC_END);
+    ASSERT_EQ(trip.members().size(), 1u);
+    EXPECT_EQ(trip.members()[0].data, file.data);
+    EXPECT_EQ(trip.members()[0].read_result, GARC_OK);
+    EXPECT_EQ(trip.members()[0].compressed_size, file.data.size() + one.framing);
+  }
+}
+
+TEST(ZipWrite, AnUnsetPasswordWritesTheSameBytesAsExplicitlyUnset) {
+  Spec file;
+  file.name = "hello.txt";
+  file.data = "hello, archive\n";
+
+  auto write = [&](const GARC_Writer_Options * options) {
+    GARC_Sink * sink = nullptr;
+    std::vector<uint8_t> out;
+    if (garc_sink_create_memory(&sink) != GARC_OK) {
+      return out;
+    }
+    GARC_Writer * writer = nullptr;
+    if (garc_writer_create(sink, GARC_FORMAT_ZIP, options, &writer) != GARC_OK) {
+      garc_sink_destroy(sink);
+      return out;
+    }
+    const GARC_Member member = member_of(file);
+    if (garc_writer_add(writer, &member) == GARC_OK) {
+      garc_writer_write(writer, file.data.data(), file.data.size());
+      garc_writer_finish(writer);
+    }
+    const void * data = nullptr;
+    size_t size = 0;
+    if (garc_sink_data(sink, &data, &size) == GARC_OK) {
+      const uint8_t * raw = static_cast<const uint8_t *>(data);
+      out.assign(raw, raw + size);
+    }
+    garc_writer_destroy(writer);
+    garc_sink_destroy(sink);
+    return out;
+  };
+
+  const std::vector<uint8_t> omitted = write(nullptr);
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_password = nullptr;
+  options.zip_password_length = 0;
+  options.zip_aes_bits = 0;
+  const std::vector<uint8_t> explicit_none = write(&options);
+  ASSERT_FALSE(omitted.empty());
+  EXPECT_EQ(explicit_none, omitted);
+}
+
+TEST(ZipWrite, AnEmptyPasswordIsDistinctFromNoPassword) {
+  Spec file;
+  file.name = "hello.txt";
+  file.data = "hello, archive\n";
+  const char empty[] = "";
+  Built built(GARC_ZIP_SIZES_AUTO, false, GARC_ZIP_METHOD_STORED, empty, 0);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+
+  Roundtrip locked(built.bytes());
+  ASSERT_EQ(locked.walk_result(), GARC_END);
+  ASSERT_EQ(locked.members().size(), 1u);
+  EXPECT_EQ(locked.members()[0].read_result, GARC_ERR_PASSWORD_REQUIRED);
+
+  Roundtrip opened(built.bytes(), empty, 0);
+  ASSERT_EQ(opened.walk_result(), GARC_END);
+  ASSERT_EQ(opened.members().size(), 1u);
+  EXPECT_EQ(opened.members()[0].data, file.data);
+  EXPECT_EQ(opened.members()[0].read_result, GARC_OK);
+}
+
+TEST(ZipWrite, ANullPasswordWithALengthAndABadStrengthAreRefused) {
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_password = nullptr;
+  options.zip_password_length = 4;
+  GARC_Writer * writer = nullptr;
+  EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer),
+      GARC_ERR_INVALID);
+  EXPECT_EQ(writer, nullptr);
+
+  options.zip_password_length = 0;
+  options.zip_aes_bits = 64;
+  EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer),
+      GARC_ERR_INVALID);
+  EXPECT_EQ(writer, nullptr);
+  garc_sink_destroy(sink);
+}
+
+TEST(ZipWrite, ABadAuthenticationCodeIsNotACrcFailure) {
+  Spec file;
+  file.name = "hello.txt";
+  file.data = "hello, archive\n";
+  Built built(GARC_ZIP_SIZES_AUTO, false, GARC_ZIP_METHOD_STORED, kAesPassword,
+      std::strlen(kAesPassword));
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+  std::vector<uint8_t> bytes = built.bytes();
+  const size_t central = central_offset_of(bytes);
+  ASSERT_GT(central, 0u);
+  bytes[central - 1u] ^= 0x01u;
+
+  Roundtrip trip(bytes, kAesPassword, std::strlen(kAesPassword));
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.walk_result(), GARC_END);
+  ASSERT_EQ(trip.members().size(), 1u);
+  EXPECT_EQ(trip.members()[0].read_result, GARC_ERR_PASSWORD_OR_CORRUPT);
+}
+
+TEST(ZipWrite, AShortAesFramingIsCorruptBeforeThePasswordIsAsked) {
+  Spec file;
+  file.name = "hello.txt";
+  file.data = "hello, archive\n";
+  Built built(GARC_ZIP_SIZES_AUTO, false, GARC_ZIP_METHOD_STORED, kAesPassword,
+      std::strlen(kAesPassword));
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+  std::vector<uint8_t> bytes = built.bytes();
+  const size_t central = central_offset_of(bytes);
+  put32(bytes, central + 20u, 10u);
+
+  for (int with_password = 0; with_password < 2; ++with_password) {
+    BufferSource source(bytes.data(), bytes.size(), true, true);
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+    if (with_password) {
+      ASSERT_EQ(garc_zip_set_password(archive, kAesPassword,
+                    std::strlen(kAesPassword)),
+          GARC_OK);
+    }
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(archive, &member), GARC_ERR_CORRUPT);
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
+}
+
+TEST(ZipWrite, Ae1StillChecksTheCrcAndAe2DoesNot) {
+  Spec file;
+  file.name = "hello.txt";
+  file.data = "hello, archive\n";
+  Built built(GARC_ZIP_SIZES_AUTO, false, GARC_ZIP_METHOD_STORED, kAesPassword,
+      std::strlen(kAesPassword));
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+  std::vector<uint8_t> bytes = built.bytes();
+
+  const uint16_t name_len = le16(bytes, 26u);
+  const size_t local_extra = 30u + name_len;
+  ASSERT_EQ(bytes[local_extra], 0x01u);
+  ASSERT_EQ(bytes[local_extra + 1u], 0x99u);
+  bytes[local_extra + 4u] = 1u;
+  const size_t central = central_offset_of(bytes);
+  const size_t central_extra = central + 46u + le16(bytes, central + 28u);
+  ASSERT_EQ(bytes[central_extra], 0x01u);
+  ASSERT_EQ(bytes[central_extra + 1u], 0x99u);
+  bytes[central_extra + 4u] = 1u;
+
+  Roundtrip zero_crc(bytes, kAesPassword, std::strlen(kAesPassword));
+  ASSERT_EQ(zero_crc.walk_result(), GARC_END);
+  ASSERT_EQ(zero_crc.members().size(), 1u);
+  EXPECT_EQ(zero_crc.members()[0].read_result, GARC_ERR_CORRUPT);
+
+  const uint32_t crc = gcomp_crc32_finalize(gcomp_crc32_update(
+      GCOMP_CRC32_INIT, reinterpret_cast<const uint8_t *>(file.data.data()),
+      file.data.size()));
+  put32(bytes, 14u, crc);
+  put32(bytes, central + 16u, crc);
+  Roundtrip real_crc(bytes, kAesPassword, std::strlen(kAesPassword));
+  ASSERT_EQ(real_crc.walk_result(), GARC_END);
+  ASSERT_EQ(real_crc.members().size(), 1u);
+  EXPECT_EQ(real_crc.members()[0].data, file.data);
+  EXPECT_EQ(real_crc.members()[0].read_result, GARC_OK);
+}
+
+void expect_aes_read_unsupported(
+    const std::vector<uint8_t> & bytes, bool password) {
+  BufferSource source(bytes.data(), bytes.size(), true, true);
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+  if (password) {
+    ASSERT_EQ(garc_zip_set_password(
+                  archive, kAesPassword, std::strlen(kAesPassword)),
+        GARC_OK);
+  }
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(archive, &member), GARC_OK);
+  if (member) {
+    char buffer[16];
+    size_t got = 1;
+    EXPECT_EQ(garc_read_member(archive, buffer, sizeof(buffer), &got),
+        GARC_ERR_UNSUPPORTED);
+    EXPECT_EQ(got, 0u);
+  }
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
+TEST(ZipWrite, AnEncryptedOddMtimeRoundTripsTheTimeAndTheBytes) {
+  Spec file;
+  file.name = "odd.txt";
+  file.data = "odd second\n";
+  file.mtime = 1000000001;
+  Built built(GARC_ZIP_SIZES_AUTO, false, GARC_ZIP_METHOD_STORED, kAesPassword,
+      std::strlen(kAesPassword));
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+
+  Roundtrip trip(built.bytes(), kAesPassword, std::strlen(kAesPassword));
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.walk_result(), GARC_END);
+  ASSERT_EQ(trip.members().size(), 1u);
+  EXPECT_EQ(trip.members()[0].data, file.data);
+  EXPECT_EQ(trip.members()[0].read_result, GARC_OK);
+  EXPECT_EQ(trip.members()[0].mtime, 1000000001);
+  EXPECT_EQ(trip.members()[0].mtime_source, GARC_TIME_ZIP_UNIX);
+}
+
+TEST(ZipWrite, AnEmptyMemberWithAFlippedAuthenticationCodeIsRefused) {
+  for (GARC_Zip_Method method : {GARC_ZIP_METHOD_STORED, GARC_ZIP_METHOD_DEFLATE}) {
+    SCOPED_TRACE(garc_zip_method_string((uint16_t)method));
+    Spec file;
+    file.name = "empty.txt";
+    Built built(GARC_ZIP_SIZES_AUTO, false, method, kAesPassword,
+        std::strlen(kAesPassword));
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    ASSERT_EQ(built.add(file), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+    std::vector<uint8_t> bytes = built.bytes();
+    const size_t central = central_offset_of(bytes);
+    ASSERT_GT(central, 0u);
+    bytes[central - 1u] ^= 0x01u;
+
+    Roundtrip trip(bytes, kAesPassword, std::strlen(kAesPassword));
+    ASSERT_EQ(trip.open_result(), GARC_OK);
+    ASSERT_EQ(trip.walk_result(), GARC_END);
+    ASSERT_EQ(trip.members().size(), 1u);
+    EXPECT_EQ(trip.members()[0].read_result, GARC_ERR_PASSWORD_OR_CORRUPT);
+  }
+}
+
+TEST(ZipWrite, AnUnknownAesVersionOrStrengthIsUnsupported) {
+  Spec file;
+  file.name = "hello.txt";
+  file.data = "hello, archive\n";
+  Built built(GARC_ZIP_SIZES_AUTO, false, GARC_ZIP_METHOD_STORED, kAesPassword,
+      std::strlen(kAesPassword));
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+  const std::vector<uint8_t> original = built.bytes();
+  const uint16_t name_len = le16(original, 26u);
+  const size_t local_extra = 30u + name_len;
+  const size_t central = central_offset_of(original);
+  const size_t central_extra = central + 46u + le16(original, central + 28u);
+  ASSERT_EQ(original[local_extra], 0x01u);
+  ASSERT_EQ(original[local_extra + 1u], 0x99u);
+  ASSERT_EQ(original[central_extra], 0x01u);
+  ASSERT_EQ(original[central_extra + 1u], 0x99u);
+
+  std::vector<uint8_t> version = original;
+  version[local_extra + 4u] = 3u;
+  version[central_extra + 4u] = 3u;
+  std::vector<uint8_t> strength = original;
+  strength[local_extra + 8u] = 4u;
+  strength[central_extra + 8u] = 4u;
+  for (const std::vector<uint8_t> & bytes : {version, strength}) {
+    for (int with_password = 0; with_password < 2; ++with_password) {
+      expect_aes_read_unsupported(bytes, with_password != 0);
+    }
+  }
+}
+
+TEST(ZipWrite, Bzip2InsideAesIsUnsupported) {
+  Spec file;
+  file.name = "hello.txt";
+  file.data = "hello, archive\n";
+  Built built(GARC_ZIP_SIZES_AUTO, false, GARC_ZIP_METHOD_STORED, kAesPassword,
+      std::strlen(kAesPassword));
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+  std::vector<uint8_t> bytes = built.bytes();
+  const uint16_t name_len = le16(bytes, 26u);
+  const size_t local_extra = 30u + name_len;
+  const size_t central = central_offset_of(bytes);
+  const size_t central_extra = central + 46u + le16(bytes, central + 28u);
+  ASSERT_EQ(bytes[local_extra], 0x01u);
+  ASSERT_EQ(bytes[central_extra], 0x01u);
+  bytes[local_extra + 9u] = (uint8_t)GARC_ZIP_METHOD_BZIP2;
+  bytes[local_extra + 10u] = 0u;
+  bytes[central_extra + 9u] = (uint8_t)GARC_ZIP_METHOD_BZIP2;
+  bytes[central_extra + 10u] = 0u;
+
+  for (int with_password = 0; with_password < 2; ++with_password) {
+    expect_aes_read_unsupported(bytes, with_password != 0);
+  }
+}
+
+TEST(ZipWrite, AesFramingCountsInTheZip64SizeBound) {
+  const uint64_t declared = 0xFFFFFFFFu - 27u;
+
+  auto local_sizes = [&](const char * password, size_t length) {
+    GARC_Sink * sink = nullptr;
+    std::vector<uint32_t> fields;
+    if (garc_sink_create_memory(&sink) != GARC_OK) {
+      return fields;
+    }
+    GARC_Writer_Options options;
+    garc_writer_options_default(&options);
+    options.zip_password = password;
+    options.zip_password_length = length;
+    GARC_Writer * writer = nullptr;
+    if (garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer)
+        != GARC_OK) {
+      garc_sink_destroy(sink);
+      return fields;
+    }
+    GARC_Member member;
+    std::memset(&member, 0, sizeof(member));
+    member.name = "big";
+    member.name_length = 3;
+    member.type = GARC_MEMBER_FILE;
+    member.size = declared;
+    member.mode = 0644;
+    member.mode_valid = 1;
+    member.mtime_seconds = 1000000000;
+    member.mtime_source = GARC_TIME_ZIP_DOS;
+    if (garc_writer_add(writer, &member) != GARC_OK) {
+      garc_writer_destroy(writer);
+      garc_sink_destroy(sink);
+      return fields;
+    }
+    const void * data = nullptr;
+    size_t size = 0;
+    if (garc_sink_data(sink, &data, &size) == GARC_OK && size >= 26u) {
+      const uint8_t * raw = static_cast<const uint8_t *>(data);
+      const std::vector<uint8_t> bytes(raw, raw + size);
+      fields.push_back(le32(bytes, 18u));
+      fields.push_back(le32(bytes, 22u));
+    }
+    garc_writer_destroy(writer);
+    garc_sink_destroy(sink);
+    return fields;
+  };
+
+  const std::vector<uint32_t> plain = local_sizes(nullptr, 0);
+  ASSERT_EQ(plain.size(), 2u);
+  EXPECT_EQ(plain[0], 0u);
+  EXPECT_EQ(plain[1], 0u);
+
+  const std::vector<uint32_t> encrypted
+      = local_sizes(kAesPassword, std::strlen(kAesPassword));
+  ASSERT_EQ(encrypted.size(), 2u);
+  EXPECT_EQ(encrypted[0], 0xFFFFFFFFu);
+  EXPECT_EQ(encrypted[1], 0xFFFFFFFFu);
 }
 
 //-----------------------------------------------------------------------------
