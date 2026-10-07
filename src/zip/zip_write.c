@@ -144,6 +144,13 @@
 #define ZIP_VERSION_NEEDED_AES 51u
 
 /**
+ * `version needed` for a cleartext bzip2 member.
+ *
+ * 4.6. Higher than zip64's 45, lower than AES's 51 and zstd/LZMA's 63.
+ */
+#define ZIP_VERSION_NEEDED_BZIP2 46u
+
+/**
  * `version needed` for a cleartext zstd or LZMA member.
  *
  * 6.3. Higher than zip64's 45, so a member that is both says 63.
@@ -205,6 +212,8 @@ static const char * zip_encoder_name(uint16_t method) {
   switch (method) {
     case GARC_ZIP_METHOD_DEFLATE:
       return "deflate";
+    case GARC_ZIP_METHOD_BZIP2:
+      return "bzip2";
     case GARC_ZIP_METHOD_ZSTD:
       return "zstd";
     case GARC_ZIP_METHOD_LZMA:
@@ -310,6 +319,9 @@ uint64_t garc_zip_compressed_ceiling(uint64_t size, uint16_t method) {
   if (method == GARC_ZIP_METHOD_DEFLATE) {
     return garc_zip_deflate_bound(size);
   }
+  if (method == GARC_ZIP_METHOD_BZIP2) {
+    return zip_encode_bound("bzip2", size);
+  }
   if (method == GARC_ZIP_METHOD_ZSTD) {
     return zip_encode_bound("zstd", size);
   }
@@ -336,8 +348,8 @@ uint64_t garc_zip_compressed_ceiling(uint64_t size, uint16_t method) {
  * available to decide on - so what stands in for it is not the declared size but
  * the largest the compressed size *can* be, which for a stored member is the
  * declared size and for a compressed one is ::garc_zip_compressed_ceiling of it.
- * Zstd asks `gcomp_encode_bound()`. LZMA has none, so the ceiling is the
- * expansion ratio times the declared size, plus the 9-byte header.
+ * Bzip2 and zstd ask `gcomp_encode_bound()`. LZMA has none, so the ceiling is
+ * the expansion ratio times the declared size, plus the 9-byte header.
  *
  * **That is the whole of the answer, and it is an answer rather than a deferral.**
  * The alternative - decide on the declared size, and refuse when the compressed
@@ -382,10 +394,10 @@ static int zip_needs_zip64(const GARC_Writer * writer, uint64_t size,
 /**
  * The version a reader needs for this member.
  *
- * AES is 51 even when the real method is zstd or LZMA, and even when the
- * member is also zip64. Cleartext zstd or LZMA is 63, which is higher than
- * zip64's 45, so a member that is both says 63. Otherwise zip64 is 45 and a
- * stored or deflated member is 20.
+ * AES is 51 even when the real method is bzip2, zstd or LZMA, and even when
+ * the member is also zip64. Cleartext zstd or LZMA is 63; cleartext bzip2 is
+ * 46. Both beat zip64's 45, so a member that is both says the codec's number.
+ * Otherwise zip64 is 45 and a stored or deflated member is 20.
  *
  * @param zip The member being written.
  * @return The version-needed field.
@@ -397,6 +409,9 @@ static uint16_t zip_version_needed(const GARC_Zip_Write_State * zip) {
   if (zip->method == GARC_ZIP_METHOD_ZSTD
       || zip->method == GARC_ZIP_METHOD_LZMA) {
     return ZIP_VERSION_NEEDED_CODEC;
+  }
+  if (zip->method == GARC_ZIP_METHOD_BZIP2) {
+    return ZIP_VERSION_NEEDED_BZIP2;
   }
   if (zip->used_zip64) {
     return ZIP_VERSION_NEEDED_ZIP64;
@@ -662,7 +677,8 @@ GARC_Result garc_zip_write_member(
   // the option.
   const uint16_t asked = writer->options.zip_method;
   const int compresses = asked == GARC_ZIP_METHOD_DEFLATE
-      || asked == GARC_ZIP_METHOD_ZSTD || asked == GARC_ZIP_METHOD_LZMA;
+      || asked == GARC_ZIP_METHOD_BZIP2 || asked == GARC_ZIP_METHOD_ZSTD
+      || asked == GARC_ZIP_METHOD_LZMA;
   zip->method = compresses && size && member->type != GARC_MEMBER_SYMLINK
       ? asked : (uint16_t)GARC_ZIP_METHOD_STORED;
   // A directory has no data. A file, an empty file and a symlink do, and the
@@ -686,6 +702,10 @@ GARC_Result garc_zip_write_member(
   }
   if (zip->method == GARC_ZIP_METHOD_LZMA) {
     zip->flags |= ZIP_FLAG_LZMA_EOS;
+  }
+  if (!zip->aes && zip->method == GARC_ZIP_METHOD_BZIP2) {
+    // Cleartext bzip2 asks for 46. AES stays 51 and does not set this.
+    zip->needs_46 = 1;
   }
   if (!zip->aes && (zip->method == GARC_ZIP_METHOD_ZSTD
                        || zip->method == GARC_ZIP_METHOD_LZMA)) {
@@ -1230,6 +1250,9 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
     uint16_t end_version = ZIP_VERSION_NEEDED_ZIP64;
     if (zip->wrote_aes && end_version < ZIP_VERSION_NEEDED_AES) {
       end_version = ZIP_VERSION_NEEDED_AES;
+    }
+    if (zip->needs_46 && end_version < ZIP_VERSION_NEEDED_BZIP2) {
+      end_version = ZIP_VERSION_NEEDED_BZIP2;
     }
     if (zip->needs_63 && end_version < ZIP_VERSION_NEEDED_CODEC) {
       end_version = ZIP_VERSION_NEEDED_CODEC;

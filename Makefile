@@ -1342,18 +1342,20 @@ check-writer: ## Fail if the references disagree with what the writer produces
 # Not in TEST_GATES and not in DEPLESS_GOALS: it needs the container, like the
 # other two, and unlike them it links the library under test.
 check-writer: $(WRITER_PROBE)
-	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/check_writer.py \
-		--probe $(WRITER_PROBE)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+		python3 $(ORACLE)/check_writer.py --probe $(WRITER_PROBE)
 
 check-zip-writer: ## Fail if the references disagree with the zip the writer produces
 # The zip half of check-writer, and it needs its own target for the same reason it
 # needs its own probe: four references rather than three, and the question "does
 # this archive read at all" is answered by `unzip -t` and `7z t` rather than by a
 # listing. Not in TEST_GATES and not in DEPLESS_GOALS: it needs the container, and
-# unlike the corpus gates it links the library under test.
+# unlike the corpus gates it links the library under test. Prefix first on
+# LD_LIBRARY_PATH the same way `test` does, so an ambient path cannot load a
+# different compress than the one this PREFIX built against.
 check-zip-writer: $(ZIP_WRITER_PROBE)
-	@GHOTI_ORACLE_REQUIRED=1 python3 $(ORACLE)/check_zip_writer.py \
-		--probe $(ZIP_WRITER_PROBE)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+		python3 $(ORACLE)/check_zip_writer.py --probe $(ZIP_WRITER_PROBE)
 
 ####################################################################
 # Install / uninstall

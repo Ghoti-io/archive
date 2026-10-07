@@ -59,8 +59,8 @@
  * it would find a signature inside a member's data.
  *
  * **What a member is compressed with is a number, and a refusal names it.**
- * Methods 0 (stored), 8 (deflate), 14 (LZMA) and 93 (zstd) are read. 9, 12, 95
- * and 98 are refused with ::GARC_ERR_UNSUPPORTED, and
+ * Methods 0 (stored), 8 (deflate), 12 (bzip2), 14 (LZMA) and 93 (zstd) are
+ * read. 9, 95 and 98 are refused with ::GARC_ERR_UNSUPPORTED, and
  * ::garc_zip_member_method() plus ::garc_zip_method_string() say which, so the
  * refusal is a to-do list rather than a dead end. The same is true of
  * encryption: ::garc_zip_member_encryption() distinguishes the broken cipher
@@ -113,7 +113,7 @@ typedef enum {
   GARC_ZIP_METHOD_IMPLODED = 6,  ///< PKWARE implode. Refused.
   GARC_ZIP_METHOD_DEFLATE = 8,   ///< RFC 1951, which compress implements.
   GARC_ZIP_METHOD_DEFLATE64 = 9, ///< Enhanced deflate. Refused; not RFC 1951.
-  GARC_ZIP_METHOD_BZIP2 = 12,    ///< Refused; no codec.
+  GARC_ZIP_METHOD_BZIP2 = 12,    ///< A bzip2 stream. Read and written.
   GARC_ZIP_METHOD_LZMA = 14,     ///< A header, then raw LZMA. Read and written.
   GARC_ZIP_METHOD_ZSTD = 93,     ///< A zstd frame. Read and written.
   GARC_ZIP_METHOD_XZ = 95,       ///< Refused; no codec.

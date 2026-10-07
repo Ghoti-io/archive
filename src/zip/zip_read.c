@@ -816,6 +816,8 @@ static const char * zip_codec_name(uint16_t method) {
   switch (method) {
     case GARC_ZIP_METHOD_DEFLATE:
       return "deflate";
+    case GARC_ZIP_METHOD_BZIP2:
+      return "bzip2";
     case GARC_ZIP_METHOD_LZMA:
       return "lzma";
     case GARC_ZIP_METHOD_ZSTD:

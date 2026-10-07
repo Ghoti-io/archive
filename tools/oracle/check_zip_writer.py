@@ -51,7 +51,8 @@ and all four shape what is compared:
   password, which is the reference that can check the authentication code.
   `zstd.zip` and `lzma.zip` copy that exception for unzip and bsdtar. 7-Zip is
   asked about both. Python is not asked about zstd. Python is asked about LZMA
-  only when it can read those bytes.
+  only when it can read those bytes. `bzip2.zip` (method 12) is asked of every
+  reference: unzip, bsdtar and Python all read it.
 - **`bsdtar --format zip` deflates what it re-writes**, so every member of its
   round trip comes back as method 8 whatever it went in as. The size and the CRC
   are still compared, which makes it the strongest statement in this gate:
@@ -103,8 +104,8 @@ COLUMNS = ["archive", "index", "name", "type", "size", "mtime", "mode",
 # green while testing less. These two numbers are the one thing here that has to be
 # edited when a fixture is added, which is where somebody says out loud that the
 # corpus grew - an accidental shrink has no such edit anywhere.
-EXPECTED_ARCHIVES = 9
-EXPECTED_MEMBERS = 108
+EXPECTED_ARCHIVES = 10
+EXPECTED_MEMBERS = 120
 
 # unzip, bsdtar and Python's zipfile cannot read method 99. 7-Zip can, and it
 # is the one reference asked about this archive. The password is the corpus one.
@@ -634,7 +635,7 @@ def run(binary, work, ours):
         if status != "0":
             failures.append("%s refused %s (%s) - %s"
                 % (tool, name, status, purposes.get(name, "?")))
-    # Six archives from unzip, bsdtar and Python, all nine from 7-Zip, and
+    # Seven archives from unzip, bsdtar and Python, all ten from 7-Zip, and
     # Python's LZMA verdict only when those bytes were ones it accepted.
     shared = EXPECTED_ARCHIVES - len(NOT_UNZIP)
     expected_verdicts = shared * 3 + EXPECTED_ARCHIVES + (1 if python_lzma else 0)

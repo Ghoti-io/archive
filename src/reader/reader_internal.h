@@ -411,7 +411,7 @@ struct GARC_Archive {
    * this library has no codec for, or encrypted.
    *
    * It exists because in zip a member's *metadata* being readable and its *data*
-   * not is an ordinary state rather than a failure: an archive with one bzip2
+   * not is an ordinary state rather than a failure: an archive with one PPMd
    * member is still an archive to walk. Without this, such a member would either
    * have to make ::garc_next() fail - losing the other members - or hand back
    * zero bytes and ::GARC_OK, which is an empty file where there is a compressed

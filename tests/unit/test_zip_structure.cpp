@@ -1990,11 +1990,11 @@ TEST(ZipCrypto, AMethodWithNoCodecIsRefusedBeforeThePasswordIsAskedFor) {
   // **The order of two refusals, asserted because it is a choice.** A member that
   // is both encrypted and compressed with a method this library has no codec for
   // can only be answered one way, and the useful answer is the one the caller
-  // cannot fix: no password will make bzip2 decodable here, so asking for one
+  // cannot fix: no password will make PPMd decodable here, so asking for one
   // first would send them to a prompt and refuse them anyway.
   ZipBuilder builder;
   builder.add("secret.txt", std::string(40u, 'z'));
-  builder.last().method = GARC_ZIP_METHOD_BZIP2;
+  builder.last().method = GARC_ZIP_METHOD_PPMD;
   builder.last().flags = 0x0001u;
   Built built(builder.build());
   ASSERT_EQ(built.open_result(), GARC_OK);

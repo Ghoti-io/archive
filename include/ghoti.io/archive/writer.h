@@ -167,12 +167,12 @@ typedef struct GARC_Writer_Options {
    * Which method a zip member's data is written with. Ignored for tar.
    *
    * ::GARC_ZIP_METHOD_STORED is the default. ::GARC_ZIP_METHOD_DEFLATE,
-   * ::GARC_ZIP_METHOD_ZSTD and ::GARC_ZIP_METHOD_LZMA are accepted beside it.
-   * Every other value is refused by ::garc_writer_create() with
-   * ::GARC_ERR_UNSUPPORTED, including methods this library can *read*. Reading
-   * a method means having a decoder for it; writing one means choosing to
-   * produce it. A zstd or an LZMA member is refused by enough readers that it
-   * is never the default: a caller names it.
+   * ::GARC_ZIP_METHOD_BZIP2, ::GARC_ZIP_METHOD_ZSTD and
+   * ::GARC_ZIP_METHOD_LZMA are accepted beside it. Every other value is refused
+   * by ::garc_writer_create() with ::GARC_ERR_UNSUPPORTED, including methods
+   * this library can *read*. Reading a method means having a decoder for it;
+   * writing one means choosing to produce it. Bzip2, zstd and LZMA are refused
+   * by enough readers that none is the default: a caller names the one it wants.
    *
    * **Stored is the default because zero is stored.** Every other field in this
    * struct is written so that a zero-filled options struct behaves like the

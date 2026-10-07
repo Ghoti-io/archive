@@ -2,9 +2,9 @@
  * @file
  *
  * A codec in front of a stream, and behind a sink: `tar.gz`, `tar.zst`,
- * `tar.lz4`, `tar.lzma`, `tar` through zlib. `"lzma"` is the `.lzma`
- * container. Zip method 14 is that codec with `lzma.raw`, and it is not
- * what these tests compose.
+ * `tar.bz2`, `tar.lz4`, `tar.lzma`, `tar` through zlib. `"lzma"` is the
+ * `.lzma` container. Zip method 14 is that codec with `lzma.raw`, and it is
+ * not what these tests compose.
  *
  * Four things these tests are careful about, and each is a way this pair could
  * pass while being wrong.
@@ -29,10 +29,11 @@
  * codec block, zstd hands over *everything* from finish.
  *
  * **What compress does is asserted, not assumed.** Concatenated members are read
- * by zstd and refused by the other three - a difference between codecs in
- * another library, measured before this code was written. Both halves are
- * asserted here, so a change next door shows up as a failure in a test that
- * names the behaviour rather than as a silent change in what an archive means.
+ * by zstd and bzip2 and refused by the codecs that stop at the first member - a
+ * difference between codecs in another library, measured before this code was
+ * written. Both halves are asserted here, so a change next door shows up as a
+ * failure in a test that names the behaviour rather than as a silent change in
+ * what an archive means.
  *
  * Copyright 2026 by Corey Pennycuff
  */
@@ -56,7 +57,8 @@ using garctest::FailingAllocator;
 namespace {
 
 /** Every codec this library is expected to compose with. */
-const char * const kMethods[] = {"gzip", "zstd", "lz4", "zlib", "lzma"};
+const char * const kMethods[]
+    = {"gzip", "zstd", "lz4", "zlib", "lzma", "bzip2"};
 
 /** One member's worth of content, repeated to @p size bytes. */
 std::string filler(size_t size, char seed) {
@@ -487,12 +489,12 @@ std::string two_streams(const char * method) {
 } // namespace
 
 TEST(Codec, ConcatenatedMembersAreRefusedWhereTheCodecStopsAtTheFirst) {
-  // Measured against compress 0.0.0: gzip, lz4 and zlib stop after one member
-  // and leave the rest unconsumed, so ignoring the remainder would hand back
-  // the first archive and call it the whole thing. RFC 1952 allows the
+  // Measured against compress 0.0.0: gzip, lz4, zlib and lzma stop after one
+  // member and leave the rest unconsumed, so ignoring the remainder would hand
+  // back the first archive and call it the whole thing. RFC 1952 allows the
   // concatenation and `cat a.gz b.gz` produces it, which is why this is a
   // refusal and not a theoretical case.
-  for (const char * method : {"gzip", "lz4", "zlib"}) {
+  for (const char * method : {"gzip", "lz4", "zlib", "lzma"}) {
     SCOPED_TRACE(method);
     const std::string both = two_streams(method);
     ASSERT_FALSE(both.empty());
@@ -502,23 +504,27 @@ TEST(Codec, ConcatenatedMembersAreRefusedWhereTheCodecStopsAtTheFirst) {
 }
 
 TEST(Codec, ConcatenatedFramesAreReadWhereTheCodecReadsThemAll) {
-  // zstd is the exception, and the asymmetry is asserted rather than described:
-  // if compress ever makes gzip read a second member, the test above fails and
-  // this one says what the new behaviour should look like.
-  const std::string both = two_streams("zstd");
-  ASSERT_FALSE(both.empty());
-  std::vector<Recovered> got;
-  // Both members come back, and that is two deliberate behaviours meeting
-  // rather than one accident. zstd consumes every frame, so the decompressing
-  // stream yields both tars end to end; and the reader records an
-  // end-of-archive marker but decides the end from what *follows* it, because a
-  // writer's trailing padding is often stripped and a reader that insisted on
-  // the second zero block would reject those archives (src/tar/tar_read.c says
-  // so where it does it). So the two tars read as one archive of two members.
-  EXPECT_EQ(GARC_OK, unpack("zstd", both, &got));
-  ASSERT_EQ(2u, got.size());
-  EXPECT_EQ("first.txt", got[0].name);
-  EXPECT_EQ("second.txt", got[1].name);
+  // zstd and bzip2 are the exceptions, and the asymmetry is asserted rather
+  // than described: if compress ever makes gzip read a second member, the test
+  // above fails and this one says what the new behaviour should look like.
+  for (const char * method : {"zstd", "bzip2"}) {
+    SCOPED_TRACE(method);
+    const std::string both = two_streams(method);
+    ASSERT_FALSE(both.empty());
+    std::vector<Recovered> got;
+    // Both members come back, and that is two deliberate behaviours meeting
+    // rather than one accident. The codec consumes every frame, so the
+    // decompressing stream yields both tars end to end; and the reader records
+    // an end-of-archive marker but decides the end from what *follows* it,
+    // because a writer's trailing padding is often stripped and a reader that
+    // insisted on the second zero block would reject those archives
+    // (src/tar/tar_read.c says so where it does it). So the two tars read as
+    // one archive of two members.
+    EXPECT_EQ(GARC_OK, unpack(method, both, &got));
+    ASSERT_EQ(2u, got.size());
+    EXPECT_EQ("first.txt", got[0].name);
+    EXPECT_EQ("second.txt", got[1].name);
+  }
 }
 
 TEST(Codec, TheCodecsOwnOutputCapIsItsOwnStatus) {

@@ -150,11 +150,11 @@ static char BIG[3000];
 static char NOISE[3000];
 
 /**
- * **Nine encodings of one member list**, which is what the gate compares against
+ * **Ten encodings of one member list**, which is what the gate compares against
  * each other and against the references.
  *
  * The encodings differ in nothing but their encoding, which is what makes "all
- * seven read the same" a statement about the writer rather than about seven
+ * ten read the same" a statement about the writer rather than about ten
  * different inputs. `pipe.zip` is the streaming form reached the way a caller
  * reaches it by accident - a sink with no `patch`, which is what a socket is -
  * and it must come out identical to asking for descriptors outright. `aes.zip`
@@ -190,6 +190,10 @@ static const struct {
       "deflated members with the compressed size in a data descriptor"},
   {"aes.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_STORED, 1,
       "the stored members, encrypted with WinZip AES and the corpus password"},
+  // **One bzip2 archive.** unzip, bsdtar and Python all read method 12, so
+  // every reference is asked about it. Version needed is 46.
+  {"bzip2.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_BZIP2, 0,
+      "bzip2 members, method 12, a bare stream, version 46"},
   // **One zstd archive and one LZMA archive.** unzip is not asked about either.
   // 7-Zip is. Python is asked about the LZMA archive only when it accepts the
   // bytes, and it is not asked about zstd. The same exception aes.zip already

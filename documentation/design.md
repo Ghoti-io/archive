@@ -1,7 +1,7 @@
 # Design
 
 **Status:** tar is read in all four of its formats and written as pax; `tar.gz`,
-`tar.zst`, `tar.lz4` and `tar.lzma` work in both directions; zip is read and written. The filesystem layer is opt-in (`fs.h`, which `archive.h` does not
+`tar.zst`, `tar.lz4`, `tar.lzma` and `tar.bz2` work in both directions; zip is read and written. The filesystem layer is opt-in (`fs.h`, which `archive.h` does not
 include); the reader and the writer still do not open a file. What is below
 describes what exists unless a heading says otherwise.
 
@@ -576,7 +576,7 @@ zip cannot hide which files exist, and 7z's encrypted header can. AES wraps the
 compressed bytes. `compress` is unchanged.
 
 That a member's *metadata* is readable and its *data* is not is an **ordinary
-state** in zip rather than a failure: an archive with one bzip2 member is still an
+state** in zip rather than a failure: an archive with one PPMd member is still an
 archive to walk. So the refusal lives on the read rather than on the walk, and
 `garc_read_member()` answers it before the size check - a zero-length member of an
 unreadable kind must not read as a successful end of data.
@@ -1036,11 +1036,12 @@ member and a test needs both sides.
 ### What decides a member's method
 
 `GARC_Writer_Options.zip_method` takes `GARC_ZIP_METHOD_STORED`,
-`GARC_ZIP_METHOD_DEFLATE`, `GARC_ZIP_METHOD_ZSTD` or `GARC_ZIP_METHOD_LZMA`
-and refuses every other value at `garc_writer_create()` - including methods
-this library can *read*. Reading a method means owning a decoder; writing one
-means choosing to produce it. Zstd and LZMA are refused by enough readers that
-neither is the default: a caller names the one it wants.
+`GARC_ZIP_METHOD_DEFLATE`, `GARC_ZIP_METHOD_BZIP2`, `GARC_ZIP_METHOD_ZSTD` or
+`GARC_ZIP_METHOD_LZMA` and refuses every other value at `garc_writer_create()` -
+including methods this library can *read*. Reading a method means owning a
+decoder; writing one means choosing to produce it. Bzip2, zstd and LZMA are
+refused by enough readers that none is the default: a caller names the one it
+wants.
 
 **Stored is the default, and the reason is the zero.** Every field in
 `GARC_Writer_Options` is written so that a zero-filled struct either behaves like
@@ -1402,11 +1403,12 @@ is a predicate on the intent row, and libarchive *agrees* about every member we
 deflated. The skip applies only to the members we stored, which is a statement about
 libarchive rather than a hole in the gate.
 
-What it compares, and what it deliberately does not: nine archives, the same member
-list encoded nine ways (stored and deflate sizes disciplines, zip64, AES, zstd,
-LZMA), are accepted by the references that can read them. Unzip, bsdtar and
+What it compares, and what it deliberately does not: ten archives, the same member
+list encoded ten ways (stored and deflate sizes disciplines, zip64, AES, bzip2,
+zstd, LZMA), are accepted by the references that can read them. Unzip, bsdtar and
 Python are not asked about AES or zstd; Python is asked about LZMA only when it
-accepts those bytes. 7-Zip is asked about every archive. `unzip -t`, `7z t` and
+accepts those bytes. Every reference is asked about bzip2. 7-Zip is asked about
+every archive. `unzip -t`, `7z t` and
 `zipfile.testzip()` each recompute every member's CRC they are asked about.
 `unzip -Z1` is the byte-faithful **name** reference for zip - it prints a high byte
 and a literal backslash as they are, where GNU tar needs `--quoting-style=literal`

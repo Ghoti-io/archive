@@ -146,6 +146,12 @@ typedef struct {
   /** Non-zero once any member of this archive was written as AES. */
   int wrote_aes;
   /**
+   * Non-zero once a cleartext member needed version 46.
+   *
+   * Bzip2. An AES member does not set it: its version stays 51.
+   */
+  int needs_46;
+  /**
    * Non-zero once a cleartext member needed version 63.
    *
    * Zstd and LZMA. An AES member does not set it: its version stays 51.
