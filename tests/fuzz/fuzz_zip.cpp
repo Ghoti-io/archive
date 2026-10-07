@@ -158,9 +158,16 @@ bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
   }
 
   if (password) {
-    REQUIRE(garc_zip_set_password(archive, password, std::strlen(password))
-            == GARC_OK,
-        "a zip archive refused a password");
+    // The allocator is allowed to fail. An out-of-memory here is that failure,
+    // and the password was not stored, so the archive is unchanged.
+    const GARC_Result set = garc_zip_set_password(archive, password,
+        std::strlen(password));
+    if (set == GARC_ERR_OOM) {
+      garc_close(archive);
+      garc_stream_destroy(stream);
+      return false;
+    }
+    REQUIRE(set == GARC_OK, "a zip archive refused a password");
   }
 
   const uint64_t declared = garc_zip_declared_members(archive);

@@ -146,6 +146,17 @@ typedef enum {
    */
   GARC_ERR_PASSWORD_OR_CORRUPT,
 
+  /**
+   * The filesystem layer refused this member.
+   *
+   * A name that escapes, a link whose target leaves the root, a second member
+   * that lands on a path already claimed, a type that is not a file or a
+   * directory or an allowed link, or a path that already existed. The members
+   * written before this one are left where they are, and the root is not
+   * removed. See fs.h.
+   */
+  GARC_ERR_REFUSED,
+
   GARC_RESULT_COUNT
 } GARC_Result;
 

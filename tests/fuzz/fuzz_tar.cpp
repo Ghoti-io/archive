@@ -104,6 +104,9 @@ bool documented(GARC_Result result) {
     case GARC_ERR_LIMIT_TOTAL_BYTES:
     case GARC_ERR_LIMIT_NAME_BYTES:
     case GARC_ERR_LIMIT_EXTRA_BYTES:
+    case GARC_ERR_NOT_SEEKABLE:
+      // garc_open returns this for a zip on a stream that cannot seek. It is
+      // a documented answer, and the options byte can choose that stream.
       return true;
     // GARC_ERR_INTERNAL is deliberately absent. It means this library's own
     // invariant failed, which no input should be able to cause - so reaching it

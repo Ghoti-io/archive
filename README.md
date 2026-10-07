@@ -2,8 +2,9 @@
 
 Archive containers — tar and zip — read and written **without touching the
 filesystem**. This library walks the members of an archive and hands you each
-one's name, size, time and bytes; it never opens, creates or writes a file. The
-one part that does is opt-in, arrives later, and lives in a header of its own.
+one's name, size, time and bytes. The reader and the writer never open,
+create or write a file. The part that does is opt-in and lives in `fs.h`, which
+`archive.h` does not include.
 
 That is not squeamishness. Every well-known archive vulnerability is a *path*
 vulnerability — a member named `../../etc/cron.d/x`, a symlink whose target
@@ -47,7 +48,8 @@ record only for what ustar cannot say, so a reader that knows only POSIX.1-1988
 gets a correct answer wherever one exists in its vocabulary. `GARC_TAR_USTAR`
 writes the same headers and *refuses*, by name, anything that would need a record:
 a caller who needs an archive a 1988 reader can read wants to be told rather than
-handed one with records in it. No filesystem layer yet; that is phase F.
+handed one with records in it. The filesystem layer is `fs.h`. It is opt-in, and
+the writer still does not open a file.
 
 **Reads zip, backwards, from the central directory.** The end record is found by
 scanning back from the end of the stream - at most 65,557 bytes, with every
@@ -348,8 +350,9 @@ in the uncompressed one.
   so a cap would be this library second-guessing the program that called it.
 - **Nothing is normalised.** A directory's trailing slash is yours to include, the
   typeflag is what says it is a directory either way, and a name
-  `garc_name_check()` has findings about is written as given. Deciding what is
-  safe to *create* is the filesystem layer's job, and that is phase F.
+`garc_name_check()` has findings about is written as given. Deciding what is
+safe to *create* is `garc_fs_extract()`'s job, in `fs.h`, which the reader and
+the writer do not include.
 
 **Writing zip adds one question and the answer is an option.** A member's CRC-32
 and compressed size are not known when its local header is written, so the archive

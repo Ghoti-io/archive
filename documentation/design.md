@@ -1,9 +1,9 @@
 # Design
 
 **Status:** tar is read in all four of its formats and written as pax; `tar.gz`,
-`tar.zst` and `tar.lz4` work in both directions; zip is **read** and not yet
-written. The filesystem layer does not exist. What is below describes what exists
-unless a heading says otherwise.
+`tar.zst` and `tar.lz4` work in both directions; zip is read and written. The filesystem layer is opt-in (`fs.h`, which `archive.h` does not
+include); the reader and the writer still do not open a file. What is below
+describes what exists unless a heading says otherwise.
 
 This page records the decisions a reader of the headers would otherwise have to
 reconstruct, and — where the decision could reasonably have gone the other way
@@ -31,9 +31,10 @@ time, a type, permissions, and possibly its own codec. Two things follow:
 
 ## 2. The filesystem is not this library's
 
-**Nothing here opens, creates, or writes a file.** A caller reading an archive
-from disk does the `fopen` and supplies a `GARC_Stream_Callbacks`, which is the
-three functions `examples/stream_from_file.c` shows.
+**Nothing in the reader or the writer opens, creates, or writes a file.** A
+caller reading an archive from disk does the `fopen` and supplies a
+`GARC_Stream_Callbacks`, which is the three functions `examples/stream_from_file.c`
+shows.
 
 The security property is the reason. Every well-known archive vulnerability is
 a path vulnerability:
@@ -51,9 +52,10 @@ A library that hands the caller a name and a byte range cannot commit any of
 them. It is also testable entirely in memory, which is what makes a corpus of
 several hundred malicious archives cheap enough to run on every commit.
 
-Extraction to a directory, and creation from one, arrive later as a separate
-opt-in layer, with the corpus already written. That layer then has exactly one
-job, done once, in one place.
+Extraction to a directory, and creation from one, are `garc_fs_extract()` and
+`garc_fs_pack()` in `fs.h`. That header is not included by `archive.h`. The
+reader and the writer still do not open a file. The layer has one job, done
+once, in one place: the canonical path stays inside the root.
 
 ### Naming the danger without deciding about it
 
@@ -674,8 +676,8 @@ A **symlink's target is the member's data**, so reporting one means reading data
 during the walk. This library does that eagerly where it is cheap and certain -
 stored, unencrypted, and no longer than a name is allowed to be - and leaves
 `link_target` NULL otherwise. The alternative was reporting no target for any zip
-symlink, which would leave the filesystem layer of phase F unable to ask the
-question it exists to ask.
+symlink, which would leave the filesystem layer unable to ask the question it
+exists to ask.
 
 ### Duplicate names are reported, not resolved
 

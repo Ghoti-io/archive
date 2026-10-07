@@ -79,6 +79,8 @@ const char * garc_result_string(GARC_Result result) {
     case GARC_ERR_PASSWORD_OR_CORRUPT:
       return "Wrong password or corrupt member; this cipher cannot tell them "
              "apart";
+    case GARC_ERR_REFUSED:
+      return "Refused by the filesystem layer";
     case GARC_RESULT_COUNT:
     default:
       return "Unknown error";
