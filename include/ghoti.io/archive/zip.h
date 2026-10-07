@@ -324,10 +324,13 @@ GARC_API GARC_Zip_Encryption garc_zip_member_encryption(
  *   only other cause is a corrupt encryption header.
  * - ::GARC_ERR_PASSWORD_OR_CORRUPT - ZipCrypto's CRC-32 disagreed after the
  *   check byte agreed, a WinZip AES HMAC disagreed after the 2-byte verifier
- *   agreed, or an encrypted LZMA member's codec header did not parse. The
- *   header is read from the decrypting stream, so a wrong password that
- *   slipped the check byte and a damaged header are the same observation, and
- *   it is answered from ::garc_read_member() so the walk continues.
+ *   agreed, or an encrypted LZMA member's codec header did not parse or ran
+ *   out. The header is read from the decrypting stream, so a wrong password
+ *   that slipped the check byte, a damaged header, and a stream that ends
+ *   inside a header the sizes said was there are the same observation, and
+ *   it is answered from ::garc_read_member() so the walk continues. An I/O
+ *   error while reading the header still fails the walk, and that read
+ *   happens only after a password has been accepted.
  *   **A 16-bit verifier can pass for a wrong password, once in 65536**, and
  *   ZipCrypto has no tag at all, so a wrong password and a damaged member are
  *   the same observation. The status names both rather than guessing. AE-2

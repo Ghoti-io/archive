@@ -2089,6 +2089,233 @@ TEST(ZipCrypto, AnLzmaHeaderFailureAfterDecryptDoesNotStopTheWalk) {
   EXPECT_EQ(read_member(with.archive(), &out), GARC_ERR_PASSWORD_OR_CORRUPT);
 }
 
+/**
+ * A file whose bytes are all there, except the range [@p hole, @p hole_end)
+ * returns nothing — or ::GARC_ERR_IO when @p io_at_hole is set.
+ *
+ * The size check on a zip member compares offsets, so it believes a header is
+ * present. Ending the stream there is how a short read of that header is
+ * reached; the bytes staying in the buffer is what keeps the check from
+ * refusing the member as structure first. Only a read that sits entirely
+ * inside the hole and is at most five bytes is swallowed — the two reads of
+ * the LZMA header, four bytes and then five. The end-record scan reads the
+ * whole file in one call, and swallowing that would fail open before the
+ * header read.
+ */
+class HoleSource {
+public:
+  HoleSource(const std::vector<uint8_t> & bytes, size_t hole, size_t hole_end,
+      bool io_at_hole)
+      : bytes_(bytes), hole_(hole), hole_end_(hole_end), io_at_hole_(io_at_hole) {
+    callbacks_.ctx = this;
+    callbacks_.read = &HoleSource::read_cb;
+    callbacks_.seek = &HoleSource::seek_cb;
+    callbacks_.size = &HoleSource::size_cb;
+  }
+
+  const GARC_Stream_Callbacks * callbacks() const { return &callbacks_; }
+
+private:
+  static GARC_Result read_cb(
+      void * ctx, void * buffer, size_t size, size_t * out_read) {
+    HoleSource * self = static_cast<HoleSource *>(ctx);
+    if (self->pos_ >= self->hole_ && self->pos_ < self->hole_end_
+        && size <= self->hole_end_ - self->pos_ && size <= 5u) {
+      *out_read = 0;
+      return self->io_at_hole_ ? GARC_ERR_IO : GARC_OK;
+    }
+    const size_t remaining = self->bytes_.size() > self->pos_
+        ? self->bytes_.size() - self->pos_ : 0;
+    const size_t take = size < remaining ? size : remaining;
+    if (take) {
+      std::memcpy(buffer, self->bytes_.data() + self->pos_, take);
+      self->pos_ += take;
+    }
+    *out_read = take;
+    return GARC_OK;
+  }
+
+  static GARC_Result seek_cb(void * ctx, uint64_t offset) {
+    HoleSource * self = static_cast<HoleSource *>(ctx);
+    if (offset > self->bytes_.size()) {
+      return GARC_ERR_IO;
+    }
+    self->pos_ = static_cast<size_t>(offset);
+    return GARC_OK;
+  }
+
+  static GARC_Result size_cb(void * ctx, uint64_t * out_size) {
+    const HoleSource * self = static_cast<const HoleSource *>(ctx);
+    *out_size = self->bytes_.size();
+    return GARC_OK;
+  }
+
+  std::vector<uint8_t> bytes_;
+  size_t hole_;
+  size_t hole_end_;
+  bool io_at_hole_;
+  size_t pos_ = 0;
+  GARC_Stream_Callbacks callbacks_ = {};
+};
+
+/** Where the first member's data starts, from its local header. */
+size_t first_data_offset(const std::vector<uint8_t> & bytes) {
+  const uint16_t name = static_cast<uint16_t>(bytes[26] | (bytes[27] << 8));
+  const uint16_t extra = static_cast<uint16_t>(bytes[28] | (bytes[29] << 8));
+  return 30u + name + extra;
+}
+
+/**
+ * The first member's compressed size, from its local header.
+ *
+ * The reader trusts the central-directory size. These fixtures write the same
+ * length in both, because the builder stores `data.size()` locally and the
+ * encrypted helper copies that into the central field.
+ */
+uint32_t first_compressed_size(const std::vector<uint8_t> & bytes) {
+  return static_cast<uint32_t>(bytes[18]) | (static_cast<uint32_t>(bytes[19]) << 8)
+      | (static_cast<uint32_t>(bytes[20]) << 16)
+      | (static_cast<uint32_t>(bytes[21]) << 24);
+}
+
+/** Open @p bytes over a hole and walk it. */
+GARC_Result walk_with_hole(const std::vector<uint8_t> & bytes, size_t hole,
+    size_t hole_end, bool io_at_hole, bool password, size_t * out_count,
+    GARC_Result * out_first_read) {
+  HoleSource source(bytes, hole, hole_end, io_at_hole);
+  GARC_Stream * stream = nullptr;
+  if (garc_stream_create_callback(source.callbacks(), &stream) != GARC_OK) {
+    return GARC_ERR_INTERNAL;
+  }
+  GARC_Archive * archive = nullptr;
+  const GARC_Result opened = garc_open(stream, nullptr, &archive);
+  if (opened != GARC_OK) {
+    garc_stream_destroy(stream);
+    return opened;
+  }
+  if (password) {
+    const GARC_Result set = garc_zip_set_password(
+        archive, kPassword, sizeof(kPassword) - 1u);
+    if (set != GARC_OK) {
+      garc_close(archive);
+      garc_stream_destroy(stream);
+      return set;
+    }
+  }
+  const GARC_Member * member = nullptr;
+  size_t count = 0;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    if (count == 0 && out_first_read) {
+      std::string ignored;
+      *out_first_read = read_member(archive, &ignored);
+    }
+    ++count;
+  }
+  if (out_count) {
+    *out_count = count;
+  }
+  garc_close(archive);
+  garc_stream_destroy(stream);
+  return result;
+}
+
+/** A method-14 header this reader accepts: version, properties size 5, props. */
+std::string valid_lzma_payload() {
+  std::string out(20, '\0');
+  out[0] = '\x19';
+  out[1] = '\x01';
+  out[2] = '\x05';
+  out[4] = '\x5d'; // lc=3, lp=0, pb=2
+  out[8] = '\x01'; // dictionary size 1
+  return out;
+}
+
+TEST(ZipCrypto, AShortReadOfAnEncryptedLzmaHeaderDoesNotStopTheWalk) {
+  // The sizes say the nine-byte header is there — the fit check passes — and
+  // the payload is a header this reader would accept if the bytes arrived.
+  // The stream ends instead. Zeros would have failed the properties check
+  // even when the read succeeded, which would not show that the short read
+  // is what refused the member.
+  const std::string plain = "hello, archive\n";
+  const uint32_t crc = ZipBuilder::crc32(plain);
+  const std::string payload = valid_lzma_payload();
+  ZipBuilder builder;
+  add_encrypted(builder, "secret.lzma", payload,
+      static_cast<uint32_t>(plain.size()), crc, CheckByte::FromCrc,
+      GARC_ZIP_METHOD_LZMA);
+  builder.add("after.txt", "still here\n");
+  const std::vector<uint8_t> bytes = builder.build();
+  ASSERT_EQ(bytes[0], static_cast<uint8_t>('P'));
+  ASSERT_EQ(bytes[1], static_cast<uint8_t>('K'));
+  const size_t data = first_data_offset(bytes);
+  const size_t hole = data + 12u;
+  const size_t hole_end = data + first_compressed_size(bytes);
+
+  for (int with_password = 0; with_password < 2; ++with_password) {
+    size_t count = 0;
+    GARC_Result first = GARC_OK;
+    EXPECT_EQ(walk_with_hole(bytes, hole, hole_end, false, with_password != 0,
+                  &count, &first),
+        GARC_END)
+        << (with_password ? "with a password" : "without one");
+    EXPECT_EQ(count, 2u);
+    EXPECT_EQ(first, with_password ? GARC_ERR_PASSWORD_OR_CORRUPT
+                                   : GARC_ERR_PASSWORD_REQUIRED);
+  }
+
+  // An I/O error is not the stream ending. It still fails the walk, and only
+  // the caller who set a password reaches the read.
+  size_t count = 0;
+  EXPECT_EQ(walk_with_hole(bytes, hole, hole_end, true, true, &count, nullptr),
+      GARC_ERR_IO);
+  EXPECT_EQ(count, 0u);
+  EXPECT_EQ(
+      walk_with_hole(bytes, hole, hole_end, true, false, &count, nullptr),
+      GARC_END);
+  EXPECT_EQ(count, 2u);
+
+  // The four-byte prefix arrives and says the properties are five bytes. The
+  // stream ends on that second read.
+  const size_t props = hole + 4u;
+  for (int with_password = 0; with_password < 2; ++with_password) {
+    size_t seen = 0;
+    GARC_Result first = GARC_OK;
+    EXPECT_EQ(walk_with_hole(bytes, props, hole_end, false, with_password != 0,
+                  &seen, &first),
+        GARC_END)
+        << (with_password ? "properties, with a password"
+                          : "properties, without one");
+    EXPECT_EQ(seen, 2u);
+    EXPECT_EQ(first, with_password ? GARC_ERR_PASSWORD_OR_CORRUPT
+                                   : GARC_ERR_PASSWORD_REQUIRED);
+  }
+
+  // A clear member has no decrypting stream. The same holes are structure, and
+  // a password does not change that. The payload would parse if it arrived.
+  ZipBuilder clear;
+  clear.add("plain.lzma", payload);
+  clear.last().method = GARC_ZIP_METHOD_LZMA;
+  clear.last().override_sizes = true;
+  clear.last().central_compressed_size = 20u;
+  clear.last().central_size = static_cast<uint32_t>(plain.size());
+  clear.add("after.txt", "still here\n");
+  const std::vector<uint8_t> clear_bytes = clear.build();
+  const size_t clear_data = first_data_offset(clear_bytes);
+  const size_t clear_end = clear_data + first_compressed_size(clear_bytes);
+  const size_t clear_holes[] = {clear_data, clear_data + 4u};
+  for (size_t clear_hole : clear_holes) {
+    for (int with_password = 0; with_password < 2; ++with_password) {
+      size_t seen = 0;
+      EXPECT_EQ(walk_with_hole(clear_bytes, clear_hole, clear_end, false,
+                    with_password != 0, &seen, nullptr),
+          GARC_ERR_CORRUPT)
+          << (with_password ? "with a password" : "without one");
+      EXPECT_EQ(seen, 0u);
+    }
+  }
+}
+
 TEST(ZipCrypto, TheDecryptingStreamRefusesItsOwnBadArguments) {
   // Called directly, because nothing the public API can be handed reaches these
   // two lines: the reader always passes a stream and a key set. They are still a

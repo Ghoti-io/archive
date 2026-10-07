@@ -526,9 +526,12 @@ shorter than those nine bytes is structure: `GARC_ERR_CORRUPT` from
 `garc_next()`, with a password and without one. A properties size other than
 5, or a properties byte that does not decode, is `GARC_ERR_CORRUPT` on a clear
 member and stops the walk. On an encrypted member those bytes come from the
-decrypting stream, so a wrong password that slipped the check byte and a
-damaged header are the same observation: the walk continues, and
-`garc_read_member()` answers `GARC_ERR_PASSWORD_OR_CORRUPT`.
+decrypting stream, so a wrong password that slipped the check byte, a damaged
+header, and a stream that ends inside a header the sizes said was there are
+the same observation: the walk continues, and `garc_read_member()` answers
+`GARC_ERR_PASSWORD_OR_CORRUPT`. That read happens only after a password has
+been accepted; without one the member is refused before it. An I/O error
+while reading the header still stops the walk.
 
 **Method 9 is refused on purpose, and it is the interesting one.** "Enhanced
 deflate" is not RFC 1951: it allows a 64 KB window and a different length code. A
@@ -626,7 +629,7 @@ wrong password from a damaged member.
 | --- | --- | --- |
 | `GARC_ERR_PASSWORD_REQUIRED` | encrypted, none supplied | unambiguous |
 | `GARC_ERR_PASSWORD_REJECTED` | the encryption header's check byte disagreed | one byte; catches 255 wrong passwords in 256, and the only other cause is a corrupt header |
-| `GARC_ERR_PASSWORD_OR_CORRUPT` | the member decrypted and its CRC-32 disagreed, or an encrypted LZMA header did not parse | **none that separates the two causes** |
+| `GARC_ERR_PASSWORD_OR_CORRUPT` | the member decrypted and its CRC-32 disagreed, or an encrypted LZMA header did not parse or ran out | **none that separates the two causes** |
 
 The third names two causes on purpose. ZipCrypto has no authentication tag, so a
 key that got past the check byte and a corrupted ciphertext produce the same
@@ -637,10 +640,11 @@ and the member stores the first 10 bytes of the digest. The verifier in front of
 the ciphertext is 16 bits, so a wrong password can pass it and then fail the
 HMAC. That failure is `GARC_ERR_PASSWORD_OR_CORRUPT` for the same reason the CRC
 disagreement is: the caller cannot tell a wrong password from a damaged member.
-An encrypted LZMA header that does not parse is the same status, and it is
-answered from `garc_read_member()` rather than from `garc_next()`, because
-returning `GARC_ERR_CORRUPT` from the walk would stop a caller who set a
-password and not one who did not. AE-2 stores a CRC of 0 and does not check it.
+An encrypted LZMA header that does not parse, or runs out after a password
+has been accepted, is the same status, and it is answered from
+`garc_read_member()` rather than from `garc_next()`, because returning
+`GARC_ERR_CORRUPT` from the walk would stop a caller who set a password and
+not one who did not. An I/O error during that read still stops the walk. AE-2 stores a CRC of 0 and does not check it.
 AE-1 still checks the CRC, and a mismatch after a matching HMAC is damage to
 the plaintext, which is `GARC_ERR_CORRUPT`.
 

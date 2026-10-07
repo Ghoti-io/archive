@@ -49,7 +49,8 @@
  * a method with no codec and is printed as itself. A wrong password is
  * ::GARC_ERR_PASSWORD_REJECTED at the encryption header, or
  * ::GARC_ERR_PASSWORD_OR_CORRUPT once decryption has started - at the CRC, or
- * at an LZMA header that does not parse - and this program
+ * at an LZMA header that does not parse or runs out. An I/O error while
+ * reading that header still fails the walk. This program
  * prints whichever arrived rather than collapsing them, because that distinction is
  * the whole reason there are three.
  *

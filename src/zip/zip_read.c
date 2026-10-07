@@ -797,12 +797,13 @@ static GARC_Result zip_read_exact(
  * codec layer takes a string: a second enum here would be a copy of compress's
  * list of methods, and the copy goes stale.
  *
- * Three rows, and each is exact rather than approximate. Method 8 is RFC 1951
+ * Four rows, and each is exact rather than approximate. Method 8 is RFC 1951
  * *raw* - no zlib header and no gzip wrapper - which is `compress`'s `"deflate"`
  * and not its `"zlib"`; reading one as the other fails on the first two bytes.
- * Method 93 is a zstd frame. Method 14 is `"lzma"`, but the bytes are not a
- * `.lzma` file: a header comes first and the rest is raw, which the caller
- * says with the `lzma.*` keys rather than with this name.
+ * Method 12 is a bare bzip2 stream. Method 93 is a zstd frame. Method 14 is
+ * `"lzma"`, but the bytes are not a `.lzma` file: a header comes first and the
+ * rest is raw, which the caller says with the `lzma.*` keys rather than with
+ * this name.
  *
  * Method 9 is deliberately absent. "Enhanced deflate" is *not* RFC 1951 - it
  * allows a 64 KB window and a different length code - so pointing it at the
@@ -1456,36 +1457,29 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
       //
       // **When the member is encrypted, a header that does not parse is a data
       // refusal rather than a walk failure.** The bytes come from the
-      // decrypting stream, so a wrong password that slipped the check byte and
-      // a damaged header are the same observation - the same reason a CRC
+      // decrypting stream, so a wrong password that slipped the check byte, a
+      // damaged header, and a stream that ends inside a header the sizes said
+      // was there are the same observation - the same reason a CRC
       // disagreement after ZipCrypto is ::GARC_ERR_PASSWORD_OR_CORRUPT.
       // Returning ::GARC_ERR_CORRUPT from next() here used to stop the walk
       // for a caller with a password and not for one without, which is how
       // the fuzz harness found it. The short-payload check above already
-      // refused a header that cannot fit as structure; everything below is
-      // content of the stream.
+      // refused a header that cannot fit as structure. An I/O error is still
+      // a failure of the walk: the stream did not end, it failed.
       uint8_t prefix[4];
       result = zip_read_exact(source, prefix, sizeof(prefix));
       if (result != GARC_OK) {
-        return result;
-      }
-      const uint16_t props_size = garc_zip_le16(prefix + 2u);
-      if (props_size != ZIP_LZMA_PROPS_SIZE) {
-        if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE) {
+        if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE
+            && result == GARC_ERR_CORRUPT) {
           archive->data_refusal = GARC_ERR_PASSWORD_OR_CORRUPT;
         }
         else {
-          return GARC_ERR_CORRUPT;
+          return result;
         }
       }
       else {
-        uint8_t props[ZIP_LZMA_PROPS_SIZE];
-        result = zip_read_exact(source, props, sizeof(props));
-        if (result != GARC_OK) {
-          return result;
-        }
-        if (!zip_lzma_props_decode(
-                props[0], &lzma_keys.lc, &lzma_keys.lp, &lzma_keys.pb)) {
+        const uint16_t props_size = garc_zip_le16(prefix + 2u);
+        if (props_size != ZIP_LZMA_PROPS_SIZE) {
           if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE) {
             archive->data_refusal = GARC_ERR_PASSWORD_OR_CORRUPT;
           }
@@ -1494,10 +1488,32 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
           }
         }
         else {
-          lzma_keys.dict_size = garc_zip_le32(props + 1u);
-          lzma_keys.uncompressed_size = size;
-          lzma = &lzma_keys;
-          codec_length = payload - (uint64_t)ZIP_LZMA_HEADER_SIZE;
+          uint8_t props[ZIP_LZMA_PROPS_SIZE];
+          result = zip_read_exact(source, props, sizeof(props));
+          if (result != GARC_OK) {
+            if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE
+                && result == GARC_ERR_CORRUPT) {
+              archive->data_refusal = GARC_ERR_PASSWORD_OR_CORRUPT;
+            }
+            else {
+              return result;
+            }
+          }
+          else if (!zip_lzma_props_decode(
+                       props[0], &lzma_keys.lc, &lzma_keys.lp, &lzma_keys.pb)) {
+            if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE) {
+              archive->data_refusal = GARC_ERR_PASSWORD_OR_CORRUPT;
+            }
+            else {
+              return GARC_ERR_CORRUPT;
+            }
+          }
+          else {
+            lzma_keys.dict_size = garc_zip_le32(props + 1u);
+            lzma_keys.uncompressed_size = size;
+            lzma = &lzma_keys;
+            codec_length = payload - (uint64_t)ZIP_LZMA_HEADER_SIZE;
+          }
         }
       }
     }
