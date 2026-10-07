@@ -506,29 +506,35 @@ holds a marker - because `zip -fz` writes the zip64 records for an archive whose
 32-bit counts would all have fitted, and those counts are right, so a reader that
 waited for a marker would pass on that archive until the one where they are not.
 
-### Methods, which are numbers, and the four that have codecs
+### Methods, which are numbers, and the five that are read
 
-**Methods 0, 8, 14 and 93 are read.** A compressed member is a *bounded view* of the
+**Methods 0, 8, 12, 14 and 93 are read.** A compressed member is a *bounded view* of the
 file with a decoder over it: the view ends where the member's compressed size ends,
 which is what stops a deflate stream from reading the next member's local header as
 more input, and the decoder is `compress`'s. So method 8 is RFC 1951 raw -
 `compress`'s `"deflate"`, not its `"zlib"`, and reading one as the other fails on
-the first two bytes - and method 93 is a zstd frame. Method 14 is not a `.lzma`
+the first two bytes - method 12 is a bare bzip2 stream, and method 93 is a zstd
+frame. Method 14 is not a `.lzma`
 file. A little-endian version word, a little-endian properties size, those
 bytes, then raw LZMA. Any version whose properties size is 5 is accepted,
 which is 7-Zip's `0x0119` and Python's `0x0409`. The properties byte is
 `(pb*5+lp)*9+lc` plus a 4-byte dictionary, and those become `lzma.lc`,
 `lzma.lp`, `lzma.pb` and `lzma.dict_size` with `lzma.raw` set. The zip
 uncompressed size is passed as `lzma.uncompressed_size`, so an end marker
-after that many bytes is accepted and an earlier one is corrupt. A properties
-size other than 5, or a header shorter than the nine bytes a size of 5 needs,
-is `GARC_ERR_CORRUPT`.
+after that many bytes is accepted and an earlier one is corrupt. A payload
+shorter than those nine bytes is structure: `GARC_ERR_CORRUPT` from
+`garc_next()`, with a password and without one. A properties size other than
+5, or a properties byte that does not decode, is `GARC_ERR_CORRUPT` on a clear
+member and stops the walk. On an encrypted member those bytes come from the
+decrypting stream, so a wrong password that slipped the check byte and a
+damaged header are the same observation: the walk continues, and
+`garc_read_member()` answers `GARC_ERR_PASSWORD_OR_CORRUPT`.
 
 **Method 9 is refused on purpose, and it is the interesting one.** "Enhanced
 deflate" is not RFC 1951: it allows a 64 KB window and a different length code. A
 reader that pointed it at the deflate decoder would decode the members that used
 neither extension correctly and the ones that used either into plausible wrong
-bytes, which is the worst of the three available outcomes. 12, 95 and 98 are
+bytes, which is the worst of the three available outcomes. 95 and 98 are
 refused for the ordinary reason - no codec - and `garc_zip_member_method()` with
 `garc_zip_method_string()` name the number in every case, so a refusal is a to-do
 list rather than a dead end. unzip 6.00 refuses 14 and 99 itself, with "need PK
@@ -620,7 +626,7 @@ wrong password from a damaged member.
 | --- | --- | --- |
 | `GARC_ERR_PASSWORD_REQUIRED` | encrypted, none supplied | unambiguous |
 | `GARC_ERR_PASSWORD_REJECTED` | the encryption header's check byte disagreed | one byte; catches 255 wrong passwords in 256, and the only other cause is a corrupt header |
-| `GARC_ERR_PASSWORD_OR_CORRUPT` | the member decrypted and its CRC-32 disagreed | **none that separates the two causes** |
+| `GARC_ERR_PASSWORD_OR_CORRUPT` | the member decrypted and its CRC-32 disagreed, or an encrypted LZMA header did not parse | **none that separates the two causes** |
 
 The third names two causes on purpose. ZipCrypto has no authentication tag, so a
 key that got past the check byte and a corrupted ciphertext produce the same
@@ -631,8 +637,12 @@ and the member stores the first 10 bytes of the digest. The verifier in front of
 the ciphertext is 16 bits, so a wrong password can pass it and then fail the
 HMAC. That failure is `GARC_ERR_PASSWORD_OR_CORRUPT` for the same reason the CRC
 disagreement is: the caller cannot tell a wrong password from a damaged member.
-AE-2 stores a CRC of 0 and does not check it. AE-1 still checks the CRC, and a
-mismatch is the same status.
+An encrypted LZMA header that does not parse is the same status, and it is
+answered from `garc_read_member()` rather than from `garc_next()`, because
+returning `GARC_ERR_CORRUPT` from the walk would stop a caller who set a
+password and not one who did not. AE-2 stores a CRC of 0 and does not check it.
+AE-1 still checks the CRC, and a mismatch after a matching HMAC is damage to
+the plaintext, which is `GARC_ERR_CORRUPT`.
 
 **The check byte has two conventions and the corpus decided which to implement.**
 APPNOTE says the twelfth header byte is the high byte of the member's CRC-32.
@@ -653,8 +663,9 @@ anyway. For WinZip AES the header method stays 99, which is what
 `garc_zip_member_method()` reports, and the real method is the last two bytes of
 the 0x9901 field. That real method is what selects the codec. An unsupported one
 is `GARC_ERR_UNSUPPORTED` with no password prompt. A compressed size shorter than
-the salt, the verifier and the authentication code is `GARC_ERR_CORRUPT`, and
-that check does not depend on a password either.
+the salt, the verifier and the authentication code is `GARC_ERR_CORRUPT`, and a
+method 14 payload shorter than its nine-byte header is the same answer. Neither
+check depends on a password.
 
 ### Times, modes and types, each from the field that is allowed to say
 

@@ -139,10 +139,13 @@ typedef enum {
    * whose bytes are not the ones the archive's CRC describes. WinZip AES does
    * have an HMAC, and a failure of that code is this status too: the verifier
    * in front of the ciphertext is 16 bits, so a wrong password can pass it,
-   * once in 65536, and then fails the HMAC. Reporting ::GARC_ERR_CORRUPT
-   * would claim the data is at fault and reporting
-   * ::GARC_ERR_PASSWORD_REJECTED would claim the
-   * password is; both would be a guess dressed as a finding.
+   * once in 65536, and then fails the HMAC. An encrypted LZMA member whose
+   * codec header does not parse is this status as well, from
+   * ::garc_read_member() rather than ::garc_next(): those nine bytes are
+   * ciphertext, and failing the walk would stop a caller who set a password
+   * and not one who did not. Reporting ::GARC_ERR_CORRUPT would claim the
+   * data is at fault and reporting ::GARC_ERR_PASSWORD_REJECTED would claim
+   * the password is; both would be a guess dressed as a finding.
    */
   GARC_ERR_PASSWORD_OR_CORRUPT,
 

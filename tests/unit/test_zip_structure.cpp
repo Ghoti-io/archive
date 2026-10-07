@@ -2045,6 +2045,50 @@ TEST(ZipCrypto, TheWalkDoesNotDependOnThePassword) {
   }
 }
 
+TEST(ZipCrypto, AnLzmaHeaderFailureAfterDecryptDoesNotStopTheWalk) {
+  // **A defect the fuzz harness found.** Encrypted LZMA parses its codec header
+  // from the decrypting stream. A password that slips the check byte (or garbage
+  // after a right one) made that parse return CORRUPT from next(), so the walk
+  // stopped for a caller with a password and continued for one without. Codec-
+  // create failures already refuse the data; the LZMA header must do the same
+  // when encryption is active.
+  const std::string plain = "hello, archive\n";
+  const uint32_t crc = ZipBuilder::crc32(plain);
+  // Enough nonsense for a nine-byte LZMA header whose properties size is not 5
+  // once decrypted under the right password.
+  const std::string junk(20, '\0');
+
+  ZipBuilder builder;
+  add_encrypted(builder, "secret.lzma", junk, static_cast<uint32_t>(plain.size()),
+      crc, CheckByte::FromCrc, GARC_ZIP_METHOD_LZMA);
+  builder.add("after.txt", "still here\n");
+  const std::vector<uint8_t> bytes = builder.build();
+
+  for (int with_password = 0; with_password < 2; ++with_password) {
+    Built built(bytes);
+    ASSERT_EQ(built.open_result(), GARC_OK);
+    if (with_password) {
+      ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+                    sizeof(kPassword) - 1u),
+          GARC_OK);
+    }
+    size_t count = 0;
+    EXPECT_EQ(built.walk(&count), GARC_END)
+        << (with_password ? "with a password" : "without one");
+    EXPECT_EQ(count, 2u) << (with_password ? "with a password" : "without one");
+  }
+
+  Built with(bytes);
+  ASSERT_EQ(with.open_result(), GARC_OK);
+  ASSERT_EQ(garc_zip_set_password(with.archive(), kPassword,
+                sizeof(kPassword) - 1u),
+      GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(with.archive(), &member), GARC_OK);
+  std::string out;
+  EXPECT_EQ(read_member(with.archive(), &out), GARC_ERR_PASSWORD_OR_CORRUPT);
+}
+
 TEST(ZipCrypto, TheDecryptingStreamRefusesItsOwnBadArguments) {
   // Called directly, because nothing the public API can be handed reaches these
   // two lines: the reader always passes a stream and a key set. They are still a

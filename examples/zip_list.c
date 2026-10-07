@@ -48,7 +48,8 @@
  * data is refused by ::GARC_ERR_PASSWORD_REQUIRED, which is a different answer from
  * a method with no codec and is printed as itself. A wrong password is
  * ::GARC_ERR_PASSWORD_REJECTED at the encryption header, or
- * ::GARC_ERR_PASSWORD_OR_CORRUPT at the CRC if it slipped past - and this program
+ * ::GARC_ERR_PASSWORD_OR_CORRUPT once decryption has started - at the CRC, or
+ * at an LZMA header that does not parse - and this program
  * prints whichever arrived rather than collapsing them, because that distinction is
  * the whole reason there are three.
  *

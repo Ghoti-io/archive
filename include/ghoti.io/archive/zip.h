@@ -323,12 +323,17 @@ GARC_API GARC_Zip_Encryption garc_zip_member_encryption(
  *   disagreed, before any data was read. Catches 255 wrong passwords in 256; the
  *   only other cause is a corrupt encryption header.
  * - ::GARC_ERR_PASSWORD_OR_CORRUPT - ZipCrypto's CRC-32 disagreed after the
- *   check byte agreed, or a WinZip AES HMAC disagreed after the 2-byte verifier
- *   agreed. **A 16-bit verifier can pass for a wrong password, once in
- *   65536**, and ZipCrypto has no tag at all, so a wrong password and a
- *   damaged member are the same observation. The status names both rather
- *   than guessing. AE-2 does not treat a stored CRC of 0 as this failure;
- *   AE-1 still checks the CRC.
+ *   check byte agreed, a WinZip AES HMAC disagreed after the 2-byte verifier
+ *   agreed, or an encrypted LZMA member's codec header did not parse. The
+ *   header is read from the decrypting stream, so a wrong password that
+ *   slipped the check byte and a damaged header are the same observation, and
+ *   it is answered from ::garc_read_member() so the walk continues.
+ *   **A 16-bit verifier can pass for a wrong password, once in 65536**, and
+ *   ZipCrypto has no tag at all, so a wrong password and a damaged member are
+ *   the same observation. The status names both rather than guessing. AE-2
+ *   does not treat a stored CRC of 0 as this failure; AE-1 still checks the
+ *   CRC, and a mismatch after a matching HMAC is damage to the plaintext
+ *   (::GARC_ERR_CORRUPT).
  *
  * **Writing ZipCrypto is refused permanently**, and not for want of code: no
  * option name makes shipping a cipher known to be broken honest. A password on

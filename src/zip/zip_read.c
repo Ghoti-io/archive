@@ -1382,6 +1382,15 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
     // refusal is not turned into a size check against the unadjusted payload.
     return GARC_ERR_CORRUPT;
   }
+  if ((zip->encryption != GARC_ZIP_ENCRYPTION_AES || aes_known)
+      && body == GARC_ZIP_METHOD_LZMA
+      && payload < (uint64_t)ZIP_LZMA_HEADER_SIZE) {
+    // Method 14's nine-byte header is a fact about the archive's sizes, the
+    // same way an encrypted member's framing is. Checked here so a short
+    // payload stops the walk for every caller rather than only one who set a
+    // password and reached the decrypting parse below.
+    return GARC_ERR_CORRUPT;
+  }
 
   // **The real method is answered before the password, and the order is the
   // point.** A member this library has no codec for is refused whatever the
@@ -1443,52 +1452,74 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
     if (body == GARC_ZIP_METHOD_LZMA) {
       // Version, properties size, five property bytes, then raw LZMA. Any
       // version word is accepted: 7-Zip writes 0x0119 and Python writes
-      // 0x0409. A properties size other than 5, or a header shorter than
-      // those nine bytes, is corrupt.
-      if (payload < 4u) {
-        return GARC_ERR_CORRUPT;
-      }
+      // 0x0409. A properties size other than 5 is corrupt on a clear member.
+      //
+      // **When the member is encrypted, a header that does not parse is a data
+      // refusal rather than a walk failure.** The bytes come from the
+      // decrypting stream, so a wrong password that slipped the check byte and
+      // a damaged header are the same observation - the same reason a CRC
+      // disagreement after ZipCrypto is ::GARC_ERR_PASSWORD_OR_CORRUPT.
+      // Returning ::GARC_ERR_CORRUPT from next() here used to stop the walk
+      // for a caller with a password and not for one without, which is how
+      // the fuzz harness found it. The short-payload check above already
+      // refused a header that cannot fit as structure; everything below is
+      // content of the stream.
       uint8_t prefix[4];
       result = zip_read_exact(source, prefix, sizeof(prefix));
       if (result != GARC_OK) {
         return result;
       }
       const uint16_t props_size = garc_zip_le16(prefix + 2u);
-      if (props_size != ZIP_LZMA_PROPS_SIZE
-          || payload < (uint64_t)ZIP_LZMA_HEADER_SIZE) {
-        return GARC_ERR_CORRUPT;
-      }
-      uint8_t props[ZIP_LZMA_PROPS_SIZE];
-      result = zip_read_exact(source, props, sizeof(props));
-      if (result != GARC_OK) {
-        return result;
-      }
-      if (!zip_lzma_props_decode(
-              props[0], &lzma_keys.lc, &lzma_keys.lp, &lzma_keys.pb)) {
-        return GARC_ERR_CORRUPT;
-      }
-      lzma_keys.dict_size = garc_zip_le32(props + 1u);
-      lzma_keys.uncompressed_size = size;
-      lzma = &lzma_keys;
-      codec_length = payload - (uint64_t)ZIP_LZMA_HEADER_SIZE;
-    }
-    result = garc_member_codec_create(archive->allocator, source, codec_name,
-        codec_length, size, lzma, &zip->codec);
-    if (result != GARC_OK) {
-      // A method compress does not have after all, or no memory. Either way the
-      // member's metadata is still good, so this is a refusal on the *data*
-      // rather than a failure of the walk - the same answer a codec-gated method
-      // gets, arrived at from the other direction.
-      if (result != GARC_ERR_OOM) {
-        archive->data_refusal = result;
-        zip->codec = NULL;
+      if (props_size != ZIP_LZMA_PROPS_SIZE) {
+        if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE) {
+          archive->data_refusal = GARC_ERR_PASSWORD_OR_CORRUPT;
+        }
+        else {
+          return GARC_ERR_CORRUPT;
+        }
       }
       else {
-        return result;
+        uint8_t props[ZIP_LZMA_PROPS_SIZE];
+        result = zip_read_exact(source, props, sizeof(props));
+        if (result != GARC_OK) {
+          return result;
+        }
+        if (!zip_lzma_props_decode(
+                props[0], &lzma_keys.lc, &lzma_keys.lp, &lzma_keys.pb)) {
+          if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE) {
+            archive->data_refusal = GARC_ERR_PASSWORD_OR_CORRUPT;
+          }
+          else {
+            return GARC_ERR_CORRUPT;
+          }
+        }
+        else {
+          lzma_keys.dict_size = garc_zip_le32(props + 1u);
+          lzma_keys.uncompressed_size = size;
+          lzma = &lzma_keys;
+          codec_length = payload - (uint64_t)ZIP_LZMA_HEADER_SIZE;
+        }
       }
     }
-    else {
-      zip->crc_active = 1;
+    if (archive->data_refusal == GARC_OK) {
+      result = garc_member_codec_create(archive->allocator, source, codec_name,
+          codec_length, size, lzma, &zip->codec);
+      if (result != GARC_OK) {
+        // A method compress does not have after all, or no memory. Either way the
+        // member's metadata is still good, so this is a refusal on the *data*
+        // rather than a failure of the walk - the same answer a codec-gated method
+        // gets, arrived at from the other direction.
+        if (result != GARC_ERR_OOM) {
+          archive->data_refusal = result;
+          zip->codec = NULL;
+        }
+        else {
+          return result;
+        }
+      }
+      else {
+        zip->crc_active = 1;
+      }
     }
   }
 

@@ -70,8 +70,9 @@ const char * garc_result_string(GARC_Result result) {
     // Three statuses where a lesser reader has one, and the third one names two
     // causes on purpose. See the enum: at the encryption header a wrong password
     // and a corrupt header are the same observation with one byte of evidence,
-    // and at the CRC they are the same observation with no way at all to
-    // separate them, because ZipCrypto carries no authentication tag.
+    // and after decryption they are the same observation with no way to
+    // separate them - a CRC that disagrees, or an LZMA header that does not
+    // parse - because those bytes are ciphertext.
     case GARC_ERR_PASSWORD_REQUIRED:
       return "The member is encrypted and no password was given";
     case GARC_ERR_PASSWORD_REJECTED:

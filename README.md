@@ -91,12 +91,15 @@ the world rather than a reason to refuse it. `garc_zip_set_password()` derives
 those keys and also keeps the password, because a WinZip AES member's salt is not
 known until that member is reached. A wrong ZipCrypto password gets **three
 statuses and not one**: none supplied, rejected by the encryption header's single
-check byte, or "wrong password or corrupt member" after the CRC - and the third
-names two causes because ZipCrypto has no authentication tag, so nothing can
-separate them. **WinZip AES is read and written.** A password on a zip writer
-produces AE-2, not ZipCrypto. The HMAC covers the ciphertext, and a tag that does
-not match is the same "wrong password or corrupt member" status, because the
-16-bit verifier can pass for the wrong password. The real compression method is
+check byte, or "wrong password or corrupt member" after the CRC or when an
+encrypted LZMA header does not parse - and the third names two causes because
+ZipCrypto has no authentication tag, so nothing can separate them. The LZMA
+case is answered from the read, not the walk: those header bytes are
+ciphertext, and stopping the walk would depend on whether a password was set.
+**WinZip AES is read and written.** A password on a zip writer produces AE-2,
+not ZipCrypto. The HMAC covers the ciphertext, and a tag that does not match
+is the same "wrong password or corrupt member" status, because the 16-bit
+verifier can pass for the wrong password. The real compression method is
 answered before the password is asked. Nothing about a zip's *metadata* is
 encrypted at any password strength: a zip cannot hide which files exist.
 
