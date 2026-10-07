@@ -192,7 +192,6 @@ static GARC_Result tar_parse_octal(
   }
 
   uint64_t value = 0;
-  int digits = 0;
   while (i < length) {
     uint8_t byte = field[i];
     if (byte == '\0' || byte == ' ') {
@@ -208,15 +207,15 @@ static GARC_Result tar_parse_octal(
       return GARC_ERR_CORRUPT;
     }
     value = (value << 3) | (uint64_t)(byte - '0');
-    digits++;
     i++;
   }
 
-  // No `if (!digits)` arm, and that is deliberate. The leading-padding loop above
+  // No "zero digits" arm, and that is deliberate. The leading-padding loop above
   // consumes every space and every NUL, so if this point is reached with i <
   // length then field[i] was neither - which makes it either an octal digit or a
-  // refusal, and the loop cannot have run zero times. A first draft had the arm;
-  // it was dead code, found by trying to write a field that would reach it.
+  // refusal, and the loop cannot have run zero times. A first draft counted
+  // digits and refused zero; that arm was dead, found by trying to write a field
+  // that would reach it. The counter itself is gone: GCC 16 flags it unused.
 
   // Everything after the terminator must be padding. A field with digits, a
   // NUL, and then more digits is not a number, and reading only the first part
