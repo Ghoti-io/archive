@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <ghoti.io/compress/options.h>
 #include <ghoti.io/compress/stream.h>
 
 #include "core/buffer_internal.h"
@@ -66,15 +67,25 @@ typedef struct {
   uint64_t entries;
 
   /**
-   * The deflate encoder, created for the first member that needs one.
+   * The encoder, created for the first member that needs one.
    *
    * **One encoder for the archive, reset between members**, not one per member:
-   * every member is an independent deflate stream, which is what
+   * every member is an independent stream, which is what
    * gcomp_encoder_reset() produces, and a zip of ten thousand small files would
    * otherwise allocate and free a window ten thousand times. NULL until a
-   * deflated member arrives, so an archive of stored members allocates nothing.
+   * compressed member arrives, so an archive of stored members allocates
+   * nothing. The method is the archive's, so the encoder is never asked to
+   * change codecs between members.
    */
   gcomp_encoder_t * encoder;
+  /**
+   * Options the encoder was created with, kept for its whole life.
+   *
+   * NULL for deflate and zstd. LZMA sets `lzma.raw` and nothing else, so the
+   * encoder's defaults stay the ones the zip header claims. `compress` keeps
+   * the pointer; freeing it at create would be a guess.
+   */
+  gcomp_options_t * encoder_options;
   /**
    * Where @ref encoder's output lands on its way to the sink. Owned.
    *
@@ -134,6 +145,12 @@ typedef struct {
   int aes;
   /** Non-zero once any member of this archive was written as AES. */
   int wrote_aes;
+  /**
+   * Non-zero once a cleartext member needed version 63.
+   *
+   * Zstd and LZMA. An AES member does not set it: its version stays 51.
+   */
+  int needs_63;
   /** The password, copied at create and wiped on release. NULL when unset. */
   uint8_t * password;
   /** Length of @ref password. Zero with @ref have_password is an empty password. */

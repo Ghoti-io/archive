@@ -166,13 +166,13 @@ typedef struct GARC_Writer_Options {
   /**
    * Which method a zip member's data is written with. Ignored for tar.
    *
-   * ::GARC_ZIP_METHOD_STORED is the default, and only
-   * ::GARC_ZIP_METHOD_DEFLATE is accepted beside it - every other value is
-   * refused by ::garc_writer_create() with ::GARC_ERR_UNSUPPORTED, including the
-   * ones this library can *read*. Reading a method means having a decoder for
-   * it; writing one means choosing to produce it, and a zstd or an LZMA member
-   * is refused by enough readers that a caller should have to name it rather
-   * than inherit it.
+   * ::GARC_ZIP_METHOD_STORED is the default. ::GARC_ZIP_METHOD_DEFLATE,
+   * ::GARC_ZIP_METHOD_ZSTD and ::GARC_ZIP_METHOD_LZMA are accepted beside it.
+   * Every other value is refused by ::garc_writer_create() with
+   * ::GARC_ERR_UNSUPPORTED, including methods this library can *read*. Reading
+   * a method means having a decoder for it; writing one means choosing to
+   * produce it. A zstd or an LZMA member is refused by enough readers that it
+   * is never the default: a caller names it.
    *
    * **Stored is the default because zero is stored.** Every other field in this
    * struct is written so that a zero-filled options struct behaves like the
@@ -186,23 +186,25 @@ typedef struct GARC_Writer_Options {
    * format decides them:
    *
    * - **A member with no data is stored** whatever this says. Deflating nothing
-   *   produces a two-byte empty final block, so the choice is between a member
-   *   that occupies 0 bytes and one that occupies 2, and every reference writes
-   *   the first. A directory reaches that by having no data; an empty file
-   *   reaches it by declaring none.
+   *   produces a two-byte empty final block, and zstd and LZMA likewise spend
+   *   a header on no bytes, so the choice is between a member that occupies 0
+   *   bytes and one that occupies a header. Every reference writes the first.
+   *   A directory reaches that by having no data; an empty file reaches it by
+   *   declaring none.
    * - **A symlink is stored.** Its target is its data - zip has no link field -
-   *   and a target is a path: short enough that deflate rarely helps, and needed
-   *   by every reader that wants to know what the link points at. This library's
-   *   own reader reads a target eagerly only when it is stored, which is a
+   *   and a target is a path: short enough that compressing it rarely helps, and
+   *   needed by every reader that wants to know what the link points at. This
+   *   library's own reader reads a target eagerly only when it is stored, which is a
    *   deliberate limit argued where it is written, and every symlink every
    *   reference in the corpus wrote is stored too. So this is not a concession to
    *   our own reader: it is what a zip symlink looks like.
-   * - **A member whose data does not compress is still deflated.** The method is
-   *   in a local header written before the first byte of data arrives, so there
-   *   is no point at which it could be changed back. `zip` stores such a member
-   *   instead, which it can because it has the whole file on disk before it
-   *   writes anything; a streaming writer does not. The cost is deflate's
-   *   stored-block overhead, five bytes per 65535.
+   * - **A member whose data does not compress keeps the method the options
+   *   asked for.** The method is in a local header written before the first
+   *   byte of data arrives, so there is no point at which it could be changed
+   *   back. `zip` stores such a member instead, which it can because it has
+   *   the whole file on disk before it writes anything; a streaming writer
+   *   does not. For deflate the cost is the stored-block overhead, five bytes
+   *   per 65535; zstd and LZMA pay their own framing.
    */
   GARC_Zip_Method zip_method;
 

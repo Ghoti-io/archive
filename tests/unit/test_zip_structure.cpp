@@ -1515,7 +1515,7 @@ TEST(ZipStructure, AZstdMemberReachesTheZstdDecoder) {
   // is the only place the routing is exercised. What it shows is that a member
   // declaring 93 reaches zstd rather than deflate; the next test is the control
   // for that claim.
-  const std::string plain = "zstd in a zip, which nothing here will write\n";
+  const std::string plain = "zstd in a zip, a bare frame\n";
   ZipBuilder builder;
   add_compressed(builder, "packed.zst", plain, GARC_ZIP_METHOD_ZSTD, "zstd");
   Built built(builder.build());

@@ -21,8 +21,9 @@
 /**
  * @file
  *
- * `tar.gz`, `tar.zst`, `tar.lz4`: a codec in front of a stream, or behind a
- * sink.
+ * `tar.gz`, `tar.zst`, `tar.lz4`, `tar.lzma`: a codec in front of a stream,
+ * or behind a sink. `"lzma"` is the `.lzma` container. Zip method 14 is the
+ * same codec with `lzma.raw`, and that header is the zip reader's.
  *
  * ```c
  * GARC_Stream * file = NULL;                       // the compressed bytes
@@ -43,7 +44,7 @@
  * way:
  *
  * **The method is a string, not a ::GARC_Format or an enum of its own.**
- * `"gzip"`, `"zstd"`, `"lz4"`, `"zlib"` - whatever `compress` has a method for,
+ * `"gzip"`, `"zstd"`, `"lz4"`, `"zlib"`, `"lzma"` - whatever `compress` has a method for,
  * spelled the way `compress` spells it and passed straight through to
  * `gcomp_decoder_create()`. An enum here would be this library keeping a second
  * copy of another library's list of codecs, and the copy would be the one that
@@ -112,8 +113,8 @@ extern "C" {
  *
  * @param inner Where the compressed bytes come from.
  * @param method A `compress` method name: `"gzip"`, `"zstd"`, `"lz4"`,
- *   `"zlib"`. Passed through unexamined; see the file comment for why this is
- *   not an enum.
+ *   `"zlib"`, `"lzma"`. Passed through unexamined; see the file comment for
+ *   why this is not an enum. `"lzma"` is a `.lzma` stream.
  * @param options `compress` options for the decoder, or NULL for its defaults -
  *   which include a cap on output bytes, so a decompression bomb is refused
  *   without the caller asking. A cap reached is ::GARC_ERR_LIMIT_CODEC_BYTES.
@@ -153,7 +154,7 @@ GARC_API GARC_Result garc_stream_create_decompress_with_allocator(
  *
  * @param inner Where the compressed bytes go.
  * @param method A `compress` method name: `"gzip"`, `"zstd"`, `"lz4"`,
- *   `"zlib"`.
+ *   `"zlib"`, `"lzma"`.
  * @param options `compress` options for the encoder - the compression level
  *   lives here - or NULL for its defaults.
  * @param out_sink Receives the sink on success.

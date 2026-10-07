@@ -730,6 +730,66 @@ static GARC_Result zip_read_link_target(
   return GARC_OK;
 }
 
+/** Method 14's header is two length fields, then five property bytes. */
+#define ZIP_LZMA_PROPS_SIZE 5u
+#define ZIP_LZMA_HEADER_SIZE (4u + ZIP_LZMA_PROPS_SIZE)
+
+/**
+ * Unpack a properties byte into lc, lp and pb.
+ *
+ * The byte is `(pb * 5 + lp) * 9 + lc`. A value that does not fit those
+ * ranges is not a properties byte.
+ *
+ * @param byte The first properties byte.
+ * @param lc Receives the literal context bits.
+ * @param lp Receives the literal position bits.
+ * @param pb Receives the position bits.
+ * @return Non-zero when the byte is a properties byte.
+ */
+static int zip_lzma_props_decode(
+    uint8_t byte, int64_t * lc, int64_t * lp, int64_t * pb) {
+  unsigned value = byte;
+  if (value >= 9u * 5u * 5u) {
+    return 0;
+  }
+  *lc = (int64_t)(value % 9u);
+  value /= 9u;
+  *lp = (int64_t)(value % 5u);
+  *pb = (int64_t)(value / 5u);
+  return 1;
+}
+
+/**
+ * Read exactly @p size bytes, or report a header that ran out.
+ *
+ * A short read is ::GARC_ERR_CORRUPT: the caller is reading a header whose
+ * length the archive already declared, and ending early means the header is
+ * not there.
+ *
+ * @param stream Where the bytes come from, already positioned.
+ * @param buffer Destination.
+ * @param size How many.
+ * @return ::GARC_OK, ::GARC_ERR_CORRUPT, or what the stream returned.
+ */
+static GARC_Result zip_read_exact(
+    GARC_Stream * stream, void * buffer, size_t size) {
+  uint8_t * out = (uint8_t *)buffer;
+  size_t got_total = 0;
+  while (got_total < size) {
+    size_t got = 0;
+    const GARC_Result result = garc_stream_read(
+        stream, out + got_total, size - got_total, &got);
+    if (result != GARC_OK) {
+      return result;
+    }
+    if (!got) {
+      return GARC_ERR_CORRUPT;
+    }
+    got_total += got;
+  }
+  return GARC_OK;
+}
+
 /**
  * The `compress` method name for a zip method number, or NULL.
  *
@@ -737,10 +797,12 @@ static GARC_Result zip_read_link_target(
  * codec layer takes a string: a second enum here would be a copy of compress's
  * list of methods, and the copy goes stale.
  *
- * Only two rows, and both are exact rather than approximate. Method 8 is RFC 1951
+ * Three rows, and each is exact rather than approximate. Method 8 is RFC 1951
  * *raw* - no zlib header and no gzip wrapper - which is `compress`'s `"deflate"`
  * and not its `"zlib"`; reading one as the other fails on the first two bytes.
- * Method 93 is a zstd frame, which `compress` has, so it comes almost free.
+ * Method 93 is a zstd frame. Method 14 is `"lzma"`, but the bytes are not a
+ * `.lzma` file: a header comes first and the rest is raw, which the caller
+ * says with the `lzma.*` keys rather than with this name.
  *
  * Method 9 is deliberately absent. "Enhanced deflate" is *not* RFC 1951 - it
  * allows a 64 KB window and a different length code - so pointing it at the
@@ -754,6 +816,8 @@ static const char * zip_codec_name(uint16_t method) {
   switch (method) {
     case GARC_ZIP_METHOD_DEFLATE:
       return "deflate";
+    case GARC_ZIP_METHOD_LZMA:
+      return "lzma";
     case GARC_ZIP_METHOD_ZSTD:
       return "zstd";
     default:
@@ -1371,8 +1435,43 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
         return result;
       }
     }
-    result = garc_member_codec_create(archive->allocator, source,
-        codec_name, payload, size, &zip->codec);
+    GARC_Member_Lzma lzma_keys;
+    const GARC_Member_Lzma * lzma = NULL;
+    uint64_t codec_length = payload;
+    if (body == GARC_ZIP_METHOD_LZMA) {
+      // Version, properties size, five property bytes, then raw LZMA. Any
+      // version word is accepted: 7-Zip writes 0x0119 and Python writes
+      // 0x0409. A properties size other than 5, or a header shorter than
+      // those nine bytes, is corrupt.
+      if (payload < 4u) {
+        return GARC_ERR_CORRUPT;
+      }
+      uint8_t prefix[4];
+      result = zip_read_exact(source, prefix, sizeof(prefix));
+      if (result != GARC_OK) {
+        return result;
+      }
+      const uint16_t props_size = garc_zip_le16(prefix + 2u);
+      if (props_size != ZIP_LZMA_PROPS_SIZE
+          || payload < (uint64_t)ZIP_LZMA_HEADER_SIZE) {
+        return GARC_ERR_CORRUPT;
+      }
+      uint8_t props[ZIP_LZMA_PROPS_SIZE];
+      result = zip_read_exact(source, props, sizeof(props));
+      if (result != GARC_OK) {
+        return result;
+      }
+      if (!zip_lzma_props_decode(
+              props[0], &lzma_keys.lc, &lzma_keys.lp, &lzma_keys.pb)) {
+        return GARC_ERR_CORRUPT;
+      }
+      lzma_keys.dict_size = garc_zip_le32(props + 1u);
+      lzma_keys.uncompressed_size = size;
+      lzma = &lzma_keys;
+      codec_length = payload - (uint64_t)ZIP_LZMA_HEADER_SIZE;
+    }
+    result = garc_member_codec_create(archive->allocator, source, codec_name,
+        codec_length, size, lzma, &zip->codec);
     if (result != GARC_OK) {
       // A method compress does not have after all, or no memory. Either way the
       // member's metadata is still good, so this is a refusal on the *data*

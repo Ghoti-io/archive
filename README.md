@@ -73,12 +73,13 @@ for the fields that hold the `0xFFFFFFFF` marker, which is why `zip -fz` produce
 an eight-byte field where a reader consuming the values positionally expects
 sixteen.
 
-**Methods 0 and 8 are read, and 93 with them**, through `compress`: a member is a
+**Methods 0, 8, 14 and 93 are read**, through `compress`: a member is a
 bounded view of the file with a decoder over it, so method 8 is RFC 1951 raw and
-method 93 a zstd frame with no new format code either way. **Method 9 is refused
+method 93 a zstd frame. Method 14 is a small header and then raw LZMA
+(`lzma.raw`), not a `.lzma` file. **Method 9 is refused
 on purpose** - "enhanced deflate" is not RFC 1951, so pointing it at the deflate
 decoder would produce plausible wrong bytes for the members that use its
-extensions. 12, 14, 95 and 98 are refused too, with a status and an accessor that
+extensions. 12, 95 and 98 are refused too, with a status and an accessor that
 **name the method number**, so the refusal is a to-do list. ZipCrypto and WinZip
 AES are named separately from each other and from "unsupported", because a caller
 needs to know whether a password could ever help.
@@ -123,8 +124,8 @@ the input a refusal needs - a header that contradicts its directory, a member co
 that is wrong, a zip64 field one value short - the archive is built byte by byte in
 the test, from a control archive this library reads.
 
-**Reads and writes `tar.gz`, `tar.zst` and `tar.lz4`, with no format code for
-any of them.** A codec wraps the stream or the sink, the tar reader and writer
+**Reads and writes `tar.gz`, `tar.zst`, `tar.lz4` and `tar.lzma`, with no format
+code for any of them.** `"lzma"` is the `.lzma` container. A codec wraps the stream or the sink, the tar reader and writer
 see the same interface they always saw, and the codec is named by a **string**
 rather than an enum — an enum here would be a second copy of compress's list of
 methods, and the copy goes stale. What a compressed archive gives up is
@@ -368,20 +369,25 @@ composes the type bits from `GARC_Member.type` and takes only the permissions fr
 a zip symlink's target *is* its data, so the writer puts it there and the caller
 writes nothing, exactly as for a tar.
 
-**Stored or deflate, and nothing else.** `GARC_Writer_Options.zip_method` takes
-those two and refuses every other value at create — including the ones this library
-can *read*, because reading a method means owning a decoder and writing one means
-choosing to produce it. Stored is the default, and the reason is the zero: every
+**Stored, deflate, zstd or LZMA.** `GARC_Writer_Options.zip_method` takes
+those four and refuses every other value at create — including methods this
+library can *read*, because reading a method means owning a decoder and writing
+one means choosing to produce it. Zstd and LZMA are not the default: a caller
+names them. Stored is the default, and the reason is the zero: every
 field in that struct is written so a zero-filled copy behaves like the defaults or
 is refused, and `GARC_ZIP_METHOD_STORED` is 0. A member with no data is stored
 whatever the option says, and so is a symlink — its target is a path, and every
 symlink every reference in the corpus wrote is stored. A member whose data does not
-compress is still deflated: the method is in a header written before the first byte
-arrives, so there is no point at which it could be taken back, which is what `zip`
-can do only because it has the whole file on disk first. And zip64's threshold is
-`gcomp_encode_bound()` rather than the declared size, because deflate can make a
-member *larger* and a compressed size that crossed 4 GiB afterwards would have
-nowhere to go.
+compress keeps the method the options asked for: the method is in a header written
+before the first byte arrives, so there is no point at which it could be taken back,
+which is what `zip` can do only because it has the whole file on disk first. And
+zip64's threshold is a compressed-size ceiling rather than the declared size,
+because a codec can make a member *larger* and a compressed size that crossed 4 GiB
+afterwards would have nowhere to go. Deflate and zstd ask `gcomp_encode_bound()`.
+LZMA has none, so the ceiling is `GCOMP_LZMA_MAX_EXPANSION_RATIO` times the
+declared size, plus the 9-byte header, plus any AES framing. A cleartext zstd or
+LZMA member needs version 63. A password still writes AE-2, and the real method
+stays in extra 0x9901; AES version-needed stays 51.
 
 `garc_writer_finish()` is not called by `garc_writer_destroy()`, on purpose:
 finishing can fail, a destructor cannot report it, and a destructor that finished

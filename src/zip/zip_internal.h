@@ -567,6 +567,20 @@ GARC_Result garc_zip_next(GARC_Archive * archive);
 uint64_t garc_zip_deflate_bound(uint64_t size);
 
 /**
+ * The most bytes @p method can turn @p size bytes into, before AES framing.
+ *
+ * Deflate and zstd ask `gcomp_encode_bound()`. LZMA has no bound, so the
+ * ceiling is ::GCOMP_LZMA_MAX_EXPANSION_RATIO times @p size plus the 9-byte
+ * zip header. Stored is @p size. A size with no bound saturates at
+ * `UINT64_MAX`, which is the answer that forces zip64.
+ *
+ * @param size The uncompressed size.
+ * @param method The method the member will be written with.
+ * @return The ceiling, saturating at `UINT64_MAX`.
+ */
+uint64_t garc_zip_compressed_ceiling(uint64_t size, uint16_t method);
+
+/**
  * Put the walk back to the first entry, leaving what open discovered alone.
  *
  * @param archive The archive.

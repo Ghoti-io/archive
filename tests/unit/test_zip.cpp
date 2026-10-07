@@ -34,6 +34,7 @@
 #include <ghoti.io/security/sha256.h>
 
 #include "test_helpers.h"
+#include "zip_builder.h"
 #include "zip_manifest.h"
 
 using garctest::BufferSource;
@@ -644,6 +645,7 @@ TEST(Zip, StoredAndDeflatedMembersReadTheSameBytes) {
   const GARC_Member * member = nullptr;
   std::string stored;
   std::string deflated;
+  std::string lzma;
   size_t refused = 0;
   while (garc_next(fixture.archive(), &member) == GARC_OK) {
     const uint16_t method = garc_zip_member_method(fixture.archive());
@@ -653,6 +655,9 @@ TEST(Zip, StoredAndDeflatedMembersReadTheSameBytes) {
     }
     else if (method == GARC_ZIP_METHOD_DEFLATE) {
       deflated = read_all(fixture.archive());
+    }
+    else if (method == GARC_ZIP_METHOD_LZMA) {
+      lzma = read_all(fixture.archive());
     }
     else {
       char buffer[64];
@@ -664,7 +669,8 @@ TEST(Zip, StoredAndDeflatedMembersReadTheSameBytes) {
   }
   EXPECT_EQ(deflated.size(), 1160u);
   EXPECT_EQ(deflated, stored);
-  EXPECT_EQ(refused, 2u) << "bzip2 and lzma have no codec here";
+  EXPECT_EQ(lzma, stored);
+  EXPECT_EQ(refused, 1u) << "bzip2 has no codec here";
 }
 
 TEST(ZipCorpus, EveryDeflatedMemberInTheCorpusReadsAndItsCrcVerifies) {
@@ -729,7 +735,7 @@ TEST(ZipCorpus, EveryDeflatedMemberInTheCorpusReadsAndItsCrcVerifies) {
   // And the encrypted members are in it rather than skipped past, which is what
   // makes this test cover the cipher as well as the codec.
   EXPECT_GE(encrypted, 4u);
-  EXPECT_GE(unsupported, 5u) << "bzip2, lzma, ppmd, deflate64";
+  EXPECT_GE(unsupported, 4u) << "bzip2, ppmd, deflate64";
 }
 
 TEST(Zip, EveryCodecGatedMethodRefusesWithItsNumber) {
@@ -748,7 +754,6 @@ TEST(Zip, EveryCodecGatedMethodRefusesWithItsNumber) {
     {"sevenzip-deflate64.zip", GARC_ZIP_METHOD_DEFLATE64,
         "enhanced deflate (deflate64)"},
     {"sevenzip-methods.zip", GARC_ZIP_METHOD_BZIP2, "bzip2"},
-    {"sevenzip-lzma.zip", GARC_ZIP_METHOD_LZMA, "lzma"},
     {"sevenzip-ppmd.zip", GARC_ZIP_METHOD_PPMD, "ppmd"},
   };
   for (const auto & one : cases) {
@@ -769,10 +774,80 @@ TEST(Zip, EveryCodecGatedMethodRefusesWithItsNumber) {
   }
 }
 
+TEST(Zip, CorpusLzmaMembersMatchTheStoredBytes) {
+  // python-methods.zip carries the same 1,160 bytes as stored and as LZMA,
+  // and its LZMA member is Python's version word 0x0409. sevenzip-lzma.zip is
+  // 7-Zip's 0x0119. Both set bit 1 and a five-byte properties field. The
+  // stored member is the oracle, so neither header is believed on its own.
+  Fixture methods("python-methods.zip");
+  ASSERT_EQ(methods.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  std::string stored;
+  std::string lzma;
+  while (garc_next(methods.archive(), &member) == GARC_OK) {
+    const uint16_t method = garc_zip_member_method(methods.archive());
+    if (method == GARC_ZIP_METHOD_STORED) {
+      GARC_Result status = GARC_ERR_INTERNAL;
+      stored = read_checked(methods.archive(), &status);
+      EXPECT_EQ(status, GARC_OK);
+    }
+    else if (method == GARC_ZIP_METHOD_LZMA) {
+      GARC_Result status = GARC_ERR_INTERNAL;
+      lzma = read_checked(methods.archive(), &status);
+      EXPECT_EQ(status, GARC_OK);
+      EXPECT_EQ(garc_zip_member_flags(methods.archive()) & 0x0002u, 0x0002u);
+    }
+  }
+  EXPECT_EQ(lzma.size(), 1160u);
+  EXPECT_EQ(lzma, stored);
+
+  Fixture seven("sevenzip-lzma.zip");
+  ASSERT_EQ(seven.open_result(), GARC_OK);
+  ASSERT_EQ(garc_next(seven.archive(), &member), GARC_OK);
+  EXPECT_EQ(garc_zip_member_method(seven.archive()), GARC_ZIP_METHOD_LZMA);
+  EXPECT_EQ(garc_zip_member_flags(seven.archive()) & 0x0002u, 0x0002u);
+  GARC_Result status = GARC_ERR_INTERNAL;
+  const std::string got = read_checked(seven.archive(), &status);
+  EXPECT_EQ(status, GARC_OK);
+  EXPECT_EQ(got, stored);
+}
+
+TEST(Zip, AnLzmaHeaderThatIsNotFivePropertiesIsCorrupt) {
+  const struct {
+    const char * name;
+    const char * bytes;
+    size_t length;
+  } cases[] = {
+    {"short", "abc", 3u},
+    {"props-size", "\x19\x01\x04\x00xxxx", 8u},
+    {"props-truncated", "\x19\x01\x05\x00", 4u},
+    // Full nine bytes, properties size five, but the properties byte is not a
+    // properties byte: 0xFF is past 9*5*5-1. The length and size fields alone
+    // would pass, so this is the only arm that exercises zip_lzma_props_decode.
+    {"props-byte", "\x19\x01\x05\x00\xff\x00\x00\x00\x00", 9u},
+  };
+  for (const auto & one : cases) {
+    SCOPED_TRACE(one.name);
+    garctest::ZipBuilder builder;
+    builder.add("member", std::string(one.bytes, one.length));
+    builder.last().method = GARC_ZIP_METHOD_LZMA;
+    const std::vector<uint8_t> bytes = builder.build();
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+        GARC_OK);
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(archive, &member), GARC_ERR_CORRUPT);
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
+}
+
 TEST(Zip, AMemberWithAnUnreadableMethodCanStillBeSkipped) {
   // The walk does not stop at a member it cannot decompress. Python's methods
-  // fixture has stored, deflate, bzip2 and lzma in that order, and all four
-  // members have to be reported.
+  // fixture has stored, deflate, bzip2 and lzma in that order. LZMA is readable
+  // now; bzip2 is not. All four members still have to be reported.
   Fixture fixture("python-methods.zip");
   ASSERT_EQ(fixture.open_result(), GARC_OK);
   const GARC_Member * member = nullptr;

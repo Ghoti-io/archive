@@ -45,10 +45,13 @@ and all four shape what is compared:
   its name is compared only where the intended name has no backslash and no
   high byte. That is a predicate on the input, not a model of libarchive's
   quoting; a wrong model would compare the wrong string and pass.
-- **`unzip` 6.00 cannot read method 99.** `aes.zip` is WinZip AES. unzip,
-  bsdtar, Python's `zipfile` and both re-writers are not asked about it. 7-Zip
-  is, with the corpus password, which is the reference that can check the
-  authentication code.
+- **`unzip` 6.00 cannot read method 99, and it is not asked about method 93
+  or 14 either.** `aes.zip` is WinZip AES. unzip, bsdtar, Python's `zipfile`
+  and both re-writers are not asked about it. 7-Zip is, with the corpus
+  password, which is the reference that can check the authentication code.
+  `zstd.zip` and `lzma.zip` copy that exception for unzip and bsdtar. 7-Zip is
+  asked about both. Python is not asked about zstd. Python is asked about LZMA
+  only when it can read those bytes.
 - **`bsdtar --format zip` deflates what it re-writes**, so every member of its
   round trip comes back as method 8 whatever it went in as. The size and the CRC
   are still compared, which makes it the strongest statement in this gate:
@@ -100,13 +103,20 @@ COLUMNS = ["archive", "index", "name", "type", "size", "mtime", "mode",
 # green while testing less. These two numbers are the one thing here that has to be
 # edited when a fixture is added, which is where somebody says out loud that the
 # corpus grew - an accidental shrink has no such edit anywhere.
-EXPECTED_ARCHIVES = 7
-EXPECTED_MEMBERS = 84
+EXPECTED_ARCHIVES = 9
+EXPECTED_MEMBERS = 108
 
 # unzip, bsdtar and Python's zipfile cannot read method 99. 7-Zip can, and it
 # is the one reference asked about this archive. The password is the corpus one.
 AES_ARCHIVE = "aes.zip"
 AES_PASSWORD = "ghoti-password"
+
+# Method 93 and method 14. unzip is not asked. 7-Zip is asked about both.
+# Python is not asked about zstd. Python is asked about LZMA only when the
+# bytes are ones it accepts, which the inner stage discovers rather than assumes.
+ZSTD_ARCHIVE = "zstd.zip"
+LZMA_ARCHIVE = "lzma.zip"
+NOT_UNZIP = (AES_ARCHIVE, ZSTD_ARCHIVE, LZMA_ARCHIVE)
 
 # What each reference is allowed to say while doing its job, matched whole.
 #
@@ -151,13 +161,15 @@ ROUNDTRIP_SKIP = {
 }
 
 
-def without_aes(rows):
-    """Intent rows the references are not asked about.
+def excluding(rows, names):
+    """Rows whose archive is not one of @p names.
 
-    `aes.zip` is method 99. unzip 6.00, bsdtar and Python's zipfile refuse it,
-    so a comparison against them is a comparison of the other six archives.
+    `aes.zip`, `zstd.zip` and `lzma.zip` are the archives unzip and bsdtar are
+    not asked about. Python drops `aes.zip` and `zstd.zip` always, and
+    `lzma.zip` when it could not read it.
     """
-    return [row for row in rows if row[0] != AES_ARCHIVE]
+    skip = set(names)
+    return [row for row in rows if row[0] not in skip]
 
 
 def rows_from(text):
@@ -316,7 +328,7 @@ def inner(directory):
             ("bsdtar", ["bsdtar", "-tf"]),
             ("sevenzip", ["7z", "t", "-bso0", "-bsp0"])):
         for name in sources:
-            if name == AES_ARCHIVE and tool != "sevenzip":
+            if name in NOT_UNZIP and tool != "sevenzip":
                 continue
             command = list(argv)
             if name == AES_ARCHIVE:
@@ -331,7 +343,7 @@ def inner(directory):
     # Names, from unzip, which prints them as bytes.
     names = []
     for name in sources:
-        if name == AES_ARCHIVE:
+        if name in NOT_UNZIP:
             continue
         finished = subprocess.run(["unzip", "-Z1", name], cwd=ours,
             capture_output=True, stdin=subprocess.DEVNULL)
@@ -360,30 +372,46 @@ def inner(directory):
     # Metadata, from Python, in the same shape.
     meta = []
     for name in sources:
-        if name == AES_ARCHIVE:
+        if name in (AES_ARCHIVE, ZSTD_ARCHIVE):
             continue
-        with zipfile.ZipFile(os.path.join(ours, name)) as handle:
-            for index, info in enumerate(handle.infolist()):
-                # read() recomputes nothing, so testzip() is asked separately
-                # below; this is here because a member whose data is the wrong
-                # length is a different defect from one whose CRC is wrong.
-                length = len(handle.read(info))
-                # The permission bits only. The type bits are in the same half
-                # and are bsdtar's question, not this one's.
-                mode = (info.external_attr >> 16) & 0o7777
-                meta.append("\t".join([
-                    name,
-                    str(index),
-                    make_zip_corpus.escape(make_zip_corpus.name_bytes(info)),
-                    python_type(info),
-                    str(info.file_size),
-                    str(length),
-                    "%04o" % mode,
-                    "",
-                    str(info.compress_type),
-                    "%08x" % (info.CRC & 0xFFFFFFFF),
-                ]))
-            bad = handle.testzip()
+        try:
+            handle = zipfile.ZipFile(os.path.join(ours, name))
+        except Exception:
+            if name == LZMA_ARCHIVE:
+                continue
+            raise
+        with handle:
+            try:
+                rows = []
+                for index, info in enumerate(handle.infolist()):
+                    # read() recomputes nothing, so testzip() is asked separately
+                    # below; this is here because a member whose data is the wrong
+                    # length is a different defect from one whose CRC is wrong.
+                    length = len(handle.read(info))
+                    # The permission bits only. The type bits are in the same half
+                    # and are bsdtar's question, not this one's.
+                    mode = (info.external_attr >> 16) & 0o7777
+                    rows.append("\t".join([
+                        name,
+                        str(index),
+                        make_zip_corpus.escape(make_zip_corpus.name_bytes(info)),
+                        python_type(info),
+                        str(info.file_size),
+                        str(length),
+                        "%04o" % mode,
+                        "",
+                        str(info.compress_type),
+                        "%08x" % (info.CRC & 0xFFFFFFFF),
+                    ]))
+                bad = handle.testzip()
+            except Exception:
+                # Opened, but a member is not bytes this Python can decode.
+                # LZMA is asked only when it accepts the bytes. Every other
+                # archive is one it is required to read.
+                if name == LZMA_ARCHIVE:
+                    continue
+                raise
+            meta.extend(rows)
             verdicts.append("pyzipfile\t%s\t%s" % (name, "0" if bad is None
                 else "bad:" + bad))
 
@@ -401,21 +429,27 @@ def inner(directory):
     os.makedirs(bsdtar_out, exist_ok=True)
     os.makedirs(python_out, exist_ok=True)
     for name in sources:
-        if name == AES_ARCHIVE:
-            continue
         source = os.path.join(ours, name)
-        finished = subprocess.run(
-            ["bsdtar", "--format", "zip", "-cf",
-                os.path.join(bsdtar_out, name), "@" + source],
-            capture_output=True, stdin=subprocess.DEVNULL)
-        if finished.returncode != 0:
-            sys.stderr.write("bsdtar could not re-write %s: %s\n" % (name,
-                finished.stderr.decode("utf-8", "replace").strip()))
-            return 1
-        with zipfile.ZipFile(source) as reader:
-            with zipfile.ZipFile(os.path.join(python_out, name), "w") as writer:
-                for info in reader.infolist():
-                    writer.writestr(info, reader.read(info))
+        if name not in NOT_UNZIP:
+            finished = subprocess.run(
+                ["bsdtar", "--format", "zip", "-cf",
+                    os.path.join(bsdtar_out, name), "@" + source],
+                capture_output=True, stdin=subprocess.DEVNULL)
+            if finished.returncode != 0:
+                sys.stderr.write("bsdtar could not re-write %s: %s\n" % (name,
+                    finished.stderr.decode("utf-8", "replace").strip()))
+                return 1
+        if name in (AES_ARCHIVE, ZSTD_ARCHIVE):
+            continue
+        try:
+            with zipfile.ZipFile(source) as reader:
+                with zipfile.ZipFile(os.path.join(python_out, name), "w") as writer:
+                    for info in reader.infolist():
+                        writer.writestr(info, reader.read(info))
+        except Exception:
+            if name == LZMA_ARCHIVE:
+                continue
+            raise
     return 0
 
 
@@ -591,14 +625,19 @@ def run(binary, work, ours):
     #    all - which is what says the checksums describe the data rather than
     #    merely being in the right fields.
     verdicts = 0
+    python_lzma = False
     for line in read_tsv("verdicts.tsv").splitlines():
         tool, name, status = line.split("\t")
         verdicts += 1
+        if tool == "pyzipfile" and name == LZMA_ARCHIVE:
+            python_lzma = True
         if status != "0":
             failures.append("%s refused %s (%s) - %s"
                 % (tool, name, status, purposes.get(name, "?")))
-    # Six archives, four references, plus 7-Zip alone on aes.zip.
-    expected_verdicts = (EXPECTED_ARCHIVES - 1) * 4 + 1
+    # Six archives from unzip, bsdtar and Python, all nine from 7-Zip, and
+    # Python's LZMA verdict only when those bytes were ones it accepted.
+    shared = EXPECTED_ARCHIVES - len(NOT_UNZIP)
+    expected_verdicts = shared * 3 + EXPECTED_ARCHIVES + (1 if python_lzma else 0)
     if verdicts != expected_verdicts:
         failures.append("%d verdicts against %d expected"
             % (verdicts, expected_verdicts))
@@ -610,7 +649,7 @@ def run(binary, work, ours):
             failures.append("%s said something about %s: %s" % (tool, name, text))
 
     # 3. The names, from the reference that prints bytes.
-    want_names = by_archive(without_aes(intent))
+    want_names = by_archive(excluding(intent, NOT_UNZIP))
     got_names = {}
     for line in read_tsv("names-unzip.tsv").splitlines():
         name, _index, printed = line.split("\t")
@@ -628,8 +667,8 @@ def run(binary, work, ours):
 
     # 4. libarchive's types, modes and links.
     bsdtar_compared, bsdtar_skipped = compare(failures, "bsdtar",
-        without_aes(intent),
-        without_aes(rows_from(read_tsv("rows-bsdtar.tsv"))),
+        excluding(intent, NOT_UNZIP),
+        excluding(rows_from(read_tsv("rows-bsdtar.tsv")), NOT_UNZIP),
         not_asked=("size", "mtime", "method", "crc"),
         predicates={"name": lambda row: bsdtar_verbatim(column(row, "name"))})
     counts.append(("fields from bsdtar", bsdtar_compared, bsdtar_skipped))
@@ -640,8 +679,11 @@ def run(binary, work, ours):
     #    not. The data length against the declared size is the check that a member
     #    holds what it says.
     python_rows = rows_from(read_tsv("meta-python.tsv"))
+    python_skip = [AES_ARCHIVE, ZSTD_ARCHIVE]
+    if not any(row[0] == LZMA_ARCHIVE for row in python_rows):
+        python_skip.append(LZMA_ARCHIVE)
     py_compared, py_skipped = compare(failures, "pyzipfile",
-        without_aes(intent), python_rows,
+        excluding(intent, python_skip), python_rows,
         not_asked=("mtime", "type", "linkname"))
     counts.append(("fields from pyzipfile", py_compared, py_skipped))
     for row in python_rows:
@@ -666,8 +708,14 @@ def run(binary, work, ours):
         predicates = {"name": lambda row, f=verbatim: f(column(row, "name"))}
         if label == "bsdtar":
             predicates["method"] = deflated_only
+            asked = excluding(intent, NOT_UNZIP)
+        else:
+            skip = [AES_ARCHIVE, ZSTD_ARCHIVE]
+            if not any(row[0] == LZMA_ARCHIVE for row in got):
+                skip.append(LZMA_ARCHIVE)
+            asked = excluding(intent, skip)
         compared, skipped = compare(failures, "%s round trip" % label,
-            without_aes(intent),
+            asked,
             got, finding_skip=ROUNDTRIP_SKIP.get(label, ()),
             predicates=predicates)
         counts.append(("fields after %s re-wrote" % label, compared, skipped))
@@ -687,9 +735,11 @@ def run(binary, work, ours):
             "comparison is against them.\n")
         return 1
 
-    print("check-zip-writer: %d archives, %s accepted by four references "
-        "and %s by 7-Zip; %s"
-        % (EXPECTED_ARCHIVES, EXPECTED_ARCHIVES - 1, AES_ARCHIVE,
+    print("check-zip-writer: %d archives, %d accepted by unzip, bsdtar and "
+        "Python, all of them by 7-Zip, Python %s %s; %s"
+        % (EXPECTED_ARCHIVES, shared,
+            "accepted" if python_lzma else "was not asked about",
+            LZMA_ARCHIVE,
             ", ".join("%d %s" % (count, what) for what, count, _ in counts)))
     skipped_total = sum(skipped for _, _, skipped in counts)
     # Only the exclusions that are findings about a reference. A column a

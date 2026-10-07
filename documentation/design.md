@@ -1,7 +1,7 @@
 # Design
 
 **Status:** tar is read in all four of its formats and written as pax; `tar.gz`,
-`tar.zst` and `tar.lz4` work in both directions; zip is read and written. The filesystem layer is opt-in (`fs.h`, which `archive.h` does not
+`tar.zst`, `tar.lz4` and `tar.lzma` work in both directions; zip is read and written. The filesystem layer is opt-in (`fs.h`, which `archive.h` does not
 include); the reader and the writer still do not open a file. What is below
 describes what exists unless a heading says otherwise.
 
@@ -506,24 +506,33 @@ holds a marker - because `zip -fz` writes the zip64 records for an archive whose
 32-bit counts would all have fitted, and those counts are right, so a reader that
 waited for a marker would pass on that archive until the one where they are not.
 
-### Methods, which are numbers, and the two that have codecs
+### Methods, which are numbers, and the four that have codecs
 
-**Methods 0, 8 and 93 are read.** A compressed member is a *bounded view* of the
+**Methods 0, 8, 14 and 93 are read.** A compressed member is a *bounded view* of the
 file with a decoder over it: the view ends where the member's compressed size ends,
 which is what stops a deflate stream from reading the next member's local header as
 more input, and the decoder is `compress`'s. So method 8 is RFC 1951 raw -
 `compress`'s `"deflate"`, not its `"zlib"`, and reading one as the other fails on
-the first two bytes - and method 93 is a zstd frame, which came almost free.
+the first two bytes - and method 93 is a zstd frame. Method 14 is not a `.lzma`
+file. A little-endian version word, a little-endian properties size, those
+bytes, then raw LZMA. Any version whose properties size is 5 is accepted,
+which is 7-Zip's `0x0119` and Python's `0x0409`. The properties byte is
+`(pb*5+lp)*9+lc` plus a 4-byte dictionary, and those become `lzma.lc`,
+`lzma.lp`, `lzma.pb` and `lzma.dict_size` with `lzma.raw` set. The zip
+uncompressed size is passed as `lzma.uncompressed_size`, so an end marker
+after that many bytes is accepted and an earlier one is corrupt. A properties
+size other than 5, or a header shorter than the nine bytes a size of 5 needs,
+is `GARC_ERR_CORRUPT`.
 
 **Method 9 is refused on purpose, and it is the interesting one.** "Enhanced
 deflate" is not RFC 1951: it allows a 64 KB window and a different length code. A
 reader that pointed it at the deflate decoder would decode the members that used
 neither extension correctly and the ones that used either into plausible wrong
-bytes, which is the worst of the three available outcomes. 12, 14, 95 and 98 are
+bytes, which is the worst of the three available outcomes. 12, 95 and 98 are
 refused for the ordinary reason - no codec - and `garc_zip_member_method()` with
 `garc_zip_method_string()` name the number in every case, so a refusal is a to-do
 list rather than a dead end. unzip 6.00 refuses 14 and 99 itself, with "need PK
-compat. v6.3", so refusing them here is the format's age rather than conservatism.
+compat. v6.3", which is the format's age: this library reads 14 anyway.
 
 The mapping from a method number to a codec name is **one switch in one file**,
 which is the whole reason the codec layer takes a string: a second enum would be a
@@ -1024,13 +1033,14 @@ because an archive carrying zip64 fields unnecessarily is refused by some old
 readers. The forced flag exists because the upper side of that threshold is a 4 GiB
 member and a test needs both sides.
 
-### Deflate, and what decides a member's method
+### What decides a member's method
 
-`GARC_Writer_Options.zip_method` takes `GARC_ZIP_METHOD_STORED` or
-`GARC_ZIP_METHOD_DEFLATE` and refuses every other value at
-`garc_writer_create()` - including the ones this library can *read*. Reading a
-method means owning a decoder; writing one means choosing to produce it, and a
-zstd member is refused by enough readers that a caller should have to name it.
+`GARC_Writer_Options.zip_method` takes `GARC_ZIP_METHOD_STORED`,
+`GARC_ZIP_METHOD_DEFLATE`, `GARC_ZIP_METHOD_ZSTD` or `GARC_ZIP_METHOD_LZMA`
+and refuses every other value at `garc_writer_create()` - including methods
+this library can *read*. Reading a method means owning a decoder; writing one
+means choosing to produce it. Zstd and LZMA are refused by enough readers that
+neither is the default: a caller names the one it wants.
 
 **Stored is the default, and the reason is the zero.** Every field in
 `GARC_Writer_Options` is written so that a zero-filled struct either behaves like
@@ -1041,40 +1051,50 @@ code.
 
 Two members are stored whatever the option says:
 
-- **One with no data.** Deflating nothing produces a two-byte empty final block,
-  so the choice is between a member occupying 0 bytes and one occupying 2, and
-  every reference writes the first. A directory reaches it without ever having had
-  the option.
+- **One with no data.** Compressing nothing still spends a header or an empty
+  final block, so the choice is between a member occupying 0 bytes and one that
+  occupies framing, and every reference writes the first. A directory reaches it
+  without ever having had the option.
 - **A symlink.** Its target is its data, and a target is a path: short enough that
-  deflate rarely helps, and wanted by every reader that cares where the link
-  points. **This was a finding rather than a preference.** The first version
+  compressing it rarely helps, and wanted by every reader that cares where the
+  link points. **This was a finding rather than a preference.** The first version
   deflated targets along with everything else - consistently, since the target
   *is* the data - and they then came back empty from this library's own reader,
   which reads a target eagerly only when it is stored. Checking the corpus settled
   which side to fix: every symlink in it is stored, Info-ZIP's included.
 
-**A member whose data does not compress is still deflated.** The method is in a
-local header written before the first byte of data arrives, so there is no point
-at which it could be changed back. `zip` stores such a member instead, which it
-can because it has the whole file on disk before it writes anything; a streaming
-writer does not. The cost is deflate's stored-block overhead, and the example
-program shows it: five tiny members come out six bytes *larger* deflated than
-stored.
+**A member whose data does not compress keeps the method the options asked for.**
+The method is in a local header written before the first byte of data arrives, so
+there is no point at which it could be changed back. `zip` stores such a member
+instead, which it can because it has the whole file on disk before it writes
+anything; a streaming writer does not. For deflate the cost is the stored-block
+overhead, and the example program shows it: five tiny members come out six bytes
+*larger* deflated than stored.
 
 One encoder per archive, reset between members, because each member is an
-independent deflate stream and an archive of ten thousand small files should not
-allocate ten thousand windows. The CRC-32 is of the **uncompressed** bytes in both
-methods - it is what an extractor checks after inflating - which is the one field a
-writer that checksummed its own output would get wrong, and every reader would then
-reject the deflated member while accepting the stored one.
+independent stream and an archive of ten thousand small files should not
+allocate ten thousand windows. The method is the archive's, so the encoder is
+not asked to change codecs. Written LZMA is 7-Zip's shape: version `0x0119`,
+properties size 5, general-purpose bit 1, and an end marker. The properties
+match a NULL options struct, which is lc 3, lp 0, pb 2 and dictionary `1<<23`.
+The encoder is given `lzma.raw` and no uncompressed size, so it writes the
+marker and not a `.lzma` header. A cleartext zstd or LZMA member needs version
+63. A password still writes AE-2: the real method, zstd or LZMA included, stays
+in extra 0x9901, and AES version-needed stays 51. The CRC-32 is of the
+**uncompressed** bytes in every method - it is what an extractor checks after
+inflating - which is the one field a writer that checksummed its own output
+would get wrong, and every reader would then reject the compressed member while
+accepting the stored one.
 
-### The zip64 threshold moved, because deflate can expand a member
+### The zip64 threshold moved, because a codec can expand a member
 
 A member's zip64 fields are decided before its data exists, so the compressed size
 is not available to decide on. What stands in for it is not the declared size but
-the **largest the compressed size can be**: `garc_zip_deflate_bound()`, which is
-`gcomp_encode_bound()` for deflate with its failure modes collapsed into "assume
-the worst".
+the **largest the compressed size can be**: `garc_zip_compressed_ceiling()`.
+Deflate and zstd are `gcomp_encode_bound()` with its failure modes collapsed
+into "assume the worst". LZMA has no bound, so the ceiling is
+`GCOMP_LZMA_MAX_EXPANSION_RATIO` times the declared size plus the 9-byte
+header. AES framing is added on top of that, for every method.
 
 The alternative was to decide on the declared size and refuse when the compressed
 size turned out to cross 4 GiB after all - a refusal arm reachable only by a member
@@ -1382,9 +1402,12 @@ is a predicate on the intent row, and libarchive *agrees* about every member we
 deflated. The skip applies only to the members we stored, which is a statement about
 libarchive rather than a hole in the gate.
 
-What it compares, and what it deliberately does not: four archives, the same member
-list encoded four ways, are accepted by unzip, bsdtar, 7-Zip and Python, with
-`unzip -t`, `7z t` and `zipfile.testzip()` each recomputing every member's CRC.
+What it compares, and what it deliberately does not: nine archives, the same member
+list encoded nine ways (stored and deflate sizes disciplines, zip64, AES, zstd,
+LZMA), are accepted by the references that can read them. Unzip, bsdtar and
+Python are not asked about AES or zstd; Python is asked about LZMA only when it
+accepts those bytes. 7-Zip is asked about every archive. `unzip -t`, `7z t` and
+`zipfile.testzip()` each recompute every member's CRC they are asked about.
 `unzip -Z1` is the byte-faithful **name** reference for zip - it prints a high byte
 and a literal backslash as they are, where GNU tar needs `--quoting-style=literal`
 to do the same for tar. libarchive answers **type, mode and link target**, which

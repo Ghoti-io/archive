@@ -40,6 +40,7 @@
 
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/crc32.h>
+#include <ghoti.io/compress/lzma.h>
 
 #include "test_helpers.h"
 #include "zip/zip_internal.h"
@@ -1390,15 +1391,168 @@ TEST(ZipWrite, ADeflatedMemberNearTheThresholdGetsZip64WithoutBeingAskedTo) {
   EXPECT_LT(garc_zip_deflate_bound(1u << 28), marker);
 }
 
+TEST(ZipWrite, ZstdAndLzmaRoundTripAndLzmaCarriesItsHeader) {
+  const GARC_Zip_Method methods[]
+      = {GARC_ZIP_METHOD_ZSTD, GARC_ZIP_METHOD_LZMA};
+  for (GARC_Zip_Method method : methods) {
+    SCOPED_TRACE(garc_zip_method_string((uint16_t)method));
+    Built built(GARC_ZIP_SIZES_LOCAL, false, method);
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    Spec file;
+    file.name = "a";
+    file.data = std::string(2000u, 'q');
+    Spec empty;
+    empty.name = "empty";
+    Spec link;
+    link.name = "link";
+    link.type = GARC_MEMBER_SYMLINK;
+    link.link = std::string(80u, 't') + "/target";
+    ASSERT_EQ(built.add(file), GARC_OK);
+    ASSERT_EQ(built.add(empty), GARC_OK);
+    ASSERT_EQ(built.add(link), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+
+    const std::vector<uint8_t> bytes = built.bytes();
+    EXPECT_EQ(le16(bytes, 4u), 63u);
+    if (method == GARC_ZIP_METHOD_LZMA) {
+      EXPECT_EQ(le16(bytes, 6u) & 0x0002u, 0x0002u);
+      EXPECT_EQ(le16(bytes, 8u), (uint16_t)GARC_ZIP_METHOD_LZMA);
+      // Local header, then the one-byte name, then the 9-byte LZMA header.
+      const size_t header = 30u + 1u;
+      ASSERT_GE(bytes.size(), header + 9u);
+      EXPECT_EQ(bytes[header], 0x19u);
+      EXPECT_EQ(bytes[header + 1u], 0x01u);
+      EXPECT_EQ(bytes[header + 2u], 0x05u);
+      EXPECT_EQ(bytes[header + 3u], 0x00u);
+      EXPECT_EQ(bytes[header + 4u], 0x5Du);
+      EXPECT_EQ(bytes[header + 5u], 0x00u);
+      EXPECT_EQ(bytes[header + 6u], 0x00u);
+      EXPECT_EQ(bytes[header + 7u], 0x80u);
+      EXPECT_EQ(bytes[header + 8u], 0x00u);
+    }
+    else {
+      EXPECT_EQ(le16(bytes, 8u), (uint16_t)GARC_ZIP_METHOD_ZSTD);
+    }
+
+    Roundtrip trip(bytes);
+    ASSERT_EQ(trip.open_result(), GARC_OK);
+    ASSERT_EQ(trip.walk_result(), GARC_END);
+    ASSERT_EQ(trip.members().size(), 3u);
+    EXPECT_EQ(trip.members()[0].method, (uint16_t)method);
+    EXPECT_EQ(trip.members()[0].data, file.data);
+    EXPECT_EQ(trip.members()[0].read_result, GARC_OK);
+    EXPECT_FALSE(trip.members()[0].used_zip64);
+    EXPECT_EQ(trip.members()[1].method, (uint16_t)GARC_ZIP_METHOD_STORED);
+    EXPECT_EQ(trip.members()[1].data, "");
+    EXPECT_EQ(trip.members()[1].read_result, GARC_OK);
+    EXPECT_EQ(trip.members()[2].method, (uint16_t)GARC_ZIP_METHOD_STORED);
+    EXPECT_EQ(trip.members()[2].link, link.link);
+    EXPECT_EQ(trip.members()[2].read_result, GARC_OK);
+  }
+}
+
+TEST(ZipWrite, ZstdUsesTheEncodeBoundAndLzmaUsesTheExpansionRatio) {
+  const uint64_t size = 1000u;
+  size_t zstd_bound = 0;
+  ASSERT_EQ(gcomp_encode_bound(
+                nullptr, "zstd", nullptr, (size_t)size, &zstd_bound),
+      GCOMP_OK);
+  EXPECT_EQ(garc_zip_compressed_ceiling(size, GARC_ZIP_METHOD_ZSTD),
+      (uint64_t)zstd_bound);
+  EXPECT_EQ(garc_zip_compressed_ceiling(size, GARC_ZIP_METHOD_DEFLATE),
+      garc_zip_deflate_bound(size));
+  EXPECT_EQ(garc_zip_compressed_ceiling(size, GARC_ZIP_METHOD_STORED), size);
+  EXPECT_EQ(garc_zip_compressed_ceiling(size, GARC_ZIP_METHOD_LZMA),
+      size * GCOMP_LZMA_MAX_EXPANSION_RATIO + 9u);
+  EXPECT_EQ(garc_zip_compressed_ceiling(UINT64_MAX, GARC_ZIP_METHOD_LZMA),
+      UINT64_MAX);
+  EXPECT_EQ(garc_zip_compressed_ceiling(UINT64_MAX, GARC_ZIP_METHOD_ZSTD),
+      UINT64_MAX);
+}
+
+TEST(ZipWrite, AnLzmaMemberWhoseCeilingCrossesFourGibGetsZip64) {
+  // With ratio 8192, size 524288 forces the ceiling past 0xFFFFFFFF. That is
+  // half a megabyte to write, which is the affordable way to pin that
+  // zip_needs_zip64 uses the LZMA ceiling rather than the declared size.
+  const uint64_t size
+      = (0xFFFFFFFFu / GCOMP_LZMA_MAX_EXPANSION_RATIO) + 1u;
+  EXPECT_GE(garc_zip_compressed_ceiling(size, GARC_ZIP_METHOD_LZMA),
+      0xFFFFFFFFu);
+  Built built(GARC_ZIP_SIZES_LOCAL, false, GARC_ZIP_METHOD_LZMA);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  Spec file;
+  file.name = "big";
+  file.data.assign((size_t)size, 'L');
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+  Roundtrip trip(built.bytes());
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.walk_result(), GARC_END);
+  ASSERT_EQ(trip.members().size(), 1u);
+  EXPECT_TRUE(trip.members()[0].used_zip64);
+  EXPECT_EQ(trip.members()[0].method, (uint16_t)GARC_ZIP_METHOD_LZMA);
+  EXPECT_EQ(trip.members()[0].data, file.data);
+}
+
+TEST(ZipWrite, CleartextZstdAndLzmaRaiseZip64EndRecordVersionToSixtyThree) {
+  // Local version 63 is already checked without zip64. The zip64 end record's
+  // version-needed is a separate field: needs_63 must lift it too, and AES must
+  // not.
+  const GARC_Zip_Method codecs[]
+      = {GARC_ZIP_METHOD_ZSTD, GARC_ZIP_METHOD_LZMA};
+  for (GARC_Zip_Method method : codecs) {
+    SCOPED_TRACE(garc_zip_method_string((uint16_t)method));
+    Built built(GARC_ZIP_SIZES_LOCAL, true, method);
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    Spec file;
+    file.name = "a";
+    file.data = "hello";
+    ASSERT_EQ(built.add(file), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+    const std::vector<uint8_t> bytes = built.bytes();
+    EXPECT_EQ(le16(bytes, 4u), 63u);
+    size_t eocd = bytes.size();
+    for (size_t i = 0; i + 4u <= bytes.size(); ++i) {
+      if (bytes[i] == 'P' && bytes[i + 1u] == 'K' && bytes[i + 2u] == 6
+          && bytes[i + 3u] == 6) {
+        eocd = i;
+        break;
+      }
+    }
+    ASSERT_LT(eocd + 16u, bytes.size());
+    EXPECT_EQ(le16(bytes, eocd + 14u), 63u);
+
+    const char password[] = "ghoti-password";
+    Built aes(GARC_ZIP_SIZES_LOCAL, true, method, password,
+        std::strlen(password));
+    ASSERT_EQ(aes.create_result(), GARC_OK);
+    ASSERT_EQ(aes.add(file), GARC_OK);
+    ASSERT_EQ(aes.finish(), GARC_OK);
+    const std::vector<uint8_t> aes_bytes = aes.bytes();
+    EXPECT_EQ(le16(aes_bytes, 4u), 51u);
+    size_t aes_eocd = aes_bytes.size();
+    for (size_t i = 0; i + 4u <= aes_bytes.size(); ++i) {
+      if (aes_bytes[i] == 'P' && aes_bytes[i + 1u] == 'K'
+          && aes_bytes[i + 2u] == 6 && aes_bytes[i + 3u] == 6) {
+        aes_eocd = i;
+        break;
+      }
+    }
+    ASSERT_LT(aes_eocd + 16u, aes_bytes.size());
+    EXPECT_EQ(le16(aes_bytes, aes_eocd + 14u), 51u);
+  }
+}
+
 TEST(ZipWrite, AMethodBesideStoredAndDeflateIsRefusedAtCreate) {
-  // Including the ones this library can read. Refused at create rather than at the
-  // first member, so that a caller who asked for zstd members is told before any
-  // bytes exist - and with GARC_ERR_UNSUPPORTED rather than GARC_ERR_INVALID,
-  // because the value is a real zip method and the answer is that this writer does
-  // not produce it.
-  const GARC_Zip_Method refused[] = {GARC_ZIP_METHOD_ZSTD,
-      GARC_ZIP_METHOD_DEFLATE64, GARC_ZIP_METHOD_BZIP2, GARC_ZIP_METHOD_LZMA,
-      GARC_ZIP_METHOD_XZ, GARC_ZIP_METHOD_AES, GARC_ZIP_METHOD_IMPLODED};
+  // The methods this writer does not produce, including ones it can read.
+  // Refused at create rather than at the first member, so the caller is told
+  // before any bytes exist - and with GARC_ERR_UNSUPPORTED rather than
+  // GARC_ERR_INVALID, because the value is a real zip method and the answer is
+  // that this writer does not produce it. Zstd and LZMA are accepted, and they
+  // are not in this list: naming them is how a caller asks for them.
+  const GARC_Zip_Method refused[] = {GARC_ZIP_METHOD_DEFLATE64,
+      GARC_ZIP_METHOD_BZIP2, GARC_ZIP_METHOD_XZ, GARC_ZIP_METHOD_PPMD,
+      GARC_ZIP_METHOD_AES, GARC_ZIP_METHOD_IMPLODED};
   for (GARC_Zip_Method method : refused) {
     SCOPED_TRACE(garc_zip_method_string((uint16_t)method));
     GARC_Sink * sink = nullptr;
@@ -1476,8 +1630,8 @@ size_t central_offset_of(const std::vector<uint8_t> & bytes) {
 }
 
 TEST(ZipWrite, APasswordRoundTripsStoredAndDeflatedMembers) {
-  const GARC_Zip_Method methods[]
-      = {GARC_ZIP_METHOD_STORED, GARC_ZIP_METHOD_DEFLATE};
+  const GARC_Zip_Method methods[] = {GARC_ZIP_METHOD_STORED,
+      GARC_ZIP_METHOD_DEFLATE, GARC_ZIP_METHOD_ZSTD, GARC_ZIP_METHOD_LZMA};
   for (GARC_Zip_Method method : methods) {
     SCOPED_TRACE(garc_zip_method_string((uint16_t)method));
     Spec file;
@@ -1511,6 +1665,9 @@ TEST(ZipWrite, APasswordRoundTripsStoredAndDeflatedMembers) {
     EXPECT_EQ(trip.members()[0].encryption, GARC_ZIP_ENCRYPTION_AES);
     EXPECT_EQ(trip.members()[0].crc, 0u);
     EXPECT_EQ(trip.members()[0].flags & 0x0001u, 0x0001u);
+    if (method == GARC_ZIP_METHOD_LZMA) {
+      EXPECT_EQ(trip.members()[0].flags & 0x0002u, 0x0002u);
+    }
   }
 }
 

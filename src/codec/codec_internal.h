@@ -73,6 +73,21 @@ GARC_Result garc_codec_result(gcomp_status_t status);
 typedef struct GARC_Member_Codec GARC_Member_Codec;
 
 /**
+ * Raw LZMA parameters for one zip method-14 member.
+ *
+ * Not a public type. The zip reader fills it from the member's header and
+ * ::garc_member_codec_create() writes the `lzma.*` keys. NULL on that call
+ * means the method is not LZMA.
+ */
+typedef struct {
+  int64_t lc;                 ///< Literal context bits.
+  int64_t lp;                 ///< Literal position bits.
+  int64_t pb;                 ///< Position bits.
+  uint64_t dict_size;         ///< Dictionary size, in bytes.
+  uint64_t uncompressed_size; ///< The zip member's declared size.
+} GARC_Member_Lzma;
+
+/**
  * Create a decoder over the next @p compressed_length bytes of @p inner.
  *
  * @p inner is borrowed and is read from wherever it is: the caller seeks to the
@@ -92,13 +107,18 @@ typedef struct GARC_Member_Codec GARC_Member_Codec;
  * @param method A `compress` method name, e.g. `"deflate"`.
  * @param compressed_length How many bytes of @p inner belong to this member.
  * @param max_output The declared uncompressed size, or 0 for no cap.
+ * @param lzma Raw LZMA parameters, or NULL when the method is not LZMA.
+ *   When set, the decoder is given `lzma.raw` and the five keys the zip
+ *   header would have carried. Not copied past this call: the options object
+ *   keeps the values.
  * @param out_codec Receives the decoder on success.
  * @return ::GARC_OK, ::GARC_ERR_UNSUPPORTED for a method `compress` does not
  *   have, ::GARC_ERR_INVALID, or ::GARC_ERR_OOM.
  */
 GARC_Result garc_member_codec_create(const GARC_Allocator * allocator,
     GARC_Stream * inner, const char * method, uint64_t compressed_length,
-    uint64_t max_output, GARC_Member_Codec ** out_codec);
+    uint64_t max_output, const GARC_Member_Lzma * lzma,
+    GARC_Member_Codec ** out_codec);
 
 /**
  * The stream the decoded bytes come out of.

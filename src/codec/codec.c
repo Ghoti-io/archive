@@ -309,7 +309,8 @@ struct GARC_Member_Codec {
 
 GARC_Result garc_member_codec_create(const GARC_Allocator * allocator,
     GARC_Stream * inner, const char * method, uint64_t compressed_length,
-    uint64_t max_output, GARC_Member_Codec ** out_codec) {
+    uint64_t max_output, const GARC_Member_Lzma * lzma,
+    GARC_Member_Codec ** out_codec) {
   if (!inner || !method || !out_codec) {
     return GARC_ERR_INVALID;
   }
@@ -331,16 +332,19 @@ GARC_Result garc_member_codec_create(const GARC_Allocator * allocator,
     return result;
   }
 
-  if (max_output) {
-    // The two arms below are `compress`'s allocator failing, not this library's,
+  if (max_output || lzma) {
+    // The arms below are `compress`'s allocator failing, not this library's,
     // so nothing here can provoke them - `make coverage` reports both as
     // unexecuted and they stay. A cap that silently failed to be set would leave
     // the decoder on its 512 MiB default, which is the wrong answer for a big
-    // member and an invisible one for a small one.
+    // member and an invisible one for a small one. LZMA needs the same object
+    // for its keys even when the cap is absent.
     if (gcomp_options_create(&codec->options) != GCOMP_OK) {
       garc_member_codec_destroy(codec);
       return GARC_ERR_OOM;
     }
+  }
+  if (max_output) {
     // The declared size, exactly. A member that expands past what its own
     // container said it holds is refused by the decoder, which is a tighter
     // answer than any ratio and needs no guess - and it arrives as
@@ -348,6 +352,28 @@ GARC_Result garc_member_codec_create(const GARC_Allocator * allocator,
     if (gcomp_options_set_uint64(
             codec->options, "limits.max_output_bytes", max_output)
         != GCOMP_OK) {
+      garc_member_codec_destroy(codec);
+      return GARC_ERR_OOM;
+    }
+  }
+  if (lzma) {
+    // Zip method 14 is raw LZMA. The header was consumed by the caller; these
+    // keys are what it said. uncompressed_size is the zip member's declared
+    // size, so an end marker after that many bytes is accepted and an earlier
+    // one is corrupt.
+    if (gcomp_options_set_bool(codec->options, "lzma.raw", 1) != GCOMP_OK
+        || gcomp_options_set_int64(codec->options, "lzma.lc", lzma->lc)
+            != GCOMP_OK
+        || gcomp_options_set_int64(codec->options, "lzma.lp", lzma->lp)
+            != GCOMP_OK
+        || gcomp_options_set_int64(codec->options, "lzma.pb", lzma->pb)
+            != GCOMP_OK
+        || gcomp_options_set_uint64(
+               codec->options, "lzma.dict_size", lzma->dict_size)
+            != GCOMP_OK
+        || gcomp_options_set_uint64(codec->options, "lzma.uncompressed_size",
+               lzma->uncompressed_size)
+            != GCOMP_OK) {
       garc_member_codec_destroy(codec);
       return GARC_ERR_OOM;
     }

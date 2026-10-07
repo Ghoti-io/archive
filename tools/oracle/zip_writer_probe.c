@@ -150,7 +150,7 @@ static char BIG[3000];
 static char NOISE[3000];
 
 /**
- * **Seven encodings of one member list**, which is what the gate compares against
+ * **Nine encodings of one member list**, which is what the gate compares against
  * each other and against the references.
  *
  * The encodings differ in nothing but their encoding, which is what makes "all
@@ -190,6 +190,14 @@ static const struct {
       "deflated members with the compressed size in a data descriptor"},
   {"aes.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_STORED, 1,
       "the stored members, encrypted with WinZip AES and the corpus password"},
+  // **One zstd archive and one LZMA archive.** unzip is not asked about either.
+  // 7-Zip is. Python is asked about the LZMA archive only when it accepts the
+  // bytes, and it is not asked about zstd. The same exception aes.zip already
+  // has, with that one difference.
+  {"zstd.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_ZSTD, 0,
+      "zstd members, method 93, a bare frame"},
+  {"lzma.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_LZMA, 0,
+      "LZMA members, method 14, version 0x0119, an end marker, bit 1 set"},
 };
 
 /** The password `aes.zip` is written and read with. The corpus uses the same one. */

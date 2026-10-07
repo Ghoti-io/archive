@@ -89,6 +89,7 @@
 #include <ghoti.io/archive/writer.h>
 #include <ghoti.io/compress/compress.h>
 #include <ghoti.io/compress/crc32.h>
+#include <ghoti.io/compress/lzma.h>
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
 #include <ghoti.io/cutil/allocator.h>
@@ -111,6 +112,14 @@
 /** General purpose flag bit 0: the member is encrypted. */
 #define ZIP_FLAG_ENCRYPTED 0x0001u
 
+/**
+ * General purpose flag bit 1: this LZMA member ends with an end marker.
+ *
+ * 7-Zip sets it, and the stream this writer produces has the marker. The
+ * reader does not require the bit; it trusts the header and the declared size.
+ */
+#define ZIP_FLAG_LZMA_EOS 0x0002u
+
 /** General purpose flag bit 3: the sizes are in a data descriptor. */
 #define ZIP_FLAG_DATA_DESCRIPTOR 0x0008u
 
@@ -129,9 +138,31 @@
 /**
  * `version needed` for a WinZip AES member.
  *
- * 5.1, whether or not the member also needs zip64. 51 is the higher of the two.
+ * 5.1, whether or not the member also needs zip64. 51 is the higher of the two,
+ * and it stays 51 when the real method is zstd or LZMA.
  */
 #define ZIP_VERSION_NEEDED_AES 51u
+
+/**
+ * `version needed` for a cleartext zstd or LZMA member.
+ *
+ * 6.3. Higher than zip64's 45, so a member that is both says 63.
+ */
+#define ZIP_VERSION_NEEDED_CODEC 63u
+
+/**
+ * The header in front of a method-14 stream: version, properties size, then
+ * five property bytes.
+ *
+ * Version `0x0119` is 7-Zip's. The properties are what a NULL options struct
+ * asks of `compress`: lc 3, lp 0, pb 2, dictionary `1 << 23`. The properties
+ * byte is `(pb * 5 + lp) * 9 + lc`.
+ */
+#define ZIP_LZMA_VERSION 0x0119u
+#define ZIP_LZMA_PROPS_SIZE 5u
+#define ZIP_LZMA_HEADER_SIZE 9u
+#define ZIP_LZMA_PROPS_BYTE 0x5Du
+#define ZIP_LZMA_DICT (1u << 23)
 
 /** 0x9901 is an 11-byte extra: header, then a 7-byte AE-2 payload. */
 #define ZIP_AES_EXTRA_SIZE 11u
@@ -158,15 +189,30 @@
 #define ZIP_DEFLATE_BUFFER 10240u
 
 /**
- * `compress`'s name for zip's method 8.
+ * `compress`'s name for a zip method this writer produces.
  *
- * Raw RFC 1951, which is what a zip member holds - not `"zlib"`, whose two-byte
- * header no zip reader expects. The reader's zip_codec_name() spells the same
- * string for the same reason, and the two are deliberately not shared: they are
- * the same word for opposite directions, and a reader that gained a method the
- * writer must not produce is the case that would break a shared table.
+ * Deliberately not the reader's zip_codec_name(). The two spell the same words
+ * for opposite directions, and a reader that gained a method the writer must
+ * not produce is the case that would break a shared table. Method 8 is
+ * `"deflate"`, raw RFC 1951, not `"zlib"`. Method 93 is a bare zstd frame.
+ * Method 14 is `"lzma"` with `lzma.raw`: the zip header is written here, and
+ * the encoder must not also write a `.lzma` header.
+ *
+ * @param method The method this member will be written with.
+ * @return The codec name, or NULL when the member is stored.
  */
-#define ZIP_DEFLATE_METHOD "deflate"
+static const char * zip_encoder_name(uint16_t method) {
+  switch (method) {
+    case GARC_ZIP_METHOD_DEFLATE:
+      return "deflate";
+    case GARC_ZIP_METHOD_ZSTD:
+      return "zstd";
+    case GARC_ZIP_METHOD_LZMA:
+      return "lzma";
+    default:
+      return NULL;
+  }
+}
 
 static const uint8_t ZIP_SIG_LOCAL[4] = {'P', 'K', 3, 4};
 static const uint8_t ZIP_SIG_CENTRAL[4] = {'P', 'K', 1, 2};
@@ -238,21 +284,48 @@ static GARC_Result zip_central_append(
   return GARC_OK;
 }
 
-uint64_t garc_zip_deflate_bound(uint64_t size) {
+/**
+ * `gcomp_encode_bound()` for @p method, saturating where it cannot answer.
+ *
+ * A size larger than a size_t, a bound larger than a size_t, and a method with
+ * no bound are one answer: the compressed size cannot be promised to fit a
+ * 32-bit field, so the member gets zip64 fields.
+ */
+static uint64_t zip_encode_bound(const char * method, uint64_t size) {
   size_t bound = 0;
   if (size > (uint64_t)(size_t)-1
-      || gcomp_encode_bound(gcomp_registry_default(), ZIP_DEFLATE_METHOD, NULL,
+      || gcomp_encode_bound(gcomp_registry_default(), method, NULL,
              (size_t)size, &bound)
           != GCOMP_OK) {
-    // **Saturating rather than refusing**, because the caller is asking a question
-    // whose safe answer is already known: a size with no bound to be had is a
-    // member whose compressed size cannot be promised to fit a 32-bit field, so it
-    // gets zip64 fields. Three ways to arrive here and one answer for all of them -
-    // a size larger than a size_t on a 32-bit host, a bound larger than a size_t,
-    // and a deflate that is somehow not registered.
     return UINT64_MAX;
   }
   return (uint64_t)bound;
+}
+
+uint64_t garc_zip_deflate_bound(uint64_t size) {
+  return zip_encode_bound("deflate", size);
+}
+
+uint64_t garc_zip_compressed_ceiling(uint64_t size, uint16_t method) {
+  if (method == GARC_ZIP_METHOD_DEFLATE) {
+    return garc_zip_deflate_bound(size);
+  }
+  if (method == GARC_ZIP_METHOD_ZSTD) {
+    return zip_encode_bound("zstd", size);
+  }
+  if (method == GARC_ZIP_METHOD_LZMA) {
+    // No encode bound. The ratio is the format's own ceiling, and the 9-byte
+    // header sits in front of that stream. AES framing is added by the caller.
+    if (size > UINT64_MAX / GCOMP_LZMA_MAX_EXPANSION_RATIO) {
+      return UINT64_MAX;
+    }
+    const uint64_t expanded = size * GCOMP_LZMA_MAX_EXPANSION_RATIO;
+    if (expanded > UINT64_MAX - (uint64_t)ZIP_LZMA_HEADER_SIZE) {
+      return UINT64_MAX;
+    }
+    return expanded + (uint64_t)ZIP_LZMA_HEADER_SIZE;
+  }
+  return size;
 }
 
 /**
@@ -262,7 +335,9 @@ uint64_t garc_zip_deflate_bound(uint64_t size) {
  * first and its layout depends on the answer. The compressed size is therefore not
  * available to decide on - so what stands in for it is not the declared size but
  * the largest the compressed size *can* be, which for a stored member is the
- * declared size and for a deflated one is ::garc_zip_deflate_bound of it.
+ * declared size and for a compressed one is ::garc_zip_compressed_ceiling of it.
+ * Zstd asks `gcomp_encode_bound()`. LZMA has none, so the ceiling is the
+ * expansion ratio times the declared size, plus the 9-byte header.
  *
  * **That is the whole of the answer, and it is an answer rather than a deferral.**
  * The alternative - decide on the declared size, and refuse when the compressed
@@ -288,8 +363,7 @@ uint64_t garc_zip_deflate_bound(uint64_t size) {
  */
 static int zip_needs_zip64(const GARC_Writer * writer, uint64_t size,
     uint16_t method, int encrypt) {
-  uint64_t largest = method == GARC_ZIP_METHOD_DEFLATE
-      ? garc_zip_deflate_bound(size) : size;
+  uint64_t largest = garc_zip_compressed_ceiling(size, method);
   if (encrypt) {
     const uint64_t framing
         = (uint64_t)garc_zip_aes_framing(writer->zip.aes_strength);
@@ -308,7 +382,9 @@ static int zip_needs_zip64(const GARC_Writer * writer, uint64_t size,
 /**
  * The version a reader needs for this member.
  *
- * AES is 51 even when the member is also zip64. Otherwise zip64 is 45 and a
+ * AES is 51 even when the real method is zstd or LZMA, and even when the
+ * member is also zip64. Cleartext zstd or LZMA is 63, which is higher than
+ * zip64's 45, so a member that is both says 63. Otherwise zip64 is 45 and a
  * stored or deflated member is 20.
  *
  * @param zip The member being written.
@@ -317,6 +393,10 @@ static int zip_needs_zip64(const GARC_Writer * writer, uint64_t size,
 static uint16_t zip_version_needed(const GARC_Zip_Write_State * zip) {
   if (zip->aes) {
     return ZIP_VERSION_NEEDED_AES;
+  }
+  if (zip->method == GARC_ZIP_METHOD_ZSTD
+      || zip->method == GARC_ZIP_METHOD_LZMA) {
+    return ZIP_VERSION_NEEDED_CODEC;
   }
   if (zip->used_zip64) {
     return ZIP_VERSION_NEEDED_ZIP64;
@@ -374,52 +454,76 @@ static GARC_Result zip_deflate_begin(GARC_Writer * writer) {
     return garc_codec_result(gcomp_encoder_reset(zip->encoder));
   }
 
+  // LZMA is raw: the 9-byte zip header is written here, and an unset
+  // uncompressed size is what makes the encoder emit the end marker. The other
+  // two methods take NULL and write the container `compress` already uses.
+  gcomp_options_t * options = NULL;
+  if (zip->method == GARC_ZIP_METHOD_LZMA) {
+    if (gcomp_options_create(&options) != GCOMP_OK) {
+      return GARC_ERR_OOM;
+    }
+    if (gcomp_options_set_bool(options, "lzma.raw", 1) != GCOMP_OK) {
+      gcomp_options_destroy(options);
+      return GARC_ERR_OOM;
+    }
+  }
+
   // The encoder before the buffer, which is the order with one unreachable line in
-  // it rather than three: deflate is always registered and always has an encoder,
-  // so the refusal below cannot be reached from a test, while the buffer's can be -
+  // it rather than three: these methods are registered and have encoders, so the
+  // refusal below cannot be reached from a test, while the buffer's can be -
   // and putting the allocation second means the refusal needs no cleanup.
-  const gcomp_status_t status = gcomp_encoder_create(
-      gcomp_registry_default(), ZIP_DEFLATE_METHOD, NULL, &zip->encoder);
+  const gcomp_status_t status = gcomp_encoder_create(gcomp_registry_default(),
+      zip_encoder_name(zip->method), options, &zip->encoder);
   if (status != GCOMP_OK) {
+    gcomp_options_destroy(options);
     return garc_codec_result(status);
   }
+  zip->encoder_options = options;
   zip->packed
       = (uint8_t *)gcu_allocator_malloc(writer->allocator, ZIP_DEFLATE_BUFFER);
   if (!zip->packed) {
     gcomp_encoder_destroy(zip->encoder);
     zip->encoder = NULL;
+    gcomp_options_destroy(zip->encoder_options);
+    zip->encoder_options = NULL;
     return GARC_ERR_OOM;
   }
   return GARC_OK;
 }
 
 /**
- * Pass whatever the encoder has produced to the sink, and count it.
+ * Pass compressed bytes to the sink, and count them.
+ *
+ * Used for encoder output and for the 9-byte LZMA header in front of it.
  *
  * @param writer The writer.
- * @param used How many bytes are in @ref GARC_Zip_Write_State.packed.
+ * @param bytes The bytes to write. May be @ref GARC_Zip_Write_State.packed
+ *   or a stack buffer; encrypted in place when the member is AES.
+ * @param used How many.
  * @return ::GARC_OK or what the sink refused with.
  */
-static GARC_Result zip_deflate_emit(GARC_Writer * writer, size_t used) {
+static GARC_Result zip_deflate_emit_bytes(
+    GARC_Writer * writer, uint8_t * bytes, size_t used) {
   GARC_Zip_Write_State * zip = &writer->zip;
   if (!used) {
     return GARC_OK;
   }
   GARC_Zip_Aes_Checkpoint saved;
   if (zip->aes_state) {
-    // In place: the packed buffer is ciphertext from here on, and the HMAC
-    // covers that ciphertext rather than the deflate output. The checkpoint
-    // is the state from before this chunk, so a failed sink write can be
-    // retried on the same counter.
+    // In place: the buffer is ciphertext from here on, and the HMAC covers
+    // that ciphertext rather than the encoder output. The checkpoint is the
+    // state from before this chunk, so a failed sink write can be retried on
+    // the same counter. The LZMA header takes the same path: it is part of
+    // the compressed size, and it is encrypted when the member is.
     garc_zip_aes_checkpoint(zip->aes_state, &saved);
     const GARC_Result encrypted
-        = garc_zip_aes_encrypt(zip->aes_state, zip->packed, zip->packed, used);
+        = garc_zip_aes_encrypt(zip->aes_state, bytes, bytes, used);
     if (encrypted != GARC_OK) {
       garc_zip_aes_restore(zip->aes_state, &saved);
       return encrypted;
     }
   }
-  const GARC_Result result = garc_sink_write(writer->sink, zip->packed, used);
+  const GARC_Result result = garc_sink_write(writer->sink, bytes, used);
   if (result != GARC_OK) {
     if (zip->aes_state) {
       garc_zip_aes_restore(zip->aes_state, &saved);
@@ -434,7 +538,7 @@ static GARC_Result zip_deflate_emit(GARC_Writer * writer, size_t used) {
 }
 
 /**
- * Close this member's deflate stream, writing its final block.
+ * Close this member's compressed stream, writing its final block.
  *
  * @param writer The writer.
  * @return ::GARC_OK, or what the encoder or the sink refused with.
@@ -444,7 +548,8 @@ static GARC_Result zip_deflate_end(GARC_Writer * writer) {
   for (;;) {
     gcomp_buffer_t out = {zip->packed, ZIP_DEFLATE_BUFFER, 0};
     const gcomp_status_t status = gcomp_encoder_finish(zip->encoder, &out);
-    const GARC_Result result = zip_deflate_emit(writer, out.used);
+    const GARC_Result result
+        = zip_deflate_emit_bytes(writer, zip->packed, out.used);
     if (result != GARC_OK) {
       return result;
     }
@@ -464,6 +569,25 @@ static GARC_Result zip_deflate_end(GARC_Writer * writer) {
       return GARC_ERR_INTERNAL;
     }
   }
+}
+
+/**
+ * Write the 9-byte header a method-14 member carries in front of raw LZMA.
+ *
+ * Version, properties size, then the five bytes the encoder's defaults
+ * produce. Counted in the compressed size, and encrypted when the member is,
+ * because it is part of the compressed data rather than of the local header.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK, or what the sink or the cipher refused with.
+ */
+static GARC_Result zip_write_lzma_header(GARC_Writer * writer) {
+  uint8_t header[ZIP_LZMA_HEADER_SIZE];
+  garc_zip_put16(header, (uint16_t)ZIP_LZMA_VERSION);
+  garc_zip_put16(header + 2u, (uint16_t)ZIP_LZMA_PROPS_SIZE);
+  header[4] = (uint8_t)ZIP_LZMA_PROPS_BYTE;
+  garc_zip_put32(header + 5u, ZIP_LZMA_DICT);
+  return zip_deflate_emit_bytes(writer, header, sizeof(header));
 }
 
 GARC_Result garc_zip_write_member(
@@ -536,17 +660,18 @@ GARC_Result garc_zip_write_member(
   // whatever the options say - one with no data at all, and a symlink - and
   // writer.h argues both. A directory reaches the first without ever having had
   // the option.
-  zip->method
-      = writer->options.zip_method == GARC_ZIP_METHOD_DEFLATE && size
-          && member->type != GARC_MEMBER_SYMLINK
-      ? GARC_ZIP_METHOD_DEFLATE : GARC_ZIP_METHOD_STORED;
+  const uint16_t asked = writer->options.zip_method;
+  const int compresses = asked == GARC_ZIP_METHOD_DEFLATE
+      || asked == GARC_ZIP_METHOD_ZSTD || asked == GARC_ZIP_METHOD_LZMA;
+  zip->method = compresses && size && member->type != GARC_MEMBER_SYMLINK
+      ? asked : (uint16_t)GARC_ZIP_METHOD_STORED;
   // A directory has no data. A file, an empty file and a symlink do, and the
   // real method above is what 0x9901 records even when the header says 99.
   zip->aes = writer->zip.have_password
       && member->type != GARC_MEMBER_DIRECTORY;
   zip->used_zip64 = zip_needs_zip64(writer, size, zip->method, zip->aes);
   zip->zip64_offset = 0;
-  if (zip->method == GARC_ZIP_METHOD_DEFLATE) {
+  if (zip->method != GARC_ZIP_METHOD_STORED) {
     // Before the header, so that a member refused for want of an encoder is
     // refused with nothing written - the same rule the name checks above follow.
     const GARC_Result ready = zip_deflate_begin(writer);
@@ -558,6 +683,16 @@ GARC_Result garc_zip_write_member(
   zip->flags = 0;
   if (zip->aes) {
     zip->flags |= ZIP_FLAG_ENCRYPTED;
+  }
+  if (zip->method == GARC_ZIP_METHOD_LZMA) {
+    zip->flags |= ZIP_FLAG_LZMA_EOS;
+  }
+  if (!zip->aes && (zip->method == GARC_ZIP_METHOD_ZSTD
+                       || zip->method == GARC_ZIP_METHOD_LZMA)) {
+    // The zip64 end record's version is the highest a member asked for.
+    // Cleartext zstd and LZMA ask for 63. AES stays 51 on the member, and
+    // that member does not raise this.
+    zip->needs_63 = 1;
   }
   if (zip_name_needs_utf8_flag(member->name, member->name_length)) {
     zip->flags |= ZIP_FLAG_UTF8;
@@ -762,6 +897,13 @@ GARC_Result garc_zip_write_member(
     zip->compressed += (uint64_t)prefix_len;
   }
 
+  if (zip->method == GARC_ZIP_METHOD_LZMA) {
+    result = zip_write_lzma_header(writer);
+    if (result != GARC_OK) {
+      return result;
+    }
+  }
+
   writer->data_remaining = size;
   writer->data_padding = 0; // zip pads nothing. Ever.
 
@@ -835,7 +977,7 @@ GARC_Result garc_zip_write_data(
     return GARC_OK;
   }
 
-  // Deflate. The loop drains the encoder rather than assuming one pass empties it,
+  // Compressed. The loop drains the encoder rather than assuming one pass empties it,
   // because the output of a block can exceed the buffer on data that does not
   // compress - which is the case the buffer is sized for rather than against.
   gcomp_buffer_t in = {data, size, 0};
@@ -847,7 +989,8 @@ GARC_Result garc_zip_write_data(
     if (status != GCOMP_OK) {
       return garc_codec_result(status);
     }
-    const GARC_Result result = zip_deflate_emit(writer, out.used);
+    const GARC_Result result
+        = zip_deflate_emit_bytes(writer, zip->packed, out.used);
     if (result != GARC_OK) {
       return result;
     }
@@ -974,7 +1117,7 @@ GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
   // is the whole reason this is a hook and not a subtraction: the final block is
   // part of the compressed size, and the descriptor or the patched header that
   // carries that size comes after it.
-  if (zip->method == GARC_ZIP_METHOD_DEFLATE) {
+  if (zip->method != GARC_ZIP_METHOD_STORED) {
     const GARC_Result ended = zip_deflate_end(writer);
     if (ended != GARC_OK) {
       return ended;
@@ -1084,8 +1227,14 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
     // bytes of signature and eight of the field are not in it.
     garc_zip_put64(record + 4u, GARC_ZIP_ZIP64_EOCD_SIZE - 12u);
     garc_zip_put16(record + 12u, ZIP_VERSION_MADE_BY);
-    garc_zip_put16(record + 14u, zip->wrote_aes ? ZIP_VERSION_NEEDED_AES
-                                               : ZIP_VERSION_NEEDED_ZIP64);
+    uint16_t end_version = ZIP_VERSION_NEEDED_ZIP64;
+    if (zip->wrote_aes && end_version < ZIP_VERSION_NEEDED_AES) {
+      end_version = ZIP_VERSION_NEEDED_AES;
+    }
+    if (zip->needs_63 && end_version < ZIP_VERSION_NEEDED_CODEC) {
+      end_version = ZIP_VERSION_NEEDED_CODEC;
+    }
+    garc_zip_put16(record + 14u, end_version);
     garc_zip_put32(record + 16u, 0u); // This disk.
     garc_zip_put32(record + 20u, 0u); // The disk the directory starts on.
     garc_zip_put64(record + 24u, zip->entries);
@@ -1134,6 +1283,8 @@ void garc_zip_write_release(GARC_Writer * writer) {
   // garc_member_codec_destroy() gives the reason for: a teardown that reads the
   // buffer would read a freed one the other way round.
   gcomp_encoder_destroy(writer->zip.encoder);
+  gcomp_options_destroy(writer->zip.encoder_options);
+  writer->zip.encoder_options = NULL;
   gcu_allocator_free(writer->allocator, writer->zip.packed);
   garc_zip_aes_destroy(writer->zip.aes_state);
   writer->zip.aes_state = NULL;

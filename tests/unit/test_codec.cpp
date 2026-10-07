@@ -2,7 +2,9 @@
  * @file
  *
  * A codec in front of a stream, and behind a sink: `tar.gz`, `tar.zst`,
- * `tar.lz4`, `tar` through zlib.
+ * `tar.lz4`, `tar.lzma`, `tar` through zlib. `"lzma"` is the `.lzma`
+ * container. Zip method 14 is that codec with `lzma.raw`, and it is not
+ * what these tests compose.
  *
  * Four things these tests are careful about, and each is a way this pair could
  * pass while being wrong.
@@ -54,7 +56,7 @@ using garctest::FailingAllocator;
 namespace {
 
 /** Every codec this library is expected to compose with. */
-const char * const kMethods[] = {"gzip", "zstd", "lz4", "zlib"};
+const char * const kMethods[] = {"gzip", "zstd", "lz4", "zlib", "lzma"};
 
 /** One member's worth of content, repeated to @p size bytes. */
 std::string filler(size_t size, char seed) {
@@ -918,7 +920,7 @@ TEST(MemberCodec, ABoundedDecoderStopsAtItsLength) {
   GARC_Member_Codec * codec = nullptr;
   ASSERT_EQ(GARC_OK,
       garc_member_codec_create(nullptr, inner, "deflate", first.size(), 400u,
-          &codec));
+          nullptr, &codec));
   std::string out;
   char buffer[64];
   size_t got = 0;
@@ -947,7 +949,7 @@ TEST(MemberCodec, TheOutputCapIsTheDeclaredSize) {
   GARC_Member_Codec * codec = nullptr;
   ASSERT_EQ(GARC_OK,
       garc_member_codec_create(nullptr, inner, "deflate", packed.size(), 16u,
-          &codec));
+          nullptr, &codec));
   std::string out;
   char buffer[256];
   size_t got = 0;
@@ -972,7 +974,7 @@ TEST(MemberCodec, AMethodCompressDoesNotHaveIsRefused) {
   GARC_Member_Codec * codec = nullptr;
   EXPECT_EQ(GARC_ERR_UNSUPPORTED,
       garc_member_codec_create(nullptr, inner, "nosuchmethod", bytes.size(),
-          16u, &codec));
+          16u, nullptr, &codec));
   EXPECT_EQ(nullptr, codec);
   garc_stream_destroy(inner);
 }
@@ -982,11 +984,14 @@ TEST(MemberCodec, TheArgumentsAreChecked) {
   GARC_Stream * inner = nullptr;
   ASSERT_EQ(GARC_OK, garc_stream_create_memory("x", 1u, &inner));
   EXPECT_EQ(GARC_ERR_INVALID,
-      garc_member_codec_create(nullptr, nullptr, "deflate", 1u, 1u, &codec));
+      garc_member_codec_create(nullptr, nullptr, "deflate", 1u, 1u, nullptr,
+          &codec));
   EXPECT_EQ(GARC_ERR_INVALID,
-      garc_member_codec_create(nullptr, inner, nullptr, 1u, 1u, &codec));
+      garc_member_codec_create(nullptr, inner, nullptr, 1u, 1u, nullptr,
+          &codec));
   EXPECT_EQ(GARC_ERR_INVALID,
-      garc_member_codec_create(nullptr, inner, "deflate", 1u, 1u, nullptr));
+      garc_member_codec_create(nullptr, inner, "deflate", 1u, 1u, nullptr,
+          nullptr));
   // And the accessors on nothing, which is what a caller holding a failed
   // create would have.
   EXPECT_EQ(nullptr, garc_member_codec_stream(nullptr));
@@ -1006,7 +1011,7 @@ TEST(MemberCodec, NoCapMeansNoOptions) {
   GARC_Member_Codec * codec = nullptr;
   ASSERT_EQ(GARC_OK,
       garc_member_codec_create(nullptr, inner, "deflate", packed.size(), 0u,
-          &codec));
+          nullptr, &codec));
   std::string out;
   char buffer[256];
   size_t got = 0;
