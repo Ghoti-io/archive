@@ -44,11 +44,13 @@
  *
  * **And nothing is compressed unless you ask.** The default method is stored,
  * which is also the zero of the option, so a caller who memset their options gets
- * what NULL would have given them. `--deflate` is the one assignment that changes
- * it, and the report at the end prints both totals so the difference is visible
- * rather than asserted.
+ * what NULL would have given them. `--deflate`, `--bzip2`, `--zstd` or `--lzma`
+ * is the one assignment that changes it, and the report at the end prints both
+ * totals so the difference is visible rather than asserted. Empty members and
+ * symlinks stay stored whatever was asked for.
  *
- * Usage: zip_write <path.zip> [--stream] [--deflate]
+ * Usage: zip_write <path.zip> [--stream]
+ *            [--deflate | --bzip2 | --zstd | --lzma]
  */
 
 #include <inttypes.h>
@@ -58,6 +60,10 @@
 #include <string.h>
 
 #include <ghoti.io/archive/archive.h>
+
+static const char USAGE[]
+    = "usage: %s <path.zip> [--stream] "
+      "[--deflate | --bzip2 | --zstd | --lzma]\n";
 
 static GARC_Result file_write(void * ctx, const void * buffer, size_t size) {
   FILE * file = (FILE *)ctx;
@@ -123,26 +129,52 @@ static const Entry ENTRIES[] = {
  *
  * @param argc Argument count.
  * @param argv `argv[1]` is the archive to write; `--stream` forces the
- *   data-descriptor form.
+ *   data-descriptor form; one of `--deflate`, `--bzip2`, `--zstd` or `--lzma`
+ *   selects the compression method.
  * @return 0 on success, 1 on any failure, 2 on a usage error.
  */
 int main(int argc, char ** argv) {
   int stream = 0;
-  int deflate = 0;
+  GARC_Zip_Method method = GARC_ZIP_METHOD_STORED;
+  int method_named = 0;
   for (int i = 2; i < argc; ++i) {
+    GARC_Zip_Method asked = GARC_ZIP_METHOD_STORED;
+    int is_method = 0;
     if (strcmp(argv[i], "--stream") == 0) {
       stream = 1;
     }
     else if (strcmp(argv[i], "--deflate") == 0) {
-      deflate = 1;
+      asked = GARC_ZIP_METHOD_DEFLATE;
+      is_method = 1;
+    }
+    else if (strcmp(argv[i], "--bzip2") == 0) {
+      asked = GARC_ZIP_METHOD_BZIP2;
+      is_method = 1;
+    }
+    else if (strcmp(argv[i], "--zstd") == 0) {
+      asked = GARC_ZIP_METHOD_ZSTD;
+      is_method = 1;
+    }
+    else if (strcmp(argv[i], "--lzma") == 0) {
+      asked = GARC_ZIP_METHOD_LZMA;
+      is_method = 1;
     }
     else {
-      fprintf(stderr, "usage: %s <path.zip> [--stream] [--deflate]\n", argv[0]);
+      fprintf(stderr, USAGE, argv[0]);
       return 2;
+    }
+    if (is_method) {
+      if (method_named) {
+        fprintf(stderr, "%s: only one of --deflate, --bzip2, --zstd, --lzma\n",
+            argv[0]);
+        return 2;
+      }
+      method = asked;
+      method_named = 1;
     }
   }
   if (argc < 2) {
-    fprintf(stderr, "usage: %s <path.zip> [--stream] [--deflate]\n", argv[0]);
+    fprintf(stderr, USAGE, argv[0]);
     return 2;
   }
 
@@ -177,9 +209,7 @@ int main(int argc, char ** argv) {
   // form matters to them.
   GARC_Writer_Options options;
   garc_writer_options_default(&options);
-  if (deflate) {
-    options.zip_method = GARC_ZIP_METHOD_DEFLATE;
-  }
+  options.zip_method = method;
   result = garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer);
   if (result != GARC_OK) {
     fprintf(stderr, "writer: %s\n", garc_result_string(result));
@@ -247,7 +277,7 @@ int main(int argc, char ** argv) {
 
   printf("%s: %" PRIu64 " members, %" PRIu64 " bytes, method %s, sizes in "
       "the %s\n",
-      argv[1], members, written, deflate ? "deflate" : "stored",
+      argv[1], members, written, garc_zip_method_string((uint16_t)method),
       stream ? "data descriptors (the sink could not go back)"
              : "local headers (the sink could be patched)");
   return 0;
