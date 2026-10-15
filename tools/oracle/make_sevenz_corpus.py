@@ -30,6 +30,8 @@ Each archive is written to vary one thing the reader has to get right:
   - the header: encoded (the default) or plain, which are two code paths;
   - a symlink, which 7z stores as a Unix mode in the attributes and its target
     as the file's data;
+  - the other six branch filters (PowerPC, IA-64, ARM, ARM Thumb, SPARC,
+    RISC-V), over one file each;
   - BCJ2, which this library refuses, so that the refusal is tested against
     an archive that really needs it.
 
@@ -126,6 +128,16 @@ ARCHIVES = [
 ]
 
 
+# The branch filters beyond x86 and ARM64, each over program.bin alone: they exist
+# to put every filter id the reader maps in front of a real decoder, and the
+# file's bytes are the same whatever the filter, so a reading that goes wrong
+# shows as a wrong CRC.
+FILTERS = [
+    ("ppc.7z", "PPC"), ("ia64.7z", "IA64"), ("arm.7z", "ARM"),
+    ("armt.7z", "ARMT"), ("sparc.7z", "SPARC"), ("riscv.7z", "RISCV"),
+]
+
+
 def generate(destination):
     tree = os.path.join(destination, "_tree")
     if os.path.exists(tree):
@@ -141,6 +153,13 @@ def generate(destination):
             os.unlink(out)
         run(["7z", "a", "-t7z", "-mmt=1", "-bso0", "-bsp0", "-y"] + flags
                 + [out] + names,
+            cwd=tree, what=name)
+    for name, flt in FILTERS:
+        out = os.path.join(destination, name)
+        if os.path.exists(out):
+            os.unlink(out)
+        run(["7z", "a", "-t7z", "-mmt=1", "-bso0", "-bsp0", "-y",
+                "-mf=" + flt, out, "program.bin"],
             cwd=tree, what=name)
     # Symlinks are stored as links only with -snl.
     run(["7z", "a", "-t7z", "-mmt=1", "-bso0", "-bsp0", "-y", "-snl",

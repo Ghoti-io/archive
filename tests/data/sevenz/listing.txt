@@ -1,3 +1,13 @@
+### arm.7z
+Method = LZMA2:24k ARM
+Solid = -
+Blocks = 1
+Path = program.bin
+Size = 20000
+Packed Size = 18528
+Attributes = A -rwxr-xr-x
+CRC = 810CD7D9
+Method = ARM LZMA2:24k
 ### arm64.7z
 Method = ARM64 LZMA2:48k
 Solid = +
@@ -74,6 +84,16 @@ Packed Size =
 Attributes = A -rw-r--r--
 CRC = 6C14D048
 Method = ARM64 LZMA2:48k
+### armt.7z
+Method = LZMA2:24k ARMT
+Solid = -
+Blocks = 1
+Path = program.bin
+Size = 20000
+Packed Size = 18523
+Attributes = A -rwxr-xr-x
+CRC = 810CD7D9
+Method = ARMT LZMA2:24k
 ### basic.7z
 Method = LZMA2:48k
 Solid = +
@@ -606,6 +626,16 @@ Packed Size =
 Attributes = A -rw-r--r--
 CRC = 6C14D048
 Method = Delta:4 LZMA2:48k
+### ia64.7z
+Method = LZMA2:24k IA64
+Solid = -
+Blocks = 1
+Path = program.bin
+Size = 20000
+Packed Size = 18533
+Attributes = A -rwxr-xr-x
+CRC = 810CD7D9
+Method = IA64 LZMA2:24k
 ### lzma.7z
 Method = LZMA:48k
 Solid = +
@@ -834,6 +864,36 @@ Packed Size =
 Attributes = A -rw-r--r--
 CRC = 6C14D048
 Method = LZMA2:48k
+### ppc.7z
+Method = LZMA2:24k PPC
+Solid = -
+Blocks = 1
+Path = program.bin
+Size = 20000
+Packed Size = 18511
+Attributes = A -rwxr-xr-x
+CRC = 810CD7D9
+Method = PPC LZMA2:24k
+### riscv.7z
+Method = RISCV LZMA2:24k
+Solid = -
+Blocks = 1
+Path = program.bin
+Size = 20000
+Packed Size = 18523
+Attributes = A -rwxr-xr-x
+CRC = 810CD7D9
+Method = RISCV LZMA2:24k
+### sparc.7z
+Method = LZMA2:24k SPARC
+Solid = -
+Blocks = 1
+Path = program.bin
+Size = 20000
+Packed Size = 18526
+Attributes = A -rwxr-xr-x
+CRC = 810CD7D9
+Method = SPARC LZMA2:24k
 ### symlink.7z
 Method = LZMA2:12
 Solid = +

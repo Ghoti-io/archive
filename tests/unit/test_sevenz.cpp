@@ -25,6 +25,7 @@
 
 #include <gtest/gtest.h>
 
+#include "failing_allocator.h"
 #include "sevenz_builder.h"
 #include "tar_manifest.h"
 #include "test_helpers.h"
@@ -199,6 +200,48 @@ TEST(SevenZ, EveryReadableArchiveHoldsExactlyWhatWasArchived) {
       }
     }
   }
+}
+
+TEST(SevenZ, EveryBranchFilterTheReaderMapsDecodesARealArchive) {
+  // program.bin alone, through each filter 7-Zip 25.01 offers beyond x86 and
+  // ARM64. A wrong mapping from id to architecture decodes to wrong bytes, and
+  // the CRC says so.
+  const uint32_t program_crc = [] {
+    for (const Row & row : manifest()) {
+      if (row.name == "program.bin") {
+        return row.crc;
+      }
+    }
+    return 0u;
+  }();
+  ASSERT_NE(program_crc, 0u);
+  for (const char * name : {"ppc.7z", "ia64.7z", "arm.7z", "armt.7z",
+           "sparc.7z", "riscv.7z"}) {
+    SCOPED_TRACE(name);
+    Opened opened(fixture(name));
+    ASSERT_EQ(opened.open_result(), GARC_OK);
+    std::map<std::string, Seen> seen;
+    ASSERT_EQ(walk(opened.archive(), &seen), GARC_END);
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen["program.bin"].status, GARC_OK);
+    EXPECT_EQ(garctest::sz_crc(seen["program.bin"].data), program_crc);
+  }
+}
+
+TEST(SevenZ, TheDumpNamesTheFoldersAndEntries) {
+  Opened opened(fixture("nonsolid.7z"));
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  char* text = nullptr;
+  size_t length = 0;
+  FILE * out = open_memstream(&text, &length);
+  ASSERT_NE(out, nullptr);
+  garc_archive_dump(opened.archive(), out);
+  fclose(out);
+  const std::string dump(text, length);
+  free(text);
+  EXPECT_NE(dump.find("format=7z"), std::string::npos);
+  EXPECT_NE(dump.find("7z: "), std::string::npos);
+  EXPECT_NE(dump.find("folders"), std::string::npos);
 }
 
 TEST(SevenZ, TheFormatHasAName) {
@@ -601,6 +644,231 @@ TEST(SevenZBuilt, AnOverlongPropertyLengthIsCorruptNotAnOverRead) {
       + header.substr(at + 3);
   Opened opened(SzBuilder::assemble(builder.packed(), bad));
   EXPECT_EQ(opened.open_result(), GARC_ERR_CORRUPT);
+}
+
+//-----------------------------------------------------------------------------
+// Corruption and allocation failure, swept
+//-----------------------------------------------------------------------------
+
+namespace {
+
+/** Recompute the two header CRCs of an archive whose header was edited. */
+std::vector<uint8_t> refix(std::vector<uint8_t> bytes) {
+  auto le64 = [&](size_t at) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) {
+      v = (v << 8) | bytes[at + i];
+    }
+    return v;
+  };
+  const uint64_t offset = le64(12);
+  const uint64_t length = le64(20);
+  if (32 + offset + length <= bytes.size()) {
+    const uint32_t crc = garctest::sz_crc(std::string(
+        bytes.begin() + 32 + offset, bytes.begin() + 32 + offset + length));
+    for (int i = 0; i < 4; ++i) {
+      bytes[28 + i] = static_cast<uint8_t>(crc >> (8 * i));
+    }
+  }
+  const uint32_t start = garctest::sz_crc(
+      std::string(bytes.begin() + 12, bytes.begin() + 32));
+  for (int i = 0; i < 4; ++i) {
+    bytes[8 + i] = static_cast<uint8_t>(start >> (8 * i));
+  }
+  return bytes;
+}
+
+bool documented(GARC_Result result) {
+  return result == GARC_OK || result == GARC_END || result == GARC_ERR_CORRUPT
+      || result == GARC_ERR_UNSUPPORTED || result == GARC_ERR_OOM
+      || result == GARC_ERR_LIMIT_EXTRA_BYTES || result == GARC_ERR_IO
+      || result == GARC_ERR_LIMIT_CODEC_BYTES
+      || result == GARC_ERR_LIMIT_NAME_BYTES
+      || result == GARC_ERR_LIMIT_MEMBERS
+      || result == GARC_ERR_LIMIT_MEMBER_BYTES
+      || result == GARC_ERR_LIMIT_TOTAL_BYTES;
+}
+
+/** Walk and read all of an archive; returns the first status that is not OK. */
+GARC_Result walk_all(const std::vector<uint8_t> & bytes) {
+  Opened opened(bytes);
+  if (opened.open_result() != GARC_OK) {
+    return opened.open_result();
+  }
+  std::map<std::string, Seen> seen;
+  const GARC_Result result = walk(opened.archive(), &seen);
+  for (const auto & one : seen) {
+    if (!documented(one.second.status)) {
+      return GARC_ERR_INTERNAL;
+    }
+  }
+  return result;
+}
+
+void sweep_header(const std::vector<uint8_t> & whole) {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+  for (int i = 7; i >= 0; --i) {
+    offset = (offset << 8) | whole[12 + i];
+    length = (length << 8) | whole[20 + i];
+  }
+  ASSERT_LE(32 + offset + length, whole.size());
+  size_t reached = 0;
+  for (uint64_t at = 0; at < length; ++at) {
+    for (uint8_t value : {uint8_t(0x00), uint8_t(0x01), uint8_t(0x7F),
+             uint8_t(0xFF)}) {
+      std::vector<uint8_t> mutated = whole;
+      uint8_t & byte = mutated[32 + offset + at];
+      if (byte == value) {
+        continue;
+      }
+      byte = value;
+      const GARC_Result result = walk_all(refix(mutated));
+      EXPECT_TRUE(documented(result)) << "byte " << at << " -> "
+          << int(value) << ": " << garc_result_string(result);
+      reached += result != GARC_END;
+    }
+  }
+  // Almost every edit to a header changes its meaning, and a sweep that
+  // refused none of them would not be reaching the parser.
+  EXPECT_GT(reached * 4, size_t(length));
+}
+
+}  // namespace
+
+TEST(SevenZSweep, EveryByteOfAPlainHeaderEditedIsAnswered) {
+  sweep_header(fixture("plainhdr.7z"));
+  sweep_header(fixture("symlink.7z"));
+  sweep_header(fixture("nonsolid.7z"));
+}
+
+TEST(SevenZSweep, EveryByteOfABuiltHeaderEditedIsAnswered) {
+  SzBuilder builder = control();
+  builder.add("t", "x");
+  builder.last().has_mtime = true;
+  builder.last().mtime = 130000000000000000ull;
+  builder.last().has_attr = true;
+  builder.last().attr = 0x8000u | (0100644u << 16);
+  const std::string built = builder.build();
+  sweep_header(std::vector<uint8_t>(built.begin(), built.end()));
+}
+
+TEST(SevenZSweep, EveryAllocationFailureInOpenAndWalkIsAnswered) {
+  for (const char * name : {"basic.7z", "plainhdr.7z", "symlink.7z",
+           "nonsolid.7z", "bcj.7z", "delta.7z", "copy.7z"}) {
+    SCOPED_TRACE(name);
+    const std::vector<uint8_t> bytes = fixture(name);
+    bool finished = false;
+    for (size_t budget = 0; budget < 4000u && !finished; ++budget) {
+      garctest::FailingAllocator allocator(budget);
+      GARC_Stream * stream = nullptr;
+      ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream),
+          GARC_OK);
+      GARC_Archive * archive = nullptr;
+      GARC_Result result = garc_open_with_allocator(
+          stream, nullptr, allocator.get(), &archive);
+      if (result == GARC_OK) {
+        const GARC_Member * member = nullptr;
+        while ((result = garc_next(archive, &member)) == GARC_OK) {
+          char buffer[4096];
+          size_t got = 0;
+          GARC_Result read;
+          while ((read = garc_read_member(archive, buffer, sizeof(buffer),
+                      &got)) == GARC_OK
+              && got) {
+          }
+          if (read != GARC_OK) {
+            result = read;
+            break;
+          }
+        }
+      }
+      EXPECT_TRUE(result == GARC_END || result == GARC_ERR_OOM)
+          << garc_result_string(result);
+      finished = result == GARC_END;
+      garc_close(archive);
+      garc_stream_destroy(stream);
+      allocator.stop_failing();
+      EXPECT_EQ(allocator.live(), 0u) << "budget " << budget;
+    }
+    EXPECT_TRUE(finished) << "never reached a clean walk";
+  }
+}
+
+TEST(SevenZBuilt, UnixTypeBitsInTheAttributeWordSelectTheMemberType) {
+  const struct {
+    uint32_t mode;
+    GARC_Member_Type type;
+  } cases[] = {
+    {0010644u, GARC_MEMBER_FIFO}, {0020644u, GARC_MEMBER_CHAR_DEVICE},
+    {0060644u, GARC_MEMBER_BLOCK_DEVICE}, {0140644u, GARC_MEMBER_OTHER},
+    {0100644u, GARC_MEMBER_FILE}, {0000644u, GARC_MEMBER_FILE},
+  };
+  for (const auto & one : cases) {
+    SCOPED_TRACE(one.mode);
+    SzBuilder builder;
+    builder.add("x", "");
+    builder.last().has_attr = true;
+    builder.last().attr = 0x8000u | (one.mode << 16);
+    Opened opened(builder.build());
+    ASSERT_EQ(opened.open_result(), GARC_OK);
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(garc_next(opened.archive(), &member), GARC_OK);
+    EXPECT_EQ(member->type, one.type);
+  }
+}
+
+TEST(SevenZBuilt, ArchivePropertiesAreSkippedByTheirStatedSize) {
+  SzBuilder builder = control();
+  std::string header = builder.header();
+  // 01 (Header) then 02 (ArchiveProperties): type 0x42, size 3, three bytes, end.
+  header.insert(1, std::string("\x02\x42\x03xyz\x00", 7));
+  Opened opened(SzBuilder::assemble(builder.packed(), header));
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  std::map<std::string, Seen> seen;
+  EXPECT_EQ(walk(opened.archive(), &seen), GARC_END);
+  EXPECT_EQ(seen["a.txt"].data, "alpha");
+}
+
+TEST(SevenZBuilt, AnAdditionalStreamsInfoIsParsedAndIgnored) {
+  SzBuilder builder = control();
+  std::string header = builder.header();
+  // An empty StreamsInfo (just its End) after the Header id.
+  header.insert(1, std::string("\x03\x00", 2));
+  Opened opened(SzBuilder::assemble(builder.packed(), header));
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  std::map<std::string, Seen> seen;
+  EXPECT_EQ(walk(opened.archive(), &seen), GARC_END);
+}
+
+TEST(SevenZBuilt, ADirectoryThatClaimsBytesIsCorrupt) {
+  SzBuilder builder;
+  builder.add("d", "data");
+  builder.last().has_attr = true;
+  builder.last().attr = 0x10u;
+  Opened opened(builder.build());
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  EXPECT_EQ(garc_next(opened.archive(), &member), GARC_ERR_CORRUPT);
+}
+
+TEST(SevenZBuilt, ASymlinkLongerThanTheNameCapKeepsItsBytesAsData) {
+  SzBuilder builder;
+  builder.add("l", std::string(40, 't'));
+  builder.last().has_attr = true;
+  builder.last().attr = 0x8000u | (0120777u << 16);
+  GARC_Limits limits;
+  garc_limits_default(&limits);
+  limits.max_name_bytes = 16;
+  Opened opened(builder.build(), &limits);
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(opened.archive(), &member), GARC_OK);
+  EXPECT_EQ(member->type, GARC_MEMBER_SYMLINK);
+  EXPECT_EQ(member->link_target, nullptr);
+  GARC_Result status = GARC_OK;
+  EXPECT_EQ(read_member(opened.archive(), &status), std::string(40, 't'));
+  EXPECT_EQ(status, GARC_OK);
 }
 
 int main(int argc, char ** argv) {
