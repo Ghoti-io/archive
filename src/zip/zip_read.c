@@ -800,7 +800,7 @@ static GARC_Result zip_read_exact(
  * Four rows, and each is exact rather than approximate. Method 8 is RFC 1951
  * *raw* - no zlib header and no gzip wrapper - which is `compress`'s `"deflate"`
  * and not its `"zlib"`; reading one as the other fails on the first two bytes.
- * Method 12 is a bare bzip2 stream. Method 93 is a zstd frame. Method 14 is
+ * Method 12 is a bare bzip2 stream. Method 95 is a complete `.xz` file. Method 93 is a zstd frame. Method 14 is
  * `"lzma"`, but the bytes are not a `.lzma` file: a header comes first and the
  * rest is raw, which the caller says with the `lzma.*` keys rather than with
  * this name.
@@ -823,6 +823,8 @@ static const char * zip_codec_name(uint16_t method) {
       return "lzma";
     case GARC_ZIP_METHOD_ZSTD:
       return "zstd";
+    case GARC_ZIP_METHOD_XZ:
+      return "xz";
     default:
       return NULL;
   }

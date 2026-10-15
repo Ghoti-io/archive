@@ -160,6 +160,7 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
       case GARC_ZIP_METHOD_DEFLATE:
       case GARC_ZIP_METHOD_BZIP2:
       case GARC_ZIP_METHOD_ZSTD:
+      case GARC_ZIP_METHOD_XZ:
       case GARC_ZIP_METHOD_LZMA:
         break;
       default:

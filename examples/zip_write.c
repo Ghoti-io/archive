@@ -44,13 +44,13 @@
  *
  * **And nothing is compressed unless you ask.** The default method is stored,
  * which is also the zero of the option, so a caller who memset their options gets
- * what NULL would have given them. `--deflate`, `--bzip2`, `--zstd` or `--lzma`
+ * what NULL would have given them. `--deflate`, `--bzip2`, `--zstd`, `--xz` or `--lzma`
  * is the one assignment that changes it, and the report at the end prints both
  * totals so the difference is visible rather than asserted. Empty members and
  * symlinks stay stored whatever was asked for.
  *
  * Usage: zip_write <path.zip> [--stream]
- *            [--deflate | --bzip2 | --zstd | --lzma]
+ *            [--deflate | --bzip2 | --zstd | --xz | --lzma]
  */
 
 #include <inttypes.h>
@@ -63,7 +63,7 @@
 
 static const char USAGE[]
     = "usage: %s <path.zip> [--stream] "
-      "[--deflate | --bzip2 | --zstd | --lzma]\n";
+      "[--deflate | --bzip2 | --zstd | --xz | --lzma]\n";
 
 static GARC_Result file_write(void * ctx, const void * buffer, size_t size) {
   FILE * file = (FILE *)ctx;
@@ -129,7 +129,7 @@ static const Entry ENTRIES[] = {
  *
  * @param argc Argument count.
  * @param argv `argv[1]` is the archive to write; `--stream` forces the
- *   data-descriptor form; one of `--deflate`, `--bzip2`, `--zstd` or `--lzma`
+ *   data-descriptor form; one of `--deflate`, `--bzip2`, `--zstd`, `--xz` or `--lzma`
  *   selects the compression method.
  * @return 0 on success, 1 on any failure, 2 on a usage error.
  */
@@ -155,6 +155,10 @@ int main(int argc, char ** argv) {
       asked = GARC_ZIP_METHOD_ZSTD;
       is_method = 1;
     }
+    else if (strcmp(argv[i], "--xz") == 0) {
+      asked = GARC_ZIP_METHOD_XZ;
+      is_method = 1;
+    }
     else if (strcmp(argv[i], "--lzma") == 0) {
       asked = GARC_ZIP_METHOD_LZMA;
       is_method = 1;
@@ -165,7 +169,7 @@ int main(int argc, char ** argv) {
     }
     if (is_method) {
       if (method_named) {
-        fprintf(stderr, "%s: only one of --deflate, --bzip2, --zstd, --lzma\n",
+        fprintf(stderr, "%s: only one of --deflate, --bzip2, --zstd, --xz, --lzma\n",
             argv[0]);
         return 2;
       }

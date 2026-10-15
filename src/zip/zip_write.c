@@ -214,6 +214,8 @@ static const char * zip_encoder_name(uint16_t method) {
       return "deflate";
     case GARC_ZIP_METHOD_BZIP2:
       return "bzip2";
+    case GARC_ZIP_METHOD_XZ:
+      return "xz";
     case GARC_ZIP_METHOD_ZSTD:
       return "zstd";
     case GARC_ZIP_METHOD_LZMA:
@@ -322,6 +324,9 @@ uint64_t garc_zip_compressed_ceiling(uint64_t size, uint16_t method) {
   if (method == GARC_ZIP_METHOD_BZIP2) {
     return zip_encode_bound("bzip2", size);
   }
+  if (method == GARC_ZIP_METHOD_XZ) {
+    return zip_encode_bound("xz", size);
+  }
   if (method == GARC_ZIP_METHOD_ZSTD) {
     return zip_encode_bound("zstd", size);
   }
@@ -407,6 +412,7 @@ static uint16_t zip_version_needed(const GARC_Zip_Write_State * zip) {
     return ZIP_VERSION_NEEDED_AES;
   }
   if (zip->method == GARC_ZIP_METHOD_ZSTD
+      || zip->method == GARC_ZIP_METHOD_XZ
       || zip->method == GARC_ZIP_METHOD_LZMA) {
     return ZIP_VERSION_NEEDED_CODEC;
   }
@@ -678,7 +684,7 @@ GARC_Result garc_zip_write_member(
   const uint16_t asked = writer->options.zip_method;
   const int compresses = asked == GARC_ZIP_METHOD_DEFLATE
       || asked == GARC_ZIP_METHOD_BZIP2 || asked == GARC_ZIP_METHOD_ZSTD
-      || asked == GARC_ZIP_METHOD_LZMA;
+      || asked == GARC_ZIP_METHOD_XZ || asked == GARC_ZIP_METHOD_LZMA;
   zip->method = compresses && size && member->type != GARC_MEMBER_SYMLINK
       ? asked : (uint16_t)GARC_ZIP_METHOD_STORED;
   // A directory has no data. A file, an empty file and a symlink do, and the
@@ -708,9 +714,10 @@ GARC_Result garc_zip_write_member(
     zip->needs_46 = 1;
   }
   if (!zip->aes && (zip->method == GARC_ZIP_METHOD_ZSTD
+                       || zip->method == GARC_ZIP_METHOD_XZ
                        || zip->method == GARC_ZIP_METHOD_LZMA)) {
     // The zip64 end record's version is the highest a member asked for.
-    // Cleartext zstd and LZMA ask for 63. AES stays 51 on the member, and
+    // Cleartext zstd, xz and LZMA ask for 63. AES stays 51 on the member, and
     // that member does not raise this.
     zip->needs_63 = 1;
   }

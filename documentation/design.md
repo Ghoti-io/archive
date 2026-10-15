@@ -513,8 +513,8 @@ file with a decoder over it: the view ends where the member's compressed size en
 which is what stops a deflate stream from reading the next member's local header as
 more input, and the decoder is `compress`'s. So method 8 is RFC 1951 raw -
 `compress`'s `"deflate"`, not its `"zlib"`, and reading one as the other fails on
-the first two bytes - method 12 is a bare bzip2 stream, and method 93 is a zstd
-frame. Method 14 is not a `.lzma`
+the first two bytes - method 12 is a bare bzip2 stream, method 93 is a zstd
+frame, and method 95 is a complete `.xz` file. Method 14 is not a `.lzma`
 file. A little-endian version word, a little-endian properties size, those
 bytes, then raw LZMA. Any version whose properties size is 5 is accepted,
 which is 7-Zip's `0x0119` and Python's `0x0409`. The properties byte is
@@ -1418,10 +1418,10 @@ is a predicate on the intent row, and libarchive *agrees* about every member we
 deflated. The skip applies only to the members we stored, which is a statement about
 libarchive rather than a hole in the gate.
 
-What it compares, and what it deliberately does not: ten archives, the same member
-list encoded ten ways (stored and deflate sizes disciplines, zip64, AES, bzip2,
-zstd, LZMA), are accepted by the references that can read them. Unzip, bsdtar and
-Python are not asked about AES or zstd; Python is asked about LZMA only when it
+What it compares, and what it deliberately does not: eleven archives, the same member
+list encoded eleven ways (stored and deflate sizes disciplines, zip64, AES, bzip2,
+zstd, xz, LZMA), are accepted by the references that can read them. Unzip, bsdtar and
+Python are not asked about AES, zstd or xz; Python is asked about LZMA only when it
 accepts those bytes. Every reference is asked about bzip2. 7-Zip is asked about
 every archive. `unzip -t`, `7z t` and
 `zipfile.testzip()` each recompute every member's CRC they are asked about.

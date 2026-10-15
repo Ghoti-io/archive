@@ -167,8 +167,8 @@ typedef struct GARC_Writer_Options {
    * Which method a zip member's data is written with. Ignored for tar.
    *
    * ::GARC_ZIP_METHOD_STORED is the default. ::GARC_ZIP_METHOD_DEFLATE,
-   * ::GARC_ZIP_METHOD_BZIP2, ::GARC_ZIP_METHOD_ZSTD and
-   * ::GARC_ZIP_METHOD_LZMA are accepted beside it. Every other value is refused
+   * ::GARC_ZIP_METHOD_BZIP2, ::GARC_ZIP_METHOD_ZSTD,
+   * ::GARC_ZIP_METHOD_XZ and ::GARC_ZIP_METHOD_LZMA are accepted beside it. Every other value is refused
    * by ::garc_writer_create() with ::GARC_ERR_UNSUPPORTED, including methods
    * this library can *read*. Reading a method means having a decoder for it;
    * writing one means choosing to produce it. Bzip2, zstd and LZMA are refused

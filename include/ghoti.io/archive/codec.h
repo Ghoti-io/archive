@@ -21,7 +21,7 @@
 /**
  * @file
  *
- * `tar.gz`, `tar.zst`, `tar.lz4`, `tar.lzma`, `tar.bz2`: a codec in front of
+ * `tar.gz`, `tar.zst`, `tar.lz4`, `tar.lzma`, `tar.bz2`, `tar.xz`: a codec in front of
  * a stream, or behind a sink. `"lzma"` is the `.lzma` container. Zip method 14
  * is the same codec with `lzma.raw`, and that header is the zip reader's.
  *
@@ -44,7 +44,7 @@
  * way:
  *
  * **The method is a string, not a ::GARC_Format or an enum of its own.**
- * `"gzip"`, `"zstd"`, `"lz4"`, `"zlib"`, `"lzma"`, `"bzip2"` - whatever
+ * `"gzip"`, `"zstd"`, `"lz4"`, `"zlib"`, `"lzma"`, `"bzip2"`, `"xz"` - whatever
  * `compress` has a method for, spelled the way `compress` spells it and passed
  * straight through to `gcomp_decoder_create()`. An enum here would be this
  * library keeping a second copy of another library's list of codecs, and the
@@ -61,13 +61,13 @@
  *
  * **Trailing bytes after a complete codec stream are ::GARC_ERR_CORRUPT.**
  * RFC 1952 allows gzip members to be concatenated, and `cat a.gz b.gz` and
- * `pigz` both produce that. Measured against `compress` 0.0.0: **zstd and
- * bzip2 decode every frame, and gzip, lz4, zlib and lzma stop after the first
+ * `pigz` both produce that. Measured against `compress` 0.0.0: **zstd,
+ * bzip2 and xz decode every frame, and gzip, lz4, zlib and lzma stop after the first
  * and leave the rest unconsumed.** Stopping quietly would hand the tar reader
  * the first member's worth of bytes and nothing else - a *silently short
  * archive*, which is the worst of the three possible answers. Refusing says
  * what happened. Reading a second member is `compress`'s to offer, not
- * something to work around here. For zstd and bzip2 the concatenated frames
+ * something to work around here. For zstd, bzip2 and xz the concatenated frames
  * are accepted, which the codec tests assert.
  *
  * **A compressing sink has to be finished, and ::garc_sink_finish() is how.**

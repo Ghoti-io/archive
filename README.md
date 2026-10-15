@@ -73,9 +73,9 @@ for the fields that hold the `0xFFFFFFFF` marker, which is why `zip -fz` produce
 an eight-byte field where a reader consuming the values positionally expects
 sixteen.
 
-**Methods 0, 8, 12, 14 and 93 are read**, through `compress`: a member is a
+**Methods 0, 8, 12, 14, 93 and 95 are read**, through `compress`: a member is a
 bounded view of the file with a decoder over it, so method 8 is RFC 1951 raw,
-method 12 a bare bzip2 stream, and method 93 a zstd frame. Method 14 is a small
+method 12 a bare bzip2 stream, method 93 a zstd frame, and method 95 a complete `.xz` file. Method 14 is a small
 header and then raw LZMA (`lzma.raw`), not a `.lzma` file. **Method 9 is refused
 on purpose** - "enhanced deflate" is not RFC 1951, so pointing it at the deflate
 decoder would produce plausible wrong bytes for the members that use its
@@ -372,10 +372,10 @@ composes the type bits from `GARC_Member.type` and takes only the permissions fr
 a zip symlink's target *is* its data, so the writer puts it there and the caller
 writes nothing, exactly as for a tar.
 
-**Stored, deflate, bzip2, zstd or LZMA.** `GARC_Writer_Options.zip_method` takes
-those five and refuses every other value at create — including methods this
+**Stored, deflate, bzip2, zstd, xz or LZMA.** `GARC_Writer_Options.zip_method` takes
+those six and refuses every other value at create — including methods this
 library can *read*, because reading a method means owning a decoder and writing
-one means choosing to produce it. Bzip2, zstd and LZMA are not the default: a
+one means choosing to produce it. Bzip2, zstd, xz and LZMA are not the default: a
 caller names them. Stored is the default, and the reason is the zero: every
 field in that struct is written so a zero-filled copy behaves like the defaults or
 is refused, and `GARC_ZIP_METHOD_STORED` is 0. A member with no data is stored
@@ -386,10 +386,10 @@ before the first byte arrives, so there is no point at which it could be taken b
 which is what `zip` can do only because it has the whole file on disk first. And
 zip64's threshold is a compressed-size ceiling rather than the declared size,
 because a codec can make a member *larger* and a compressed size that crossed 4 GiB
-afterwards would have nowhere to go. Deflate, bzip2 and zstd ask
+afterwards would have nowhere to go. Deflate, bzip2, zstd and xz ask
 `gcomp_encode_bound()`. LZMA has none, so the ceiling is
 `GCOMP_LZMA_MAX_EXPANSION_RATIO` times the declared size, plus the 9-byte header,
-plus any AES framing. Cleartext bzip2 needs version 46; cleartext zstd or LZMA
+plus any AES framing. Cleartext bzip2 needs version 46; cleartext zstd, xz or LZMA
 needs 63. A password still writes AE-2, and the real method stays in extra 0x9901;
 AES version-needed stays 51.
 

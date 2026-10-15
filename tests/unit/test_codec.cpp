@@ -2,7 +2,7 @@
  * @file
  *
  * A codec in front of a stream, and behind a sink: `tar.gz`, `tar.zst`,
- * `tar.bz2`, `tar.lz4`, `tar.lzma`, `tar` through zlib. `"lzma"` is the
+ * `tar.bz2`, `tar.xz`, `tar.lz4`, `tar.lzma`, `tar` through zlib. `"lzma"` is the
  * `.lzma` container. Zip method 14 is that codec with `lzma.raw`, and it is
  * not what these tests compose.
  *
@@ -58,7 +58,7 @@ namespace {
 
 /** Every codec this library is expected to compose with. */
 const char * const kMethods[]
-    = {"gzip", "zstd", "lz4", "zlib", "lzma", "bzip2"};
+    = {"gzip", "zstd", "lz4", "zlib", "lzma", "bzip2", "xz"};
 
 /** One member's worth of content, repeated to @p size bytes. */
 std::string filler(size_t size, char seed) {
@@ -504,10 +504,10 @@ TEST(Codec, ConcatenatedMembersAreRefusedWhereTheCodecStopsAtTheFirst) {
 }
 
 TEST(Codec, ConcatenatedFramesAreReadWhereTheCodecReadsThemAll) {
-  // zstd and bzip2 are the exceptions, and the asymmetry is asserted rather
+  // zstd, bzip2 and xz are the exceptions, and the asymmetry is asserted rather
   // than described: if compress ever makes gzip read a second member, the test
   // above fails and this one says what the new behaviour should look like.
-  for (const char * method : {"zstd", "bzip2"}) {
+  for (const char * method : {"zstd", "bzip2", "xz"}) {
     SCOPED_TRACE(method);
     const std::string both = two_streams(method);
     ASSERT_FALSE(both.empty());

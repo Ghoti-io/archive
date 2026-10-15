@@ -200,6 +200,9 @@ static const struct {
   // has, with that one difference.
   {"zstd.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_ZSTD, 0,
       "zstd members, method 93, a bare frame"},
+  // **One xz archive**, treated like zstd.zip: only 7-Zip is asked.
+  {"xz.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_XZ, 0,
+      "xz members, method 95, a complete .xz file, version 63"},
   {"lzma.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_LZMA, 0,
       "LZMA members, method 14, version 0x0119, an end marker, bit 1 set"},
 };
