@@ -338,6 +338,26 @@ typedef struct {
   /** @} */
 } GARC_Zip_State;
 
+/** What only the ar reader looks at. */
+typedef struct {
+  /** The current member's name, resolved from whichever convention carried it. */
+  GARC_Buffer name;
+  /** GNU's `//` member: the names too long for a header, separated by `/\n`. */
+  GARC_Buffer table;
+  int have_table;     ///< Whether a `//` member has been read.
+  int seen_member;    ///< Whether a real member has been reported yet.
+} GARC_Ar_State;
+
+/** What only the cpio reader looks at. */
+typedef struct {
+  GARC_Buffer name;   ///< The current member's name.
+  GARC_Buffer link;   ///< A symlink's target, which in cpio is the data.
+  int variant;        ///< 0 newc, 1 crc, 2 odc.
+  uint32_t check;     ///< The crc variant's declared sum for this member.
+  uint32_t running;   ///< The sum of the bytes handed over so far.
+  int check_active;   ///< Whether a verdict is owed at the end of this member.
+} GARC_Cpio_State;
+
 /**
  * An archive being read.
  *
@@ -425,6 +445,10 @@ struct GARC_Archive {
   GARC_Zip_State zip;
   /** What only the 7z reader looks at: NULL for every other format. */
   struct GARC_SevenZ * sevenz;
+  /** What only the ar reader looks at. */
+  GARC_Ar_State ar;
+  /** What only the cpio reader looks at. */
+  GARC_Cpio_State cpio;
 };
 
 /**
@@ -438,6 +462,21 @@ struct GARC_Archive {
  * @return GARC_OK, or the specific GARC_ERR_LIMIT_* that fired.
  */
 GARC_Result garc_reader_account(GARC_Archive * archive);
+
+/**
+ * Throw away @p count bytes of the stream, draining the identification window
+ * first.
+ *
+ * The tar reader never needs the window drained here because a header is a
+ * whole block. ar and cpio headers are shorter, so the window still holds the
+ * start of the first member's data when the header has been read, and a skip or
+ * a read that went straight to the stream would lose it.
+ *
+ * @param archive The archive.
+ * @param count How many bytes.
+ * @return ::GARC_OK, or the stream's failure.
+ */
+GARC_Result garc_reader_discard(GARC_Archive * archive, uint64_t count);
 
 #ifdef __cplusplus
 }

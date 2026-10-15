@@ -126,6 +126,17 @@ typedef enum {
 } GARC_SevenZ_Method;
 
 /**
+ * @brief Which cpio header a cpio archive is written with.
+ *
+ * Zero is newc, which is what Linux initramfs and RPM use and what every
+ * current reader takes.
+ */
+typedef enum {
+  GARC_CPIO_NEWC = 0, ///< SVR4 "070701": hex fields, 4-byte alignment.
+  GARC_CPIO_ODC       ///< POSIX "070707": octal fields, no alignment.
+} GARC_Cpio_Variant;
+
+/**
  * @brief How an archive is to be written.
  *
  * Pass NULL wherever this is accepted to use ::garc_writer_options_default(),
@@ -287,6 +298,25 @@ typedef struct GARC_Writer_Options {
    * Ignored for tar and zip.
    */
   int sevenz_non_solid;
+
+  /**
+   * Which cpio header to write. Ignored for every other format.
+   *
+   * ::GARC_CPIO_NEWC is 0 and the default.
+   */
+  GARC_Cpio_Variant cpio_variant;
+
+  /**
+   * Encode a shar's file data with uuencode instead of as text. Ignored for
+   * every other format.
+   *
+   * Off by default, which writes the data as lines prefixed with `X` and
+   * recovered with `sed`: readable, diffable, and *text only* - a NUL byte, or
+   * data whose last line has no newline, is ::GARC_ERR_UNSUPPORTED at the byte
+   * where it is met, and the script being written is then unusable. On, any
+   * bytes are written, and extracting them needs `uudecode`.
+   */
+  int shar_uuencode;
 } GARC_Writer_Options;
 
 /**
@@ -306,7 +336,8 @@ GARC_API void garc_writer_options_default(GARC_Writer_Options * options);
  *
  * @param sink Where the bytes go.
  * @param format Which container to write: ::GARC_FORMAT_TAR,
- *   ::GARC_FORMAT_ZIP or ::GARC_FORMAT_SEVENZ.
+ *   ::GARC_FORMAT_ZIP, ::GARC_FORMAT_SEVENZ, ::GARC_FORMAT_AR,
+ *   ::GARC_FORMAT_CPIO or ::GARC_FORMAT_SHAR.
  * @param options How to write it. NULL uses ::garc_writer_options_default().
  * @param out_writer Receives the writer on success.
  * @return ::GARC_OK, ::GARC_ERR_INVALID, ::GARC_ERR_OOM,

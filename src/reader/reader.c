@@ -36,6 +36,8 @@
 #include <string.h>
 
 #include "reader/reader_internal.h"
+#include "ar/ar_internal.h"
+#include "cpio/cpio_internal.h"
 #include "sevenz/sevenz_internal.h"
 #include "tar/tar_internal.h"
 #include "zip/zip_internal.h"
@@ -50,6 +52,12 @@ const char * garc_format_string(GARC_Format format) {
       return "zip";
     case GARC_FORMAT_SEVENZ:
       return "7z";
+    case GARC_FORMAT_AR:
+      return "ar";
+    case GARC_FORMAT_CPIO:
+      return "cpio";
+    case GARC_FORMAT_SHAR:
+      return "shar";
     case GARC_FORMAT_COUNT:
     default:
       return "invalid";
@@ -112,6 +120,22 @@ static GARC_Result reader_identify(GARC_Archive * archive) {
   if (garc_tar_identify(archive->peek, total)) {
     archive->format = GARC_FORMAT_TAR;
     return GARC_OK;
+  }
+
+  if (garc_ar_identify(archive->peek, total)) {
+    archive->format = GARC_FORMAT_AR;
+    return GARC_OK;
+  }
+
+  if (garc_cpio_identify(archive->peek, total)) {
+    archive->format = GARC_FORMAT_CPIO;
+    return GARC_OK;
+  }
+
+  if (garc_cpio_identify_binary(archive->peek, total)) {
+    // A cpio, and one whose header is a machine-order struct. Named rather than
+    // reported as unknown: the fix for the caller is a different tool.
+    return GARC_ERR_UNSUPPORTED;
   }
 
   if (garc_sevenz_identify(archive->peek, total)) {
@@ -211,6 +235,12 @@ static void reader_release(GARC_Archive * archive) {
       break;
     case GARC_FORMAT_SEVENZ:
       garc_sevenz_release(archive);
+      break;
+    case GARC_FORMAT_AR:
+      garc_ar_release(archive);
+      break;
+    case GARC_FORMAT_CPIO:
+      garc_cpio_release(archive);
       break;
     default:
       // Identification failed, so no format reader has run and there is nothing
@@ -328,6 +358,12 @@ GARC_Result garc_next(GARC_Archive * archive, const GARC_Member ** out_member) {
     case GARC_FORMAT_SEVENZ:
       result = garc_sevenz_next(archive);
       break;
+    case GARC_FORMAT_AR:
+      result = garc_ar_next(archive);
+      break;
+    case GARC_FORMAT_CPIO:
+      result = garc_cpio_next(archive);
+      break;
     default:
       // reader_identify() refuses anything else, so reaching this is a bug in
       // this file rather than a fact about the input.
@@ -427,6 +463,12 @@ static GARC_Result reader_rewind(GARC_Archive * archive) {
     case GARC_FORMAT_SEVENZ:
       garc_sevenz_rewind(archive);
       break;
+    case GARC_FORMAT_AR:
+      garc_ar_rewind(archive);
+      break;
+    case GARC_FORMAT_CPIO:
+      garc_cpio_rewind(archive);
+      break;
     default:
       // Unreachable, and kept for the reason the switch in garc_next() gives:
       // identification sets one of the two formats above, so `make coverage`
@@ -505,6 +547,9 @@ GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,
   if (archive->format == GARC_FORMAT_SEVENZ && archive->data_refusal == GARC_OK) {
     return garc_sevenz_read(archive, buffer, capacity, out_read);
   }
+  if (archive->format == GARC_FORMAT_CPIO) {
+    return garc_cpio_read(archive, buffer, capacity, out_read);
+  }
   if (archive->data_refusal != GARC_OK) {
     // A member whose metadata was readable and whose bytes are not: a zip member
     // compressed with a method there is no codec for, or encrypted. Answered
@@ -530,7 +575,10 @@ GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,
   }
 
   size_t got = 0;
-  GARC_Result result = garc_stream_read(archive->stream, buffer, want, &got);
+  // Through the identification window, which for ar and cpio still holds the
+  // first bytes of the first member's data: their headers are shorter than the
+  // window, tar's is exactly as long.
+  GARC_Result result = garc_tar_read(archive, (uint8_t *)buffer, want, &got);
   if (result != GARC_OK) {
     return result;
   }
@@ -564,13 +612,23 @@ GARC_Result garc_skip_member(GARC_Archive * archive) {
     return GARC_OK;
   }
 
-  GARC_Result result
-      = garc_stream_skip(archive->stream, archive->data_remaining);
+  GARC_Result result = garc_reader_discard(archive, archive->data_remaining);
   if (result != GARC_OK) {
     return result;
   }
   archive->data_remaining = 0;
   return GARC_OK;
+}
+
+GARC_Result garc_reader_discard(GARC_Archive * archive, uint64_t count) {
+  if (archive->peek_consumed < archive->peek_length) {
+    const uint64_t pending
+        = (uint64_t)(archive->peek_length - archive->peek_consumed);
+    const uint64_t take = pending < count ? pending : count;
+    archive->peek_consumed += (size_t)take;
+    count -= take;
+  }
+  return count ? garc_stream_skip(archive->stream, count) : GARC_OK;
 }
 
 uint64_t garc_member_count(const GARC_Archive * archive) {

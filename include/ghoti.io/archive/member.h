@@ -132,6 +132,7 @@ typedef enum {
    */
   GARC_TIME_ZIP_NTFS,
   GARC_TIME_FILETIME,     ///< An NTFS FILETIME as 7z carries it, 100 ns ticks.
+  GARC_TIME_UNIX,         ///< Whole seconds since the epoch, as ar and cpio carry.
   GARC_TIME_SOURCE_COUNT
 } GARC_Time_Source;
 

@@ -1,6 +1,6 @@
 # Ghoti.io Archive
 
-Archive containers — tar, zip and 7z — read and written **without touching the
+Archive containers — tar, zip, 7z, ar, cpio and shar — read and written **without touching the
 filesystem**. This library walks the members of an archive and hands you each
 one's name, size, time and bytes. The reader and the writer never open,
 create or write a file. The part that does is opt-in and lives in `fs.h`, which
@@ -115,6 +115,26 @@ header is written plain rather than encoded, which every reader accepts and
 which saves a second encoder. `make check-sevenz-writer` hands six archives to
 7-Zip and libarchive and compares what each says with what was meant; neither
 is asked what it cannot say.
+
+**Reads and writes ar and cpio, and writes shar.** All three are streams and
+none needs a sink that can go back, so ar and cpio are read from a pipe as tar is
+(`examples/arcpio_list.c` lists either from standard input). *ar* reads the
+common, System V/GNU (`/` symbol table, `//` long-name table) and BSD (`#1/N`)
+conventions; the symbol tables are consumed and not reported. It writes System V
+names where they fit and BSD's `#1/N` for everything else, because GNU's table
+must precede the members it names and a streaming writer does not know them yet.
+*cpio* reads newc, its crc variant (the byte sum is checked when a member ends)
+and odc, and writes newc or odc; the binary dialect is refused by name. A symlink
+is a symlink, a device carries its numbers, and a hard link is not recognised as
+one (cpio writes the data once and nothing in a header says which name is the
+other half). *shar* is **written and never read**: a shell archive is a program,
+and reading one means deciding what a shell would do with it. Names are
+single-quoted for the shell; the body is `X`-prefixed text recovered by `sed`
+(text only, and refused at the byte that is not) or, with `shar_uuencode`, any
+bytes through `uudecode`. The ar and cpio fixtures are written by libarchive's
+bsdtar and checked against the tree they were made from; `make
+check-arcpio-writer` hands the writers' output to libarchive, tests the cpio with
+7-Zip, runs the shar with `sh`, and decodes the uuencoded one independently.
 
 **ZipCrypto is read and will never be written.** The traditional PKWARE cipher
 needs no cryptography library at all - it is three words mixed with CRC-32, which

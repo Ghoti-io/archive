@@ -80,6 +80,8 @@ const char * garc_time_source_string(GARC_Time_Source source) {
       return "zip extended timestamp";
     case GARC_TIME_FILETIME:
       return "7z-filetime";
+    case GARC_TIME_UNIX:
+      return "unix-seconds";
     case GARC_TIME_ZIP_NTFS:
       return "zip NTFS timestamp";
     case GARC_TIME_SOURCE_COUNT:

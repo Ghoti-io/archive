@@ -37,7 +37,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "ar/ar_internal.h"
+#include "cpio/cpio_internal.h"
 #include "sevenz/sevenz_internal.h"
+#include "shar/shar_internal.h"
 #include "tar/tar_internal.h"
 #include "writer/writer_internal.h"
 #include "zip/zip_internal.h"
@@ -57,6 +60,8 @@ void garc_writer_options_default(GARC_Writer_Options * options) {
   // LZMA2 solid, which is 7-Zip's default and the zero of both fields.
   options->sevenz_method = GARC_SEVENZ_LZMA2;
   options->sevenz_non_solid = 0;
+  options->cpio_variant = GARC_CPIO_NEWC;
+  options->shar_uuencode = 0;
   // Stored, which is also this field's zero. GARC_Writer_Options argues it.
   options->zip_method = GARC_ZIP_METHOD_STORED;
   // No password. A zero-filled struct agrees: the pointer and the length are
@@ -98,7 +103,16 @@ static GARC_Result writer_close_member(GARC_Writer * writer) {
   // and zip writes a descriptor or patches a header and appends a directory
   // entry, and neither rule belongs in the file that has no format in it.
   GARC_Result result;
-  if (writer->format == GARC_FORMAT_SEVENZ) {
+  if (writer->format == GARC_FORMAT_AR) {
+    result = garc_ar_write_close_member(writer);
+  }
+  else if (writer->format == GARC_FORMAT_CPIO) {
+    result = garc_cpio_write_close_member(writer);
+  }
+  else if (writer->format == GARC_FORMAT_SHAR) {
+    result = garc_shar_write_close_member(writer);
+  }
+  else if (writer->format == GARC_FORMAT_SEVENZ) {
     result = garc_sevenz_write_close_member(writer);
   }
   else if (writer->format == GARC_FORMAT_ZIP) {
@@ -214,6 +228,18 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
         return GARC_ERR_INVALID;
     }
   }
+  else if (format == GARC_FORMAT_AR || format == GARC_FORMAT_SHAR) {
+    // Streamed: nothing here needs the sink to go back.
+  }
+  else if (format == GARC_FORMAT_CPIO) {
+    switch (resolved.cpio_variant) {
+      case GARC_CPIO_NEWC:
+      case GARC_CPIO_ODC:
+        break;
+      default:
+        return GARC_ERR_INVALID;
+    }
+  }
   else {
     // GARC_FORMAT_UNKNOWN included: a caller who has not said what to write has
     // not said it, and there is no format to guess at from a sink.
@@ -274,7 +300,16 @@ GARC_Result garc_writer_add(GARC_Writer * writer, const GARC_Member * member) {
     return result;
   }
 
-  if (writer->format == GARC_FORMAT_SEVENZ) {
+  if (writer->format == GARC_FORMAT_AR) {
+    result = garc_ar_write_member(writer, member);
+  }
+  else if (writer->format == GARC_FORMAT_CPIO) {
+    result = garc_cpio_write_member(writer, member);
+  }
+  else if (writer->format == GARC_FORMAT_SHAR) {
+    result = garc_shar_write_member(writer, member);
+  }
+  else if (writer->format == GARC_FORMAT_SEVENZ) {
     result = garc_sevenz_write_member(writer, member);
   }
   else if (writer->format == GARC_FORMAT_ZIP) {
@@ -314,7 +349,10 @@ GARC_Result garc_writer_write(
   }
 
   GARC_Result result;
-  if (writer->format == GARC_FORMAT_SEVENZ) {
+  if (writer->format == GARC_FORMAT_SHAR) {
+    result = garc_shar_write_data(writer, data, size);
+  }
+  else if (writer->format == GARC_FORMAT_SEVENZ) {
     result = garc_sevenz_write_data(writer, data, size);
   }
   else if (writer->format == GARC_FORMAT_ZIP) {
@@ -340,7 +378,16 @@ GARC_Result garc_writer_finish(GARC_Writer * writer) {
     return result;
   }
 
-  if (writer->format == GARC_FORMAT_SEVENZ) {
+  if (writer->format == GARC_FORMAT_AR) {
+    result = garc_ar_write_end(writer);
+  }
+  else if (writer->format == GARC_FORMAT_CPIO) {
+    result = garc_cpio_write_end(writer);
+  }
+  else if (writer->format == GARC_FORMAT_SHAR) {
+    result = garc_shar_write_end(writer);
+  }
+  else if (writer->format == GARC_FORMAT_SEVENZ) {
     result = garc_sevenz_write_end(writer);
   }
   else if (writer->format == GARC_FORMAT_ZIP) {
@@ -413,5 +460,6 @@ void garc_writer_destroy(GARC_Writer * writer) {
   // condition here would be a second place the format lives for no gain.
   garc_zip_write_release(writer);
   garc_sevenz_write_release(writer);
+  garc_shar_write_release(writer);
   gcu_allocator_free(allocator, writer);
 }

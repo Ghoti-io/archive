@@ -641,6 +641,16 @@ $(SEVENZ_WRITER_PROBE): tools/oracle/sevenz_writer_probe.c \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
 
+# The ar, cpio and shar writers' probe, built like the others: it links the
+# library under test.
+ARCPIO_WRITER_PROBE := $(APP_DIR)/oracle/arcpio_writer_probe$(EXE_EXTENSION)
+
+$(ARCPIO_WRITER_PROBE): tools/oracle/arcpio_writer_probe.c \
+		$(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Probe: arcpio_writer_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
+
 ####################################################################
 # Commands
 ####################################################################
@@ -648,8 +658,8 @@ $(SEVENZ_WRITER_PROBE): tools/oracle/sevenz_writer_probe.c \
 # General commands
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-corpus-hashes check-corpus corpus oracle-build oracle-version
-.PHONY: zip-corpus check-zip-corpus check-zip-oracle sevenz-corpus check-sevenz-corpus
-.PHONY: check-oracle check-writer check-zip-writer check-sevenz-writer
+.PHONY: zip-corpus check-zip-corpus check-zip-oracle sevenz-corpus check-sevenz-corpus arcpio-corpus check-arcpio-corpus
+.PHONY: check-oracle check-writer check-zip-writer check-sevenz-writer check-arcpio-writer
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1239,7 +1249,7 @@ endef
 # aggregate target below. Two lists is how a harness comes to exist, build, and
 # never be run by `make fuzz` - which adding the writer harness demonstrated, by
 # building and passing while the aggregate still named three.
-FUZZ_HARNESSES := stream tar name writer find zip sevenz
+FUZZ_HARNESSES := stream tar name writer find zip sevenz arcpio
 
 $(foreach harness,$(FUZZ_HARNESSES),\
 	$(eval $(call fuzz-rule,fuzz_$(harness),$(harness))))
@@ -1344,6 +1354,16 @@ check-sevenz-corpus: ## Fail if the pinned 7-Zip no longer produces the 7z corpu
 	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) sevenzip -- \
 		python3 $(ORACLE)/make_sevenz_corpus.py --check
 
+arcpio-corpus: ## Regenerate tests/data/arcpio/ and containers/CORPUS-ARCPIO in the container
+# bsdtar and bsdcpio are the only ar and cpio writers in the reference image, and
+# the manifests are computed from the source tree. See the generator.
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) bsdtar -- \
+		python3 $(ORACLE)/make_arcpio_corpus.py
+
+check-arcpio-corpus: ## Fail if the pinned bsdtar no longer produces the ar and cpio corpus
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) bsdtar -- \
+		python3 $(ORACLE)/make_arcpio_corpus.py --check
+
 check-zip-oracle: ## Fail if the live references read the zip corpus differently
 # The only gate that covers the three zip fixtures with no digest in CORPUS-ZIP: a
 # random salt, a random encryption header and an unsettable ctime mean their bytes
@@ -1384,6 +1404,11 @@ check-sevenz-writer: ## Fail if the references disagree with the 7z the writer p
 check-sevenz-writer: $(SEVENZ_WRITER_PROBE)
 	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
 		python3 $(ORACLE)/check_sevenz_writer.py --probe $(SEVENZ_WRITER_PROBE)
+
+check-arcpio-writer: ## Fail if the references disagree with the ar, cpio and shar the writers produce
+check-arcpio-writer: $(ARCPIO_WRITER_PROBE)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+		python3 $(ORACLE)/check_arcpio_writer.py --probe $(ARCPIO_WRITER_PROBE)
 
 ####################################################################
 # Install / uninstall

@@ -58,6 +58,9 @@ CORPORA = (
     ("sevenz", os.path.join(ROOT, "tests", "data", "sevenz"),
         os.path.join(HERE, "oracle", "containers", "CORPUS-SEVENZ"),
         (".7z", ".tsv", ".txt")),
+    ("arcpio", os.path.join(ROOT, "tests", "data", "arcpio"),
+        os.path.join(HERE, "oracle", "containers", "CORPUS-ARCPIO"),
+        (".a", ".cpio", ".tsv")),
 )
 
 

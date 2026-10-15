@@ -179,6 +179,29 @@ typedef struct {
  *
  * Opaque to callers, for the reason ::GARC_Archive gives.
  */
+typedef struct {
+  int started; ///< Whether the 8-byte magic has gone out.
+} GARC_Ar_Write_State;
+
+typedef struct {
+  uint64_t inode;   ///< The next inode number to hand out.
+  uint64_t padding; ///< Zero bytes owed after the current member's data.
+} GARC_Cpio_Write_State;
+
+typedef struct {
+  int started;        ///< Whether the script's opening lines have gone out.
+  int uu;             ///< Whether data is uuencoded rather than text.
+  int in_data;        ///< Whether a data section is open.
+  int at_line_start;  ///< Text mode: the next byte begins a line.
+  int last_newline;   ///< Text mode: the last byte written was a newline.
+  uint64_t written;   ///< Data bytes written for the current member.
+  uint8_t pending[45]; ///< Uuencode: bytes waiting for a full line.
+  size_t pending_length;
+  GARC_Buffer name;   ///< The open member's name, for the chmod after its data.
+  int chmod_valid;    ///< Whether that chmod is owed.
+  uint32_t chmod_mode;
+} GARC_Shar_Write_State;
+
 struct GARC_Writer {
   /** The sink, borrowed. The caller destroys it; garc_writer_destroy() does
    *  not. */
@@ -223,6 +246,10 @@ struct GARC_Writer {
 
   /** What only the 7z writer looks at: NULL for every other format. */
   struct GARC_SevenZ_Write * sevenz;
+
+  GARC_Ar_Write_State ar;
+  GARC_Cpio_Write_State cpio;
+  GARC_Shar_Write_State shar;
 };
 
 /**

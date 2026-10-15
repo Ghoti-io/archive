@@ -793,6 +793,60 @@ before anything is recorded so a refused member leaves no trace.
 **The header is plain.** 7-Zip encodes it; saving a few hundred bytes would cost
 a second encoder pass, and every reader accepts a plain one.
 
+## 7b. ar, cpio and shar, which are streams
+
+None of the three has an index, a compressor or a header at the end, so each is
+read straight through and written in one pass. That is the reason they were cheap
+and the reason they are in one section: what they share is the shape tar has.
+
+**The window.** Identification reads one 512-byte block and keeps it so that a
+pipe can be read. tar's header is exactly a block, so the window is empty when a
+member's data begins. ar's header is 60 bytes and cpio's 76 or 110, so the window
+still holds the start of the first member's data, and a read or a skip that went
+to the stream would lose it. `garc_read_member()` and `garc_skip_member()` now
+go through the window for every format (`garc_reader_discard()` is the skip), and
+the pipe-shaped half of the tests is what fails if either stops.
+
+**ar is three conventions on one header.** A name is 16 bytes, and what happens
+when it does not fit is a convention: System V ends short names in `/` and keeps
+long ones in a `//` member that later headers index as `/offset`; BSD writes
+`#1/N` and puts N bytes of name at the front of the data. The reader takes both,
+and the plain one, and consumes the symbol tables (`/`, `/SYM64/`, `__.SYMDEF*`)
+without reporting them - a linker's index is not a file - but only while no real
+member has been seen, so a file that is *named* `__.SYMDEF` later is a file.
+
+**ar's writer chooses by what streams.** GNU's table has to be written before the
+members that point into it, which needs every long name up front. BSD's needs
+only the member's own name. So a name of at most 15 bytes with no `/`, no
+trailing space and no leading `/` or `#1/` is written System V and everything else
+BSD. GNU `ar` reads the BSD form; 7-Zip does not, and the writer gate does not ask
+it.
+
+**cpio's header is ASCII, and its dialects differ in padding.** newc aligns the
+name and the data to four bytes counted from the header's start; odc aligns
+nothing. A member called `TRAILER!!!` ends the archive, and a stream that stops
+where a header would begin ends it too, because writers do. The sizes are 32 bits
+(33 in odc), so nothing here widens. Types come from the mode's high bits as in a
+stat; a symlink's target is its data and is read into the member eagerly, as tar's
+`linkname` is.
+
+**The binary dialect is recognised and refused.** Its header is a struct in the
+writer's byte order, which cannot be read without deciding which machine wrote
+it, and nothing in the image writes one to check against.
+
+**shar is a program.** Reading one would mean predicting what a shell does with
+it, which is the question this library is built not to answer, so
+`GARC_FORMAT_SHAR` is a writer's format only. The script is the shape libarchive
+writes: an `echo x name` per member, `sed 's/^X//'` between here-document
+delimiters, `X` on every line so that no data line can be the delimiter, and
+`chmod` after. Every name is single-quoted with an embedded quote written `'\''`;
+a name with a newline cannot be and is invalid. Text mode cannot carry a NUL or a
+last line without a newline (sed would add one), and says so at the byte; the
+uuencode mode carries anything and needs `uudecode`. **The unit test for the
+script's bytes had been written from what the code did and omitted the `chmod`
+after a file's data; running the script under `sh` is what showed the file came
+out with the wrong mode.**
+
 ## 8. The result vocabulary, and its two departures
 
 CONVENTIONS.md section 5 fixes the result vocabulary. This library departs
