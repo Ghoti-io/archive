@@ -24,6 +24,7 @@
 #include <ghoti.io/cutil/file.h>
 #include <ghoti.io/cutil/path.h>
 
+#include "sevenz_builder.h"
 #include "tar_builder.h"
 #include "tar_manifest.h"
 
@@ -518,6 +519,74 @@ TEST_F(ExtractRoot, PackAndExtractRoundTripMatchesBytesAndMasksModes) {
   EXPECT_EQ(0755u, file_id.mode);
   EXPECT_EQ(0u, dir_id.mode & 07000u);
   EXPECT_EQ(0755u, dir_id.mode);
+
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  remove_tree(out);
+}
+
+//-----------------------------------------------------------------------------
+// 7z goes through the same layer
+//-----------------------------------------------------------------------------
+
+TEST_F(ExtractRoot, ASevenZipArchiveExtractsWithItsBytesAndMasksItsModes) {
+  Opened opened(read_fixture(std::string(GARC_TEST_DATA) + "/sevenz/basic.7z"));
+  opened.open();
+  ASSERT_EQ(GARC_OK, garc_fs_extract(opened.archive, root.c_str(), 0));
+  EXPECT_EQ("hello, archive\n", read_file(join_path(root, "hello.txt")));
+  EXPECT_EQ("nested\n", read_file(join_path(root, "sub/deep/nested.txt")));
+  EXPECT_EQ(std::string(11600, '\0').size(),
+      read_file(join_path(root, "compressible.txt")).size());
+  EXPECT_TRUE(list_dir(join_path(root, "emptydir")).empty());
+  GCU_File_Identity id;
+  ASSERT_EQ(GCU_FILE_OK,
+      gcu_file_identity(join_path(root, "program.bin").c_str(), &id));
+  EXPECT_EQ(0755u, id.mode & 0777u);
+  expect_parent_unchanged();
+}
+
+TEST_F(ExtractRoot, ASevenZipArchiveWithEscapingNamesWritesNothing) {
+  garctest::SzBuilder builder;
+  builder.add("ok.txt", "fine");
+  builder.add("../escaped", "x");
+  builder.add("/tmp/ghoti-escaped-fs", "x");
+  const std::string built = builder.build();
+  Opened opened(std::vector<uint8_t>(built.begin(), built.end()));
+  opened.open();
+  EXPECT_EQ(GARC_ERR_REFUSED, garc_fs_extract(opened.archive, root.c_str(), 0));
+  EXPECT_FALSE(gcu_file_exists("/tmp/ghoti-escaped-fs"));
+  expect_parent_unchanged();
+}
+
+TEST_F(ExtractRoot, PackedAsSevenZipAndExtractedAgainMatches) {
+  ASSERT_EQ(GCU_FILE_OK, gcu_dir_create(join_path(root, "sub").c_str()));
+  write_file(join_path(root, "sub/note.txt"), "hello");
+  write_file(join_path(root, "top.txt"), std::string(50000, 'z'));
+
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_memory(&sink));
+  GARC_Writer * writer = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_writer_create(sink, GARC_FORMAT_SEVENZ, nullptr, &writer));
+  ASSERT_EQ(GARC_OK, garc_fs_pack(writer, root.c_str(), 0));
+  ASSERT_EQ(GARC_OK, garc_writer_finish(writer));
+  const void * packed = nullptr;
+  size_t packed_size = 0;
+  ASSERT_EQ(GARC_OK, garc_sink_data(sink, &packed, &packed_size));
+
+  char * other = nullptr;
+  ASSERT_EQ(GCU_FILE_OK,
+      gcu_dir_temp_create(nullptr, "garc-fs-out", nullptr, &other));
+  std::string out = other;
+  gcu_dir_free_path(nullptr, other);
+
+  Opened opened(std::vector<uint8_t>(
+      static_cast<const uint8_t *>(packed),
+      static_cast<const uint8_t *>(packed) + packed_size));
+  opened.open();
+  ASSERT_EQ(GARC_OK, garc_fs_extract(opened.archive, out.c_str(), 0));
+  EXPECT_EQ("hello", read_file(join_path(out, "sub/note.txt")));
+  EXPECT_EQ(std::string(50000, 'z'), read_file(join_path(out, "top.txt")));
 
   garc_writer_destroy(writer);
   garc_sink_destroy(sink);
