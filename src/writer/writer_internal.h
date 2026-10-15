@@ -220,6 +220,9 @@ struct GARC_Writer {
 
   /** What only the zip writer looks at. Meaningless for any other format. */
   GARC_Zip_Write_State zip;
+
+  /** What only the 7z writer looks at: NULL for every other format. */
+  struct GARC_SevenZ_Write * sevenz;
 };
 
 /**
@@ -310,6 +313,20 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer);
  * @param writer The writer.
  */
 void garc_zip_write_release(GARC_Writer * writer);
+
+GARC_Result garc_sevenz_write_begin(GARC_Writer * writer);
+
+GARC_Result garc_sevenz_write_member(
+    GARC_Writer * writer, const GARC_Member * member);
+
+GARC_Result garc_sevenz_write_data(
+    GARC_Writer * writer, const void * data, size_t size);
+
+GARC_Result garc_sevenz_write_close_member(GARC_Writer * writer);
+
+GARC_Result garc_sevenz_write_end(GARC_Writer * writer);
+
+void garc_sevenz_write_release(GARC_Writer * writer);
 
 /**
  * Write the end-of-archive marker and whatever padding the options ask for.

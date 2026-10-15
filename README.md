@@ -101,7 +101,20 @@ with a lone surrogate becoming U+FFFD. A time is a FILETIME and is reported with
 when its `0x8000` flag says it is there, and that is also where a symlink is
 recognised, its target being the member's data. The fixtures are written by
 7-Zip 25.01 in the pinned container and the expectation is the source tree they
-were made from. Writing 7z is not done yet.
+were made from.
+
+**Writes 7z**, to a sink that can patch (a pipe cannot be given its start
+header after the fact, and is `GARC_ERR_NOT_SEEKABLE`). The packed streams go
+out as members arrive and the header goes out last; the 32 bytes at the front
+are reserved and then patched. LZMA2 is the default and the zero of the option,
+as in 7-Zip; LZMA, bzip2, deflate and copy are named. The archive is solid
+unless `sevenz_non_solid` is set. A name must be well-formed UTF-8 (the format
+stores UTF-16, and there is none for other bytes), a symlink's target is written
+as its data, and a hard link, device or fifo is `GARC_ERR_UNSUPPORTED`. The
+header is written plain rather than encoded, which every reader accepts and
+which saves a second encoder. `make check-sevenz-writer` hands six archives to
+7-Zip and libarchive and compares what each says with what was meant; neither
+is asked what it cannot say.
 
 **ZipCrypto is read and will never be written.** The traditional PKWARE cipher
 needs no cryptography library at all - it is three words mixed with CRC-32, which

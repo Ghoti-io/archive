@@ -752,6 +752,38 @@ member.
 `manifest.tsv` is computed from the source files - names, types, modes, times,
 sizes and CRC-32 - and not from reading any archive back.
 
+### Writing 7z
+
+The mirror of the reader, and with zip's shape: packed streams out as members
+arrive, every size and CRC remembered, the header last. The signature header
+that points at it is 32 zero bytes at the front, **patched** when the header's
+position is known, so a sink that cannot patch is refused at create with
+`GARC_ERR_NOT_SEEKABLE` and the refusal says what to supply. Buffering the
+archive to get round it would hide a cost the caller should choose.
+
+**One encoder, reset per folder.** A solid archive is one folder, so one encoder
+for the whole archive; a non-solid one resets it between files. The dictionary
+is stated to the encoder (8 MiB) rather than defaulted, so the property bytes in
+the header are the ones the encoder used and cannot drift if a default moves.
+LZMA writes an end marker, because the size is not known when the stream starts;
+the reader accepts one after the declared number of bytes.
+
+**What decides a coder is the option, and what decides a folder is solidness.**
+There is no per-file choice: a member whose data does not compress keeps the
+coder, as in zip, because the method is fixed before the first byte arrives.
+
+**Metadata.** Times are FILETIME ticks (100 ns), refused if they precede 1601 or
+overflow; the mode goes in the attribute word's high half under the `0x8000`
+flag with the type bits added (`S_IFREG`, `S_IFDIR`, `S_IFLNK`), which is what
+7-Zip on Unix writes and what makes a symlink recognisable; a directory is an
+empty stream with no empty-file bit and an empty file is an empty stream *with*
+it. Names are converted to UTF-16 here and must be well-formed UTF-8: overlong
+forms, surrogates and code points above U+10FFFF are `GARC_ERR_INVALID`, checked
+before anything is recorded so a refused member leaves no trace.
+
+**The header is plain.** 7-Zip encodes it; saving a few hundred bytes would cost
+a second encoder pass, and every reader accepts a plain one.
+
 ## 8. The result vocabulary, and its two departures
 
 CONVENTIONS.md section 5 fixes the result vocabulary. This library departs

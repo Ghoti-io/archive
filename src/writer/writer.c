@@ -37,6 +37,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "sevenz/sevenz_internal.h"
 #include "tar/tar_internal.h"
 #include "writer/writer_internal.h"
 #include "zip/zip_internal.h"
@@ -53,6 +54,9 @@ void garc_writer_options_default(GARC_Writer_Options * options) {
   // Off, because a zip64 field on a member that does not need one is refused by
   // some old readers. GARC_Writer_Options says why the knob exists at all.
   options->zip_force_zip64 = 0;
+  // LZMA2 solid, which is 7-Zip's default and the zero of both fields.
+  options->sevenz_method = GARC_SEVENZ_LZMA2;
+  options->sevenz_non_solid = 0;
   // Stored, which is also this field's zero. GARC_Writer_Options argues it.
   options->zip_method = GARC_ZIP_METHOD_STORED;
   // No password. A zero-filled struct agrees: the pointer and the length are
@@ -93,9 +97,16 @@ static GARC_Result writer_close_member(GARC_Writer * writer) {
   // Each format's own closing work, through a hook rather than inline: tar pads
   // and zip writes a descriptor or patches a header and appends a directory
   // entry, and neither rule belongs in the file that has no format in it.
-  GARC_Result result = writer->format == GARC_FORMAT_ZIP
-      ? garc_zip_write_close_member(writer)
-      : garc_tar_write_close_member(writer);
+  GARC_Result result;
+  if (writer->format == GARC_FORMAT_SEVENZ) {
+    result = garc_sevenz_write_close_member(writer);
+  }
+  else if (writer->format == GARC_FORMAT_ZIP) {
+    result = garc_zip_write_close_member(writer);
+  }
+  else {
+    result = garc_tar_write_close_member(writer);
+  }
   if (result != GARC_OK) {
     return result;
   }
@@ -186,6 +197,23 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
     // checked: a caller copying an archive from tar to zip should not have to
     // clear a field that describes the format they are no longer writing.
   }
+  else if (format == GARC_FORMAT_SEVENZ) {
+    // The signature header at the front is written last, so the sink has to be
+    // able to go back for it. See sevenz_write.c.
+    if (!garc_sink_is_seekable(sink)) {
+      return GARC_ERR_NOT_SEEKABLE;
+    }
+    switch (resolved.sevenz_method) {
+      case GARC_SEVENZ_LZMA2:
+      case GARC_SEVENZ_LZMA:
+      case GARC_SEVENZ_BZIP2:
+      case GARC_SEVENZ_DEFLATE:
+      case GARC_SEVENZ_COPY:
+        break;
+      default:
+        return GARC_ERR_INVALID;
+    }
+  }
   else {
     // GARC_FORMAT_UNKNOWN included: a caller who has not said what to write has
     // not said it, and there is no format to guess at from a sink.
@@ -221,6 +249,14 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
     writer->options.zip_password_length = 0;
   }
 
+  if (format == GARC_FORMAT_SEVENZ) {
+    const GARC_Result begun = garc_sevenz_write_begin(writer);
+    if (begun != GARC_OK) {
+      garc_writer_destroy(writer);
+      return begun;
+    }
+  }
+
   *out_writer = writer;
   return GARC_OK;
 }
@@ -238,9 +274,15 @@ GARC_Result garc_writer_add(GARC_Writer * writer, const GARC_Member * member) {
     return result;
   }
 
-  result = writer->format == GARC_FORMAT_ZIP
-      ? garc_zip_write_member(writer, member)
-      : garc_tar_write_member(writer, member);
+  if (writer->format == GARC_FORMAT_SEVENZ) {
+    result = garc_sevenz_write_member(writer, member);
+  }
+  else if (writer->format == GARC_FORMAT_ZIP) {
+    result = garc_zip_write_member(writer, member);
+  }
+  else {
+    result = garc_tar_write_member(writer, member);
+  }
   if (result != GARC_OK) {
     // have_member stays clear: a header that was not written describes nothing,
     // and leaving a member open would make the next add() pad for data that has
@@ -271,9 +313,16 @@ GARC_Result garc_writer_write(
     return GARC_OK;
   }
 
-  GARC_Result result = writer->format == GARC_FORMAT_ZIP
-      ? garc_zip_write_data(writer, data, size)
-      : garc_sink_write(writer->sink, data, size);
+  GARC_Result result;
+  if (writer->format == GARC_FORMAT_SEVENZ) {
+    result = garc_sevenz_write_data(writer, data, size);
+  }
+  else if (writer->format == GARC_FORMAT_ZIP) {
+    result = garc_zip_write_data(writer, data, size);
+  }
+  else {
+    result = garc_sink_write(writer->sink, data, size);
+  }
   if (result != GARC_OK) {
     return result;
   }
@@ -291,8 +340,15 @@ GARC_Result garc_writer_finish(GARC_Writer * writer) {
     return result;
   }
 
-  result = writer->format == GARC_FORMAT_ZIP ? garc_zip_write_end(writer)
-                                            : garc_tar_write_end(writer);
+  if (writer->format == GARC_FORMAT_SEVENZ) {
+    result = garc_sevenz_write_end(writer);
+  }
+  else if (writer->format == GARC_FORMAT_ZIP) {
+    result = garc_zip_write_end(writer);
+  }
+  else {
+    result = garc_tar_write_end(writer);
+  }
   if (result != GARC_OK) {
     return result;
   }
@@ -325,6 +381,11 @@ void garc_writer_dump(const GARC_Writer * writer, FILE * out) {
         (unsigned long long)writer->zip.entries,
         (unsigned long long)writer->zip.central.length);
   }
+  else if (writer->format == GARC_FORMAT_SEVENZ) {
+    fprintf(out, "GARC_Writer: format=7z method=%d%s\n",
+        (int)writer->options.sevenz_method,
+        writer->options.sevenz_non_solid ? " non-solid" : "");
+  }
   else {
     fprintf(out, "GARC_Writer: format=%s variant=%s blocking=%u\n",
         garc_format_string(writer->format),
@@ -351,5 +412,6 @@ void garc_writer_destroy(GARC_Writer * writer) {
   // for a tar writer and garc_buffer_free() of a NULL buffer is a no-op, so a
   // condition here would be a second place the format lives for no gain.
   garc_zip_write_release(writer);
+  garc_sevenz_write_release(writer);
   gcu_allocator_free(allocator, writer);
 }

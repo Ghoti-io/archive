@@ -631,6 +631,16 @@ $(ZIP_WRITER_PROBE): tools/oracle/zip_writer_probe.c \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
 
+# The 7z writer's probe, built the same way and for the same reasons as the zip
+# one: it links the library under test, so it is a target of its own.
+SEVENZ_WRITER_PROBE := $(APP_DIR)/oracle/sevenz_writer_probe$(EXE_EXTENSION)
+
+$(SEVENZ_WRITER_PROBE): tools/oracle/sevenz_writer_probe.c \
+		$(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Probe: sevenz_writer_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
+
 ####################################################################
 # Commands
 ####################################################################
@@ -639,7 +649,7 @@ $(ZIP_WRITER_PROBE): tools/oracle/zip_writer_probe.c \
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-corpus-hashes check-corpus corpus oracle-build oracle-version
 .PHONY: zip-corpus check-zip-corpus check-zip-oracle sevenz-corpus check-sevenz-corpus
-.PHONY: check-oracle check-writer check-zip-writer
+.PHONY: check-oracle check-writer check-zip-writer check-sevenz-writer
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1366,6 +1376,14 @@ check-zip-writer: ## Fail if the references disagree with the zip the writer pro
 check-zip-writer: $(ZIP_WRITER_PROBE)
 	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
 		python3 $(ORACLE)/check_zip_writer.py --probe $(ZIP_WRITER_PROBE)
+
+check-sevenz-writer: ## Fail if the references disagree with the 7z the writer produces
+# The 7z half of check-zip-writer, and a target of its own for the same reason:
+# it links the library under test, so it is not in TEST_GATES and not in
+# DEPLESS_GOALS.
+check-sevenz-writer: $(SEVENZ_WRITER_PROBE)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+		python3 $(ORACLE)/check_sevenz_writer.py --probe $(SEVENZ_WRITER_PROBE)
 
 ####################################################################
 # Install / uninstall

@@ -112,6 +112,20 @@ extern "C" {
 typedef struct GARC_Writer GARC_Writer;
 
 /**
+ * @brief How a 7z folder's data is compressed.
+ *
+ * Zero is LZMA2, 7-Zip's own default, so that a zero-filled options struct is
+ * the default archive.
+ */
+typedef enum {
+  GARC_SEVENZ_LZMA2 = 0, ///< LZMA2, one property byte.
+  GARC_SEVENZ_LZMA,      ///< LZMA, five property bytes.
+  GARC_SEVENZ_BZIP2,     ///< bzip2.
+  GARC_SEVENZ_DEFLATE,   ///< Raw deflate.
+  GARC_SEVENZ_COPY       ///< Stored.
+} GARC_SevenZ_Method;
+
+/**
  * @brief How an archive is to be written.
  *
  * Pass NULL wherever this is accepted to use ::garc_writer_options_default(),
@@ -255,6 +269,24 @@ typedef struct GARC_Writer_Options {
    * for tar.
    */
   int zip_force_zip64;
+
+  /**
+   * How a 7z archive's data is compressed. Ignored for tar and zip.
+   *
+   * ::GARC_SEVENZ_LZMA2 is 0 and is the default, as it is 7-Zip's.
+   */
+  GARC_SevenZ_Method sevenz_method;
+
+  /**
+   * Write one folder per file instead of one folder for all of them.
+   *
+   * Off by default, as in 7-Zip: a solid archive compresses better because
+   * every file sees the ones before it, and costs more to read, because
+   * reaching a later file means decoding the earlier ones. A non-solid archive
+   * is the other trade. Zero is solid, so a zero-filled struct is the default.
+   * Ignored for tar and zip.
+   */
+  int sevenz_non_solid;
 } GARC_Writer_Options;
 
 /**
@@ -273,14 +305,15 @@ GARC_API void garc_writer_options_default(GARC_Writer_Options * options);
  * ::garc_writer_add().
  *
  * @param sink Where the bytes go.
- * @param format Which container to write: ::GARC_FORMAT_TAR or
- *   ::GARC_FORMAT_ZIP.
+ * @param format Which container to write: ::GARC_FORMAT_TAR,
+ *   ::GARC_FORMAT_ZIP or ::GARC_FORMAT_SEVENZ.
  * @param options How to write it. NULL uses ::garc_writer_options_default().
  * @param out_writer Receives the writer on success.
  * @return ::GARC_OK, ::GARC_ERR_INVALID, ::GARC_ERR_OOM,
  *   ::GARC_ERR_UNSUPPORTED for a format or a variant this library does not
  *   write, or ::GARC_ERR_NOT_SEEKABLE when ::GARC_ZIP_SIZES_LOCAL is asked of a
- *   sink that cannot be patched.
+ *   sink that cannot be patched, or when a 7z is asked of one: its signature
+ *   header is written last, over 32 bytes reserved at the front.
  */
 GARC_API GARC_Result garc_writer_create(GARC_Sink * sink, GARC_Format format,
     const GARC_Writer_Options * options, GARC_Writer ** out_writer);
