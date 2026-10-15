@@ -741,6 +741,15 @@ because it is four streams through a range coder whose definition lives in code
 rather than in a published specification; this library does not port other
 implementations' source.
 
+**7z encryption is refused for the same reason.** The coder id is recognised
+nowhere and is `GARC_ERR_UNSUPPORTED` like any other; the key derivation (a
+SHA-256 iterated a stated number of times over the salt, the password and a
+counter) and the AES-CBC framing are defined by the reference implementation's
+source, and the only way to learn them would be to read it. That is a decision
+for the maintainer, not a default: the choice made on 2026-10-15 was to leave
+BCJ2 and AES refused. `security` already has AES-CBC and SHA-256, so the cost of
+revisiting it is the specification, not the primitives.
+
 **Names are the one conversion.** Elsewhere a name is the bytes the container
 carried. 7z stores UTF-16LE, so the reader converts to UTF-8 and says so with
 `GARC_NAME_UTF8`. A lone surrogate is reported as U+FFFD rather than as an error:
