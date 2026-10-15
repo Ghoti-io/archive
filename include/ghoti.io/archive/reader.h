@@ -88,6 +88,7 @@ typedef enum {
   GARC_FORMAT_UNKNOWN = 0, ///< Not a container this library reads.
   GARC_FORMAT_TAR,         ///< A tar stream, in any of its variants.
   GARC_FORMAT_ZIP,         ///< A zip, which is read from its end backwards.
+  GARC_FORMAT_SEVENZ,      ///< A 7z, whose header is at the end of the file.
   GARC_FORMAT_COUNT
 } GARC_Format;
 

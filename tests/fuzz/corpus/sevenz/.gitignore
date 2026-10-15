@@ -1,0 +1,4 @@
+# Seeds are tracked; what the fuzzer adds beside them is not.
+*
+!.gitignore
+!*.seed

@@ -638,7 +638,7 @@ $(ZIP_WRITER_PROBE): tools/oracle/zip_writer_probe.c \
 # General commands
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-corpus-hashes check-corpus corpus oracle-build oracle-version
-.PHONY: zip-corpus check-zip-corpus check-zip-oracle
+.PHONY: zip-corpus check-zip-corpus check-zip-oracle sevenz-corpus check-sevenz-corpus
 .PHONY: check-oracle check-writer check-zip-writer
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
@@ -1229,7 +1229,7 @@ endef
 # aggregate target below. Two lists is how a harness comes to exist, build, and
 # never be run by `make fuzz` - which adding the writer harness demonstrated, by
 # building and passing while the aggregate still named three.
-FUZZ_HARNESSES := stream tar name writer find zip
+FUZZ_HARNESSES := stream tar name writer find zip sevenz
 
 $(foreach harness,$(FUZZ_HARNESSES),\
 	$(eval $(call fuzz-rule,fuzz_$(harness),$(harness))))
@@ -1323,6 +1323,16 @@ check-zip-corpus: ## Fail if the pinned references no longer produce the zip cor
 check-oracle: ## Fail if the live references disagree with the committed manifest
 	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) tar,bsdtar,pytarfile -- \
 		python3 $(ORACLE)/check_manifest.py
+
+sevenz-corpus: ## Regenerate tests/data/sevenz/ and containers/CORPUS-SEVENZ in the container
+# 7-Zip is the only 7z writer in the reference image, so the manifest is computed
+# from the source tree rather than read back from an archive. See the generator.
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) sevenzip -- \
+		python3 $(ORACLE)/make_sevenz_corpus.py
+
+check-sevenz-corpus: ## Fail if the pinned 7-Zip no longer produces the 7z corpus
+	@GHOTI_ORACLE_REQUIRED=1 $(ORACLE_RUN) sevenzip -- \
+		python3 $(ORACLE)/make_sevenz_corpus.py --check
 
 check-zip-oracle: ## Fail if the live references read the zip corpus differently
 # The only gate that covers the three zip fixtures with no digest in CORPUS-ZIP: a

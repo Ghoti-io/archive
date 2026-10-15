@@ -710,6 +710,48 @@ and reports both. So does this: silently picking one would be deciding which of
 two answers a caller wanted, and the two have different contents.
 `garc_find()` returns the first, which is the same rule the tar reader follows.
 
+## 7a. 7z, which is read from a header at the end
+
+A 7z begins with a 32-byte signature header, and the only thing of interest in
+it is where the real header is, near the end. That header describes **folders** -
+each a graph of coders turning packed streams into one unpacked stream - and the
+**substreams** that are the files cut from a folder's output. Solid compression
+is one folder holding many files, which makes a member's bytes a position in a
+decoder's output rather than a range of the file. The reader therefore keeps one
+folder's decoder open and moves forward through it; advancing past a member
+decodes and discards whatever the caller did not read, and a later member in a
+different folder closes the first and opens the next. Going backwards is a
+rewind, which is how `garc_find()` works here as everywhere.
+
+**Nothing in the header is believed.** Every count is bounded by the bytes
+remaining *after the count was read* (an earlier version bounded it by the bytes
+before, which the fuzzer turned into a 4-byte over-read the first time its
+checksums were repaired); every offset is checked against the stream's size; the
+substream sizes in a folder must sum to the folder's unpacked size; a property
+that the reader acts on may appear only once, because a second would overwrite
+what the first allocated; and the header and every file are checked by their
+CRC-32. Each decoder runs under `limits.max_output_bytes` equal to the size the
+header declared for it. The filters take no `limits.*` keys and need none.
+
+**What is refused, and where.** The coder graph is checked when a folder is
+opened, not when the header is parsed, so an archive containing a BCJ2 folder can
+still be listed: the metadata is good and the data is not readable, which the zip
+reader already treats as an ordinary state (`data_refusal`). BCJ2 is refused
+because it is four streams through a range coder whose definition lives in code
+rather than in a published specification; this library does not port other
+implementations' source.
+
+**Names are the one conversion.** Elsewhere a name is the bytes the container
+carried. 7z stores UTF-16LE, so the reader converts to UTF-8 and says so with
+`GARC_NAME_UTF8`. A lone surrogate is reported as U+FFFD rather than as an error:
+Windows file names can contain them and refusing the walk would lose every other
+member.
+
+**The fixtures are checked against the tree they were made from.** There is one
+7z writer in the reference image, so there is no second reader to disagree with.
+`manifest.tsv` is computed from the source files - names, types, modes, times,
+sizes and CRC-32 - and not from reading any archive back.
+
 ## 8. The result vocabulary, and its two departures
 
 CONVENTIONS.md section 5 fixes the result vocabulary. This library departs

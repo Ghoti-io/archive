@@ -36,6 +36,7 @@
 #include <string.h>
 
 #include "reader/reader_internal.h"
+#include "sevenz/sevenz_internal.h"
 #include "tar/tar_internal.h"
 #include "zip/zip_internal.h"
 
@@ -47,6 +48,8 @@ const char * garc_format_string(GARC_Format format) {
       return "tar";
     case GARC_FORMAT_ZIP:
       return "zip";
+    case GARC_FORMAT_SEVENZ:
+      return "7z";
     case GARC_FORMAT_COUNT:
     default:
       return "invalid";
@@ -111,6 +114,15 @@ static GARC_Result reader_identify(GARC_Archive * archive) {
     return GARC_OK;
   }
 
+  if (garc_sevenz_identify(archive->peek, total)) {
+    if (!garc_stream_is_seekable(archive->stream)) {
+      // The header is at the end, so a 7z cannot be read as it arrives.
+      return GARC_ERR_NOT_SEEKABLE;
+    }
+    archive->format = GARC_FORMAT_SEVENZ;
+    return GARC_OK;
+  }
+
   if (garc_zip_identify(archive->peek, total)) {
     if (!garc_stream_is_seekable(archive->stream)) {
       // A zip, and unreadable this way. Saying so by name matters: a caller
@@ -158,6 +170,9 @@ static GARC_Result reader_identify(GARC_Archive * archive) {
  * @return ::GARC_OK, or the format's failure.
  */
 static GARC_Result reader_open_format(GARC_Archive * archive) {
+  if (archive->format == GARC_FORMAT_SEVENZ) {
+    return garc_sevenz_open(archive);
+  }
   if (archive->format != GARC_FORMAT_ZIP) {
     return GARC_OK;
   }
@@ -193,6 +208,9 @@ static void reader_release(GARC_Archive * archive) {
       break;
     case GARC_FORMAT_ZIP:
       garc_zip_release(archive);
+      break;
+    case GARC_FORMAT_SEVENZ:
+      garc_sevenz_release(archive);
       break;
     default:
       // Identification failed, so no format reader has run and there is nothing
@@ -307,6 +325,9 @@ GARC_Result garc_next(GARC_Archive * archive, const GARC_Member ** out_member) {
     case GARC_FORMAT_ZIP:
       result = garc_zip_next(archive);
       break;
+    case GARC_FORMAT_SEVENZ:
+      result = garc_sevenz_next(archive);
+      break;
     default:
       // reader_identify() refuses anything else, so reaching this is a bug in
       // this file rather than a fact about the input.
@@ -403,6 +424,9 @@ static GARC_Result reader_rewind(GARC_Archive * archive) {
     case GARC_FORMAT_ZIP:
       garc_zip_rewind(archive);
       break;
+    case GARC_FORMAT_SEVENZ:
+      garc_sevenz_rewind(archive);
+      break;
     default:
       // Unreachable, and kept for the reason the switch in garc_next() gives:
       // identification sets one of the two formats above, so `make coverage`
@@ -478,6 +502,9 @@ GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,
     // borrowing each other's assumptions.
     return garc_zip_read(archive, buffer, capacity, out_read);
   }
+  if (archive->format == GARC_FORMAT_SEVENZ && archive->data_refusal == GARC_OK) {
+    return garc_sevenz_read(archive, buffer, capacity, out_read);
+  }
   if (archive->data_refusal != GARC_OK) {
     // A member whose metadata was readable and whose bytes are not: a zip member
     // compressed with a method there is no codec for, or encrypted. Answered
@@ -524,6 +551,9 @@ GARC_Result garc_skip_member(GARC_Archive * archive) {
   }
   if (!archive->have_member) {
     return GARC_ERR_INVALID;
+  }
+  if (archive->format == GARC_FORMAT_SEVENZ) {
+    return garc_sevenz_skip(archive);
   }
   if (archive->format == GARC_FORMAT_ZIP) {
     // Nothing to read past: the next member's position comes from the central
@@ -599,6 +629,13 @@ void garc_archive_dump(const GARC_Archive * archive, FILE * out) {
           archive->zip.encryption == GARC_ZIP_ENCRYPTION_NONE ? ""
               : garc_zip_encryption_string(archive->zip.encryption));
     }
+  }
+  if (archive->format == GARC_FORMAT_SEVENZ) {
+    uint64_t folders = 0;
+    uint64_t files = 0;
+    garc_sevenz_counts(archive, &folders, &files);
+    fprintf(out, "  7z: %llu folders, %llu entries\n",
+        (unsigned long long)folders, (unsigned long long)files);
   }
   fprintf(out, "  members: %llu\n", (unsigned long long)archive->member_count);
   fprintf(out, "  declared bytes: %llu\n",

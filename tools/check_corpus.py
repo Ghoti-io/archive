@@ -55,6 +55,9 @@ CORPORA = (
     ("zip", os.path.join(ROOT, "tests", "data", "zip"),
         os.path.join(HERE, "oracle", "containers", "CORPUS-ZIP"),
         (".zip", ".tsv")),
+    ("sevenz", os.path.join(ROOT, "tests", "data", "sevenz"),
+        os.path.join(HERE, "oracle", "containers", "CORPUS-SEVENZ"),
+        (".7z", ".tsv", ".txt")),
 )
 
 
@@ -78,7 +81,7 @@ def check(label, corpus, hashes, extensions):
     if not want:
         return (["%s: %s lists no files, so this gate checks nothing. Run "
             "`make %scorpus` to regenerate it."
-            % (label, hashes, "" if label == "tar" else "zip-")], 0, 0)
+            % (label, hashes, "" if label == "tar" else label + "-")], 0, 0)
 
     checked = 0
     unhashed = 0

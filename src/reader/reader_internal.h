@@ -423,6 +423,8 @@ struct GARC_Archive {
   GARC_Tar_State tar;
   /** What only the zip reader looks at. Meaningless for any other format. */
   GARC_Zip_State zip;
+  /** What only the 7z reader looks at: NULL for every other format. */
+  struct GARC_SevenZ * sevenz;
 };
 
 /**

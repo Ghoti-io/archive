@@ -1,6 +1,6 @@
 # Ghoti.io Archive
 
-Archive containers — tar and zip — read and written **without touching the
+Archive containers — tar, zip and 7z — read and written **without touching the
 filesystem**. This library walks the members of an archive and hands you each
 one's name, size, time and bytes. The reader and the writer never open,
 create or write a file. The part that does is opt-in and lives in `fs.h`, which
@@ -79,10 +79,29 @@ method 12 a bare bzip2 stream, method 93 a zstd frame, and method 95 a complete 
 header and then raw LZMA (`lzma.raw`), not a `.lzma` file. **Method 9 is refused
 on purpose** - "enhanced deflate" is not RFC 1951, so pointing it at the deflate
 decoder would produce plausible wrong bytes for the members that use its
-extensions. 95 and 98 are refused too, with a status and an accessor that
+extensions. 98 is refused too, with a status and an accessor that
 **name the method number**, so the refusal is a to-do list. ZipCrypto and WinZip
 AES are named separately from each other and from "unsupported", because a caller
 needs to know whether a password could ever help.
+
+**Reads 7z.** The header is at the end of the file, so a 7z needs a stream that
+seeks and is `GARC_ERR_NOT_SEEKABLE` on a pipe. The header is read whole (at most
+64 MiB), checked against its CRC, and decoded first when it is encoded, which is
+7-Zip's default. Folders that are a straight chain of coders are read: copy,
+LZMA, LZMA2, bzip2, deflate, delta, and the x86, PowerPC, IA-64, ARM, ARM
+Thumb, SPARC, ARM64 and RISC-V branch filters, all through `compress`. **A solid
+archive is one folder**, so reaching a later member means decoding the earlier
+ones and discarding them; that is paid when you advance, not up front. Every
+file's CRC-32 is checked when its last byte is read. What is refused, with
+`GARC_ERR_UNSUPPORTED` on the member's *data* and not on the walk, is BCJ2 (four
+input streams), PPMd, deflate64, and encryption. Names are UTF-16 in the format
+and are the one place this library converts text: they are reported as UTF-8,
+with a lone surrogate becoming U+FFFD. A time is a FILETIME and is reported with
+`GARC_TIME_FILETIME`; a Unix mode is read from the attribute word's high half
+when its `0x8000` flag says it is there, and that is also where a symlink is
+recognised, its target being the member's data. The fixtures are written by
+7-Zip 25.01 in the pinned container and the expectation is the source tree they
+were made from. Writing 7z is not done yet.
 
 **ZipCrypto is read and will never be written.** The traditional PKWARE cipher
 needs no cryptography library at all - it is three words mixed with CRC-32, which
