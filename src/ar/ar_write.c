@@ -50,6 +50,7 @@
 
 #include "ar_internal.h"
 
+/** The eight bytes every ar archive begins with. */
 #define AR_MAGIC "!<arch>\n"
 
 /** Write @p value as @p width digits of @p base, left-aligned, space padded. */

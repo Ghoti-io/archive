@@ -570,7 +570,7 @@ uint64_t garc_zip_deflate_bound(uint64_t size);
  * The most bytes @p method can turn @p size bytes into, before AES framing.
  *
  * Deflate and zstd ask `gcomp_encode_bound()`. LZMA has no bound, so the
- * ceiling is ::GCOMP_LZMA_MAX_EXPANSION_RATIO times @p size plus the 9-byte
+ * ceiling is `GCOMP_LZMA_MAX_EXPANSION_RATIO` times @p size plus the 9-byte
  * zip header. Stored is @p size. A size with no bound saturates at
  * `UINT64_MAX`, which is the answer that forces zip64.
  *

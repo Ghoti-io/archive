@@ -144,6 +144,7 @@ enum {
 
 /** FILE_ATTRIBUTE_DIRECTORY, and 7-Zip's "the high 16 bits are st_mode". */
 #define SZ_ATTR_DIRECTORY 0x10u
+/** Set in the attribute word when its high 16 bits are the Unix `st_mode`. */
 #define SZ_ATTR_UNIX_EXTENSION 0x8000u
 
 /** Seconds between 1601-01-01 and 1970-01-01, the FILETIME epoch gap. */
@@ -153,10 +154,11 @@ enum {
 // Cursor
 ////////////////////////////////////////////////////////////////////////
 
+/** A read position in a buffer, which every header parser bounds itself by. */
 typedef struct {
-  const uint8_t * p;
-  size_t len;
-  size_t pos;
+  const uint8_t * p; ///< The buffer.
+  size_t len;        ///< Its length.
+  size_t pos;        ///< The next byte to read.
 } Cur;
 
 static size_t cur_left(const Cur * c) {
@@ -268,6 +270,7 @@ static GARC_Result cur_count_left(Cur * c, uint64_t * v) {
   return GARC_OK;
 }
 
+/** Evaluate a ::GARC_Result and return it from the caller unless it is ::GARC_OK. */
 #define TRY(expr) \
   do { \
     GARC_Result try_result_ = (expr); \
@@ -280,96 +283,107 @@ static GARC_Result cur_count_left(Cur * c, uint64_t * v) {
 // The parsed header
 ////////////////////////////////////////////////////////////////////////
 
+/** One coder of a folder: its id, how many streams it consumes and makes, and its properties. */
 typedef struct {
-  uint8_t id[8];
-  uint8_t id_len;
-  uint32_t num_in;
-  uint32_t num_out;
+  uint8_t id[8];      ///< The method id bytes, most significant first.
+  uint8_t id_len;     ///< How many bytes of @ref id are used.
+  uint32_t num_in;    ///< Streams the coder consumes.
+  uint32_t num_out;   ///< Streams the coder produces.
   uint32_t props_off; ///< Into Streams.props.
-  uint32_t props_len;
+  uint32_t props_len; ///< Property bytes.
 } Coder;
 
+/** Joins one coder's output to another coder's input, within a folder. */
 typedef struct {
-  uint32_t in_index;
-  uint32_t out_index;
+  uint32_t in_index;  ///< The folder-wide index of the input stream.
+  uint32_t out_index; ///< The folder-wide index of the output stream that feeds it.
 } Bind;
 
+/** A folder: a graph of coders that turns packed streams into one unpacked stream. */
 typedef struct {
   uint32_t coder0;   ///< First coder, into Streams.coders.
-  uint32_t ncoders;
+  uint32_t ncoders;  ///< Coders in the folder.
   uint32_t bind0;    ///< First bind pair, into Streams.binds.
-  uint32_t nbind;
+  uint32_t nbind;    ///< Bind pairs in the folder.
   uint32_t packed0;  ///< First packed in-stream index, into Streams.packed.
-  uint32_t npacked;
+  uint32_t npacked;  ///< Packed streams the folder reads.
   uint32_t unpack0;  ///< First out stream's size, into Streams.unpack.
   uint32_t nout;     ///< Out streams in the folder.
   uint32_t pack0;    ///< First pack stream, into Streams.pack_*.
   uint32_t nsub;     ///< Substreams in this folder.
   uint64_t sub0;     ///< First substream, into Streams.sub_*.
-  int has_crc;
-  uint32_t crc;
+  int has_crc;       ///< Whether the whole folder has a CRC-32.
+  uint32_t crc;      ///< That CRC-32, when @ref has_crc.
 } Folder;
 
+/** The parsed stream tables of a header: pack streams, folders, coders, substreams. */
 typedef struct {
-  uint64_t pack_pos;
-  uint32_t num_pack;
-  uint64_t * pack_sizes;
-  uint64_t * pack_offsets;
-  uint32_t num_folders;
-  Folder * folders;
-  Coder * coders;
-  uint32_t num_coders, cap_coders;
-  Bind * binds;
-  uint32_t num_binds, cap_binds;
-  uint32_t * packed;
-  uint32_t num_packed, cap_packed;
-  uint64_t * unpack;
-  uint32_t num_unpack;
-  uint8_t * props;
-  size_t props_len, props_cap;
-  uint64_t num_sub;
-  uint64_t * sub_sizes;
-  uint8_t * sub_has_crc;
-  uint32_t * sub_crc;
+  uint64_t pack_pos;           ///< Offset of the first pack stream after the signature header.
+  uint32_t num_pack;           ///< Pack streams in the archive.
+  uint64_t * pack_sizes;       ///< Each pack stream's size.
+  uint64_t * pack_offsets;     ///< Each pack stream's offset from the first.
+  uint32_t num_folders;        ///< Folders in the archive.
+  Folder * folders;            ///< The folders.
+  Coder * coders;              ///< Every folder's coders, end to end.
+  uint32_t num_coders;         ///< How many of @ref coders are in use.
+  uint32_t cap_coders;         ///< How many @ref coders has room for.
+  Bind * binds;                ///< Every folder's bind pairs, end to end.
+  uint32_t num_binds;          ///< How many of @ref binds are in use.
+  uint32_t cap_binds;          ///< How many @ref binds has room for.
+  uint32_t * packed;           ///< Every folder's packed in-stream indices, end to end.
+  uint32_t num_packed;         ///< How many of @ref packed are in use.
+  uint32_t cap_packed;         ///< How many @ref packed has room for.
+  uint64_t * unpack;           ///< Every folder's out-stream sizes, end to end.
+  uint32_t num_unpack;         ///< How many of @ref unpack are in use.
+  uint8_t * props;             ///< Every coder's property bytes, end to end.
+  size_t props_len;            ///< How many bytes of @ref props are in use.
+  size_t props_cap;            ///< How many bytes @ref props has room for.
+  uint64_t num_sub;            ///< Substreams in the archive, across all folders.
+  uint64_t * sub_sizes;        ///< Each substream's size.
+  uint8_t * sub_has_crc;       ///< Whether each substream has a CRC-32.
+  uint32_t * sub_crc;          ///< Each substream's CRC-32.
 } Streams;
 
+/** One entry of the file table. */
 typedef struct {
-  uint32_t name_off;
-  uint32_t name_len;
-  uint8_t flags;
-  uint64_t mtime;
-  uint32_t attrib;
+  uint32_t name_off; ///< Offset of the name in GARC_SevenZ.names, in bytes.
+  uint32_t name_len; ///< Length of the name in UTF-8 bytes.
+  uint8_t flags;     ///< ::SZF_ANTI, ::SZF_HAS_MTIME and the other SZF_ bits.
+  uint64_t mtime;    ///< FILETIME ticks, when ::SZF_HAS_MTIME.
+  uint32_t attrib;   ///< The attribute word, when ::SZF_HAS_ATTRIB.
   uint64_t sub; ///< Global substream index, when there is a stream.
 } File;
 
+/** The decoders open for one folder, from the packed stream up to the top. */
 typedef struct {
-  GARC_Stream * s[SZ_MAX_CODERS + 1u];
-  size_t n;
-  gcomp_options_t * o[SZ_MAX_CODERS];
-  size_t no;
-  GARC_Stream * top;
+  GARC_Stream * s[SZ_MAX_CODERS + 1u]; ///< The streams, packed slice first.
+  size_t n;                            ///< How many of @ref s are in use.
+  gcomp_options_t * o[SZ_MAX_CODERS];  ///< The options each decoder was given.
+  size_t no;                           ///< How many of @ref o are in use.
+  GARC_Stream * top;                   ///< The stream the unpacked bytes come from.
 } Chain;
 
+/** The 7z reader's state: the parsed header, and where the walk is. */
 struct GARC_SevenZ {
-  Streams main;
-  uint64_t num_files;
-  File * files;
-  char * names;
-  size_t names_len;
-  uint64_t origin;
-  uint64_t stream_size;
-  int have_size;
+  Streams main;        ///< The stream tables.
+  uint64_t num_files;  ///< Entries in the file table.
+  File * files;        ///< The file table.
+  char * names;        ///< Every name converted to UTF-8, end to end.
+  size_t names_len;    ///< Bytes in @ref names.
+  uint64_t origin;     ///< Offset of the signature header in the stream.
+  uint64_t stream_size; ///< The stream's size, when @ref have_size.
+  int have_size;       ///< Whether the stream reported a size.
   /* the walk */
-  uint64_t next_file;
+  uint64_t next_file;  ///< The next entry ::garc_sevenz_next() returns.
   int open_folder;     ///< Index of the folder being read, or -1.
-  uint32_t folder_cursor;
-  Chain chain;
-  uint64_t folder_pos;
-  uint64_t folder_size;
-  uint32_t crc;
-  int crc_active;
-  uint32_t expect_crc;
-  GARC_Buffer link;
+  uint32_t folder_cursor; ///< The folder holding the current member's stream.
+  Chain chain;         ///< The open folder's decoders.
+  uint64_t folder_pos; ///< Bytes of the open folder already decoded.
+  uint64_t folder_size; ///< Bytes the open folder decodes to.
+  uint32_t crc;        ///< The unfinalized CRC-32 of the current member so far.
+  int crc_active;      ///< Whether the current member's bytes are being checksummed.
+  uint32_t expect_crc; ///< The CRC-32 the current member must finish with.
+  GARC_Buffer link;    ///< The current symlink's target, which is its data.
 };
 
 static void * sz_calloc(const GARC_Allocator * a, uint64_t count, size_t size) {
@@ -966,16 +980,17 @@ static GARC_Result wrap_lzma(const Coder * coder, const uint8_t * props,
   return GARC_OK;
 }
 
+/** What this library does with a coder id. */
 typedef enum {
-  SZM_COPY,
-  SZM_LZMA,
-  SZM_LZMA2,
-  SZM_BZIP2,
-  SZM_DEFLATE,
-  SZM_DEFLATE64,
-  SZM_DELTA,
-  SZM_BCJ,
-  SZM_UNSUPPORTED
+  SZM_COPY,        ///< No coder: the bytes are stored.
+  SZM_LZMA,        ///< LZMA, with five property bytes.
+  SZM_LZMA2,       ///< LZMA2, with one property byte.
+  SZM_BZIP2,       ///< bzip2.
+  SZM_DEFLATE,     ///< Raw deflate.
+  SZM_DEFLATE64,   ///< Raw deflate64.
+  SZM_DELTA,       ///< The delta filter.
+  SZM_BCJ,         ///< A branch filter; the architecture is returned beside it.
+  SZM_UNSUPPORTED  ///< Anything else: BCJ2, PPMd, encryption, an unknown id.
 } Sz_Kind;
 
 /** Map a coder id to what this library does with it. */

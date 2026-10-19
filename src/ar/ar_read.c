@@ -59,8 +59,11 @@
 #include "../tar/tar_internal.h"
 #include "ar_internal.h"
 
+/** The eight bytes every ar archive begins with. */
 #define AR_MAGIC "!<arch>\n"
+/** How long ::AR_MAGIC is. */
 #define AR_MAGIC_LENGTH 8u
+/** The size of a member header: name 16, date 12, uid 6, gid 6, mode 8, size 10, end 2. */
 #define AR_HEADER 60u
 
 /** The most a `//` table may hold, so a hostile size cannot allocate freely. */

@@ -55,13 +55,42 @@ void garc_cpio_rewind(GARC_Archive * archive);
 /** Free what the reader allocated. */
 void garc_cpio_release(GARC_Archive * archive);
 
+/**
+ * Begin a member: write its header and name in the writer's dialect (newc or odc),
+ * padded as that dialect requires.
+ *
+ * @param writer The writer.
+ * @param member The member: a file, directory, symlink, device or fifo.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID for a name, size or number the dialect's
+ *   fields cannot hold, ::GARC_ERR_UNSUPPORTED for a type it has no mode for, or
+ *   the sink's failure.
+ */
 GARC_Result garc_cpio_write_member(
     GARC_Writer * writer, const GARC_Member * member);
 
+/**
+ * End the current member: write the zero bytes that pad its data, when the
+ * dialect pads (newc does, to four bytes; odc does not). The declared size was
+ * checked by the generic writer.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK or the sink's failure.
+ */
 GARC_Result garc_cpio_write_close_member(GARC_Writer * writer);
 
+/**
+ * Finish the archive: write the `TRAILER!!!` entry and pad to a 512-byte block.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK or the sink's failure.
+ */
 GARC_Result garc_cpio_write_end(GARC_Writer * writer);
 
+/**
+ * Free what the writer allocated.
+ *
+ * @param writer The writer.
+ */
 void garc_cpio_write_release(GARC_Writer * writer);
 
 /** Read a member's bytes, checking the crc variant's sum at the end. */

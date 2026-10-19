@@ -79,50 +79,57 @@
 /** The most a header may occupy, matching what the reader accepts. */
 #define SZW_MAX_HEADER (64u * 1024u * 1024u)
 
+/** Seconds from 1601-01-01, where FILETIME begins, to the Unix epoch. */
 #define SZW_EPOCH_GAP 11644473600LL
 
+/** What an entry is, as the header's property tables record it. */
 enum {
-  SZWF_DIRECTORY = 1,
-  SZWF_EMPTY_FILE = 2,
-  SZWF_HAS_MTIME = 4
+  SZWF_DIRECTORY = 1,  ///< A directory: no stream, and no empty-file bit.
+  SZWF_EMPTY_FILE = 2, ///< An empty file: no stream, with the empty-file bit.
+  SZWF_HAS_MTIME = 4   ///< The entry has a modification time.
 };
 
+/** One member as the header will list it. */
 typedef struct {
-  uint32_t name_off;
+  uint32_t name_off; ///< Where the name starts in the names buffer.
   uint32_t name_len; ///< UTF-8 bytes in the names buffer.
-  uint8_t flags;
-  uint64_t mtime;
-  uint32_t attrib;
-  uint64_t size;
-  uint32_t crc;
-  int has_stream;
+  uint8_t flags;     ///< ::SZWF_DIRECTORY, ::SZWF_EMPTY_FILE and ::SZWF_HAS_MTIME.
+  uint64_t mtime;    ///< FILETIME ticks; meaningful with ::SZWF_HAS_MTIME.
+  uint32_t attrib;   ///< The attribute word, Unix mode in the high half.
+  uint64_t size;     ///< Unpacked size in bytes.
+  uint32_t crc;      ///< CRC-32 of the unpacked bytes.
+  int has_stream;    ///< Whether the entry has bytes in a folder.
 } SzwEntry;
 
+/** One folder as the header will list it: a packed stream and what it holds. */
 typedef struct {
-  uint64_t pack_size;
-  uint64_t unpack_size;
-  uint32_t nsub;
+  uint64_t pack_size;   ///< Bytes written to the archive for this folder.
+  uint64_t unpack_size; ///< Bytes the folder decodes to.
+  uint32_t nsub;        ///< How many members share the folder.
 } SzwFolder;
 
+/** Everything the 7z writer remembers until the header is written. */
 struct GARC_SevenZ_Write {
   uint64_t origin; ///< Sink offset of the signature header.
-  SzwEntry * entries;
-  uint32_t num_entries, cap_entries;
-  SzwFolder * folders;
-  uint32_t num_folders, cap_folders;
-  GARC_Buffer names;
+  SzwEntry * entries; ///< One per member, in the order added.
+  uint32_t num_entries; ///< How many entries are in use.
+  uint32_t cap_entries; ///< How many @ref entries has room for.
+  SzwFolder * folders; ///< One per finished folder.
+  uint32_t num_folders; ///< How many folders are in use.
+  uint32_t cap_folders; ///< How many @ref folders has room for.
+  GARC_Buffer names; ///< Every name, as UTF-8, end to end.
   /* the folder being written */
-  int folder_open;
-  uint64_t cur_pack;
-  uint64_t cur_unpack;
-  uint32_t cur_nsub;
-  gcomp_encoder_t * encoder;
-  gcomp_options_t * encoder_options;
-  uint8_t * packed;
+  int folder_open; ///< Whether a folder's encoder has been started.
+  uint64_t cur_pack; ///< Packed bytes written to the open folder.
+  uint64_t cur_unpack; ///< Unpacked bytes given to the open folder.
+  uint32_t cur_nsub; ///< Members in the open folder.
+  gcomp_encoder_t * encoder; ///< The folder encoder, reset between folders.
+  gcomp_options_t * encoder_options; ///< Its options, or NULL.
+  uint8_t * packed; ///< Output buffer for the encoder.
   /* the member being written */
-  uint32_t running_crc;
+  uint32_t running_crc; ///< The unfinalized CRC-32 so far.
   uint32_t current; ///< Index in entries.
-  int in_member;
+  int in_member; ///< Whether a member is open.
 };
 
 static GARC_Result szw_grow(const GARC_Allocator * a, void * slot,

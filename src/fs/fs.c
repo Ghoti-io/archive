@@ -40,20 +40,23 @@
 /** Setuid, setgid and sticky. Cleared before any mode is applied. */
 #define GARC_FS_MODE_CLEAR ((uint32_t)(04000u | 02000u | 01000u))
 
+/** Every flag ::garc_fs_extract() accepts; any other bit is refused. */
 #define GARC_FS_FLAGS_KNOWN                                                \
   (GARC_FS_ALLOW_LINKS | GARC_FS_ALLOW_PORTABLE_NAMES)
 
+/** A growable list of canonical paths. */
 typedef struct FsPaths {
-  char ** items;
-  size_t count;
-  size_t capacity;
+  char ** items;   ///< The paths, each owned.
+  size_t count;    ///< How many are in use.
+  size_t capacity; ///< How many @ref items has room for.
 } FsPaths;
 
+/** What one extraction remembers, so a later member cannot reach past an earlier one. */
 typedef struct FsExtract {
-  char * root;
-  uint32_t flags;
-  FsPaths claimed;
-  FsPaths made;
+  char * root;      ///< The canonical destination root.
+  uint32_t flags;   ///< The caller's GARC_FS_ flags.
+  FsPaths claimed;  ///< Every path a member of this archive has named.
+  FsPaths made;     ///< Every path this call created, which links may be followed into.
 } FsExtract;
 
 static void fs_free(char * path) {
@@ -918,23 +921,25 @@ GARC_Result garc_fs_extract(GARC_Archive * archive, const char * root,
   return result;
 }
 
+/** One thing found on disk while packing a tree. */
 typedef struct FsEntry {
-  char * rel;
-  char * full;
-  char * link;
-  GARC_Member_Type type;
-  uint32_t mode;
-  uint64_t size;
-  uint64_t device;
-  uint64_t inode;
-  uint64_t links;
-  size_t first;
+  char * rel;               ///< The path relative to the packed root: the member name.
+  char * full;              ///< The path on disk.
+  char * link;              ///< A symlink's target, or NULL.
+  GARC_Member_Type type;    ///< File, directory or symlink.
+  uint32_t mode;            ///< The permission bits.
+  uint64_t size;            ///< A file's size in bytes.
+  uint64_t device;          ///< The device the entry is on.
+  uint64_t inode;           ///< Its inode, which with @ref device identifies it.
+  uint64_t links;           ///< How many names the inode has.
+  size_t first;             ///< The index of the first entry sharing this inode.
 } FsEntry;
 
+/** A growable list of ::FsEntry. */
 typedef struct FsList {
-  FsEntry * items;
-  size_t count;
-  size_t capacity;
+  FsEntry * items;   ///< The entries, each owning its strings.
+  size_t count;      ///< How many are in use.
+  size_t capacity;   ///< How many @ref items has room for.
 } FsList;
 
 static void fs_entry_clear(FsEntry * entry) {
@@ -991,10 +996,11 @@ static GARC_Result fs_rel_join(const char * parent, const char * name,
   return GARC_OK;
 }
 
+/** A directory on the path being walked, so a symlink loop is noticed. */
 typedef struct FsSeen {
-  uint64_t device;
-  uint64_t inode;
-  struct FsSeen * next;
+  uint64_t device;       ///< The directory's device.
+  uint64_t inode;        ///< The directory's inode.
+  struct FsSeen * next;  ///< The directory above it.
 } FsSeen;
 
 static int fs_seen_has(const FsSeen * seen, uint64_t device, uint64_t inode) {

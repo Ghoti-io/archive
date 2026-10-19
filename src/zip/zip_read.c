@@ -736,6 +736,7 @@ static GARC_Result zip_read_link_target(
 
 /** Method 14's header is two length fields, then five property bytes. */
 #define ZIP_LZMA_PROPS_SIZE 5u
+/** Method 14 starts with this many bytes: the version, the properties size and the properties. */
 #define ZIP_LZMA_HEADER_SIZE (4u + ZIP_LZMA_PROPS_SIZE)
 
 /**

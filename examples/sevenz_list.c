@@ -81,6 +81,14 @@ static GARC_Result size_cb(void * ctx, uint64_t * out_size) {
   return GARC_OK;
 }
 
+/**
+ * List a 7z, reading each file to its end and printing the status of the last
+ * read, which is where the CRC-32 verdict arrives.
+ *
+ * @param argc Argument count.
+ * @param argv `sevenz_list <path.7z>`.
+ * @return 0 on success, 1 on a failure, 2 on a usage error.
+ */
 int main(int argc, char ** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s <path.7z>\n", argv[0]);

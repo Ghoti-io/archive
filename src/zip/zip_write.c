@@ -172,9 +172,13 @@
  * byte is `(pb * 5 + lp) * 9 + lc`.
  */
 #define ZIP_LZMA_VERSION 0x0119u
+/** How many property bytes method 14 carries: the lc/lp/pb byte and a 4-byte dictionary. */
 #define ZIP_LZMA_PROPS_SIZE 5u
+/** The whole header: two version bytes, two size bytes, then the properties. */
 #define ZIP_LZMA_HEADER_SIZE 9u
+/** lc 3, lp 0, pb 2: `(2 * 5 + 0) * 9 + 3`. */
 #define ZIP_LZMA_PROPS_BYTE 0x5Du
+/** The dictionary size, 8 MiB. */
 #define ZIP_LZMA_DICT (1u << 23)
 
 /** 0x9901 is an 11-byte extra: header, then a 7-byte AE-2 payload. */

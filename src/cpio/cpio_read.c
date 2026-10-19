@@ -55,8 +55,11 @@
 #include "../tar/tar_internal.h"
 #include "cpio_internal.h"
 
+/** The size of a newc or crc header: the 6-byte magic and thirteen 8-digit fields. */
 #define CPIO_NEWC_HEADER 110u
+/** The size of an odc header: the 6-byte magic and eleven fields of 6 or 11 digits. */
 #define CPIO_ODC_HEADER 76u
+/** The name of the entry that ends every cpio archive. */
 #define CPIO_TRAILER "TRAILER!!!"
 
 int garc_cpio_identify(const uint8_t * bytes, size_t length) {

@@ -37,16 +37,53 @@
 extern "C" {
 #endif
 
+/**
+ * Begin a member: write the script lines that create it. The first member also
+ * writes the script's header.
+ *
+ * @param writer The writer.
+ * @param member A file, directory or symlink.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID for a name or link target that cannot be
+ *   quoted on one line, ::GARC_ERR_UNSUPPORTED for a type a script cannot make,
+ *   or the sink's failure.
+ */
 GARC_Result garc_shar_write_member(
     GARC_Writer * writer, const GARC_Member * member);
 
+/**
+ * Write file data: `X`-prefixed text lines, or uuencoded bytes.
+ *
+ * @param writer The writer.
+ * @param data The bytes.
+ * @param size How many.
+ * @return ::GARC_OK, ::GARC_ERR_UNSUPPORTED for a NUL in text mode, or the sink's
+ *   failure.
+ */
 GARC_Result garc_shar_write_data(
     GARC_Writer * writer, const void * data, size_t size);
 
+/**
+ * End the current member: finish its body and emit its `chmod`.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK, ::GARC_ERR_UNSUPPORTED for text data with no final newline,
+ *   or the sink's failure.
+ */
 GARC_Result garc_shar_write_close_member(GARC_Writer * writer);
 
+/**
+ * Finish the script with `exit 0`.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK or the sink's failure.
+ */
 GARC_Result garc_shar_write_end(GARC_Writer * writer);
 
+/**
+ * Free what the writer allocated.
+ *
+ * @param writer The writer.
+ */
 void garc_shar_write_release(GARC_Writer * writer);
 
 #ifdef __cplusplus

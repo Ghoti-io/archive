@@ -48,6 +48,7 @@
 
 #include "cpio_internal.h"
 
+/** The archive is padded to a multiple of this, as cpio -o does. */
 #define CPIO_BLOCK 512u
 
 static void put_hex(uint8_t * out, uint64_t value) {

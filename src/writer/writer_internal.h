@@ -174,20 +174,18 @@ typedef struct {
   /** @} */
 } GARC_Zip_Write_State;
 
-/**
- * An archive being written.
- *
- * Opaque to callers, for the reason ::GARC_Archive gives.
- */
+/** What the ar writer remembers. */
 typedef struct {
   int started; ///< Whether the 8-byte magic has gone out.
 } GARC_Ar_Write_State;
 
+/** What the cpio writer remembers. */
 typedef struct {
   uint64_t inode;   ///< The next inode number to hand out.
   uint64_t padding; ///< Zero bytes owed after the current member's data.
 } GARC_Cpio_Write_State;
 
+/** What the shar writer remembers: where it is in a script it writes in one pass. */
 typedef struct {
   int started;        ///< Whether the script's opening lines have gone out.
   int uu;             ///< Whether data is uuencoded rather than text.
@@ -196,12 +194,17 @@ typedef struct {
   int last_newline;   ///< Text mode: the last byte written was a newline.
   uint64_t written;   ///< Data bytes written for the current member.
   uint8_t pending[45]; ///< Uuencode: bytes waiting for a full line.
-  size_t pending_length;
+  size_t pending_length; ///< How many bytes of @ref pending are in use.
   GARC_Buffer name;   ///< The open member's name, for the chmod after its data.
   int chmod_valid;    ///< Whether that chmod is owed.
-  uint32_t chmod_mode;
+  uint32_t chmod_mode; ///< The permission bits that chmod sets.
 } GARC_Shar_Write_State;
 
+/**
+ * An archive being written.
+ *
+ * Opaque to callers, for the reason ::GARC_Archive gives.
+ */
 struct GARC_Writer {
   /** The sink, borrowed. The caller destroys it; garc_writer_destroy() does
    *  not. */
@@ -247,8 +250,11 @@ struct GARC_Writer {
   /** What only the 7z writer looks at: NULL for every other format. */
   struct GARC_SevenZ_Write * sevenz;
 
+  /** What only the ar writer looks at. Meaningless for any other format. */
   GARC_Ar_Write_State ar;
+  /** What only the cpio writer looks at. Meaningless for any other format. */
   GARC_Cpio_Write_State cpio;
+  /** What only the shar writer looks at. Meaningless for any other format. */
   GARC_Shar_Write_State shar;
 };
 
@@ -341,18 +347,65 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer);
  */
 void garc_zip_write_release(GARC_Writer * writer);
 
+/**
+ * Start a 7z: allocate the writer's state and reserve the 32-byte signature
+ * header, which ::garc_sevenz_write_end() patches once the header's position is
+ * known.
+ *
+ * @param writer The writer; its sink must be able to patch.
+ * @return ::GARC_OK, ::GARC_ERR_OOM, or the sink's failure.
+ */
 GARC_Result garc_sevenz_write_begin(GARC_Writer * writer);
 
+/**
+ * Add a member to the archive's table. A directory or an empty file has no
+ * stream; a symlink's target is its data.
+ *
+ * @param writer The writer.
+ * @param member The member; its name must be well-formed UTF-8.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID for a bad name or time,
+ *   ::GARC_ERR_UNSUPPORTED for a type 7z cannot hold, ::GARC_ERR_OOM, or the
+ *   sink's failure.
+ */
 GARC_Result garc_sevenz_write_member(
     GARC_Writer * writer, const GARC_Member * member);
 
+/**
+ * Compress and write a piece of the current member's data, and fold it into the
+ * member's CRC-32.
+ *
+ * @param writer The writer.
+ * @param data The bytes.
+ * @param size How many.
+ * @return ::GARC_OK, a codec failure, or the sink's failure.
+ */
 GARC_Result garc_sevenz_write_data(
     GARC_Writer * writer, const void * data, size_t size);
 
+/**
+ * End the current member: record its CRC-32, and in a non-solid archive close its
+ * folder.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK, a codec failure, or the sink's failure.
+ */
 GARC_Result garc_sevenz_write_close_member(GARC_Writer * writer);
 
+/**
+ * Finish the archive: close the last folder, write the header, and patch the
+ * signature header to point at it.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK, ::GARC_ERR_UNSUPPORTED if the header exceeds what the reader
+ *   accepts, ::GARC_ERR_OOM, or the sink's failure.
+ */
 GARC_Result garc_sevenz_write_end(GARC_Writer * writer);
 
+/**
+ * Free what the 7z writer allocated. Called by garc_writer_destroy().
+ *
+ * @param writer The writer.
+ */
 void garc_sevenz_write_release(GARC_Writer * writer);
 
 /**

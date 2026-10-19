@@ -91,6 +91,13 @@ static const Entry ENTRIES[] = {
       1000000000},
 };
 
+/**
+ * Write a small 7z of fixed members.
+ *
+ * @param argc Argument count.
+ * @param argv `sevenz_write <path.7z>` and the options in the file comment.
+ * @return 0 on success, 1 on a failure, 2 on a usage error.
+ */
 int main(int argc, char ** argv) {
   if (argc < 2) {
     fprintf(stderr,

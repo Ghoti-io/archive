@@ -55,6 +55,11 @@ static GARC_Result read_cb(
   return GARC_OK;
 }
 
+/**
+ * List the ar or cpio on standard input: the format, then one line per member.
+ *
+ * @return 0 on success, 1 on a failure.
+ */
 int main(void) {
   GARC_Stream_Callbacks callbacks;
   memset(&callbacks, 0, sizeof(callbacks));
