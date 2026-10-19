@@ -1385,6 +1385,81 @@ TEST(WriterData, AShortMemberIsRefusedByBothWaysOfClosingOne) {
   }
 }
 
+namespace {
+
+/** Every format the writer produces. The size rules live in one shared place, and
+ *  this list is what proves each format goes through it. */
+const GARC_Format kEveryWriteFormat[] = {GARC_FORMAT_TAR, GARC_FORMAT_ZIP,
+    GARC_FORMAT_SEVENZ, GARC_FORMAT_AR, GARC_FORMAT_CPIO, GARC_FORMAT_SHAR};
+
+}  // namespace
+
+TEST(WriterData, EveryFormatRefusesBytesPastTheDeclaredSizeAndWritesNothing) {
+  // **The declared size is checked once, in garc_writer_write(), before any
+  // format sees the bytes** - so a refusal here has to leave the sink exactly
+  // where it was. Compared by sink position rather than by return code alone,
+  // because a check that ran after the format hook would also return
+  // GARC_ERR_INVALID, with the bytes already written. The data ends in a newline
+  // so that shar's text mode takes it.
+  for (const GARC_Format format : kEveryWriteFormat) {
+    SCOPED_TRACE(garc_format_string(format));
+    GARC_Sink * sink = nullptr;
+    ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+    GARC_Writer * writer = nullptr;
+    ASSERT_EQ(garc_writer_create(sink, format, nullptr, &writer), GARC_OK);
+    const Captured member = plain_file("a", "1234\n");
+    const GARC_Member m = member.as_member();
+    ASSERT_EQ(garc_writer_add(writer, &m), GARC_OK);
+    ASSERT_EQ(garc_writer_write(writer, "12", 2), GARC_OK);
+    EXPECT_EQ(garc_writer_data_remaining(writer), 3u);
+
+    const uint64_t before = garc_sink_tell(sink);
+    EXPECT_EQ(garc_writer_write(writer, "34\nXX", 5), GARC_ERR_INVALID);
+    EXPECT_EQ(garc_sink_tell(sink), before) << "the refused bytes reached the sink";
+    EXPECT_EQ(garc_writer_data_remaining(writer), 3u);
+
+    ASSERT_EQ(garc_writer_write(writer, "34\n", 3), GARC_OK);
+    EXPECT_EQ(garc_writer_data_remaining(writer), 0u);
+    const uint64_t full = garc_sink_tell(sink);
+    EXPECT_EQ(garc_writer_write(writer, "x", 1), GARC_ERR_INVALID);
+    EXPECT_EQ(garc_sink_tell(sink), full);
+    EXPECT_EQ(garc_writer_finish(writer), GARC_OK);
+    garc_writer_destroy(writer);
+    garc_sink_destroy(sink);
+  }
+}
+
+TEST(WriterData, EveryFormatRefusesAShortMemberWhicheverWayItIsClosed) {
+  // The other direction: fewer bytes than the header declared. Closed by adding
+  // the next member, and closed by finishing - the two places a member ends - and
+  // in both the member is refused, not padded to fit.
+  for (const GARC_Format format : kEveryWriteFormat) {
+    for (int finish : {0, 1}) {
+      SCOPED_TRACE(garc_format_string(format));
+      SCOPED_TRACE(finish);
+      GARC_Sink * sink = nullptr;
+      ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+      GARC_Writer * writer = nullptr;
+      ASSERT_EQ(garc_writer_create(sink, format, nullptr, &writer), GARC_OK);
+      const Captured member = plain_file("a", "1234\n");
+      const GARC_Member m = member.as_member();
+      ASSERT_EQ(garc_writer_add(writer, &m), GARC_OK);
+      ASSERT_EQ(garc_writer_write(writer, "12", 2), GARC_OK);
+      if (finish) {
+        EXPECT_EQ(garc_writer_finish(writer), GARC_ERR_INVALID);
+      }
+      else {
+        const Captured next = plain_file("b", "z\n");
+        const GARC_Member m2 = next.as_member();
+        EXPECT_EQ(garc_writer_add(writer, &m2), GARC_ERR_INVALID);
+        EXPECT_EQ(garc_writer_member_count(writer), 1u);
+      }
+      garc_writer_destroy(writer);
+      garc_sink_destroy(sink);
+    }
+  }
+}
+
 TEST(WriterData, WritingWithNoMemberIsRefused) {
   GARC_Sink * sink = nullptr;
   ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
