@@ -44,7 +44,7 @@
  * way:
  *
  * **The method is a string, not a ::GARC_Format or an enum of its own.**
- * `"gzip"`, `"zstd"`, `"lz4"`, `"zlib"`, `"lzma"`, `"bzip2"`, `"xz"` - whatever
+ * `"gzip"`, `"zstd"`, `"lz4"`, `"zlib"`, `"lzma"`, `"bzip2"`, `"xz"`, `"brotli"` - whatever
  * `compress` has a method for, spelled the way `compress` spells it and passed
  * straight through to `gcomp_decoder_create()`. An enum here would be this
  * library keeping a second copy of another library's list of codecs, and the

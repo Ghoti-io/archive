@@ -122,7 +122,8 @@ typedef enum {
   GARC_SEVENZ_LZMA,      ///< LZMA, five property bytes.
   GARC_SEVENZ_BZIP2,     ///< bzip2.
   GARC_SEVENZ_DEFLATE,   ///< Raw deflate.
-  GARC_SEVENZ_COPY       ///< Stored.
+  GARC_SEVENZ_COPY,      ///< Stored.
+  GARC_SEVENZ_DEFLATE64  ///< Raw deflate64 (a 64 KB window), coder 04 01 09.
 } GARC_SevenZ_Method;
 
 /**
@@ -192,7 +193,7 @@ typedef struct GARC_Writer_Options {
    * Which method a zip member's data is written with. Ignored for tar.
    *
    * ::GARC_ZIP_METHOD_STORED is the default. ::GARC_ZIP_METHOD_DEFLATE,
-   * ::GARC_ZIP_METHOD_BZIP2, ::GARC_ZIP_METHOD_ZSTD,
+   * ::GARC_ZIP_METHOD_DEFLATE64, ::GARC_ZIP_METHOD_BZIP2, ::GARC_ZIP_METHOD_ZSTD,
    * ::GARC_ZIP_METHOD_XZ and ::GARC_ZIP_METHOD_LZMA are accepted beside it. Every other value is refused
    * by ::garc_writer_create() with ::GARC_ERR_UNSUPPORTED, including methods
    * this library can *read*. Reading a method means having a decoder for it;

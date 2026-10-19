@@ -73,13 +73,18 @@ for the fields that hold the `0xFFFFFFFF` marker, which is why `zip -fz` produce
 an eight-byte field where a reader consuming the values positionally expects
 sixteen.
 
-**Methods 0, 8, 12, 14, 93 and 95 are read**, through `compress`: a member is a
+**Methods 0, 1, 2 to 6, 8, 9, 12, 14, 93 and 95 are read**, through `compress`: a member is a
 bounded view of the file with a decoder over it, so method 8 is RFC 1951 raw,
 method 12 a bare bzip2 stream, method 93 a zstd frame, and method 95 a complete `.xz` file. Method 14 is a small
-header and then raw LZMA (`lzma.raw`), not a `.lzma` file. **Method 9 is refused
-on purpose** - "enhanced deflate" is not RFC 1951, so pointing it at the deflate
-decoder would produce plausible wrong bytes for the members that use its
-extensions. 98 is refused too, with a status and an accessor that
+header and then raw LZMA (`lzma.raw`), not a `.lzma` file. **Method 9 is
+`"deflate64"`, not `"deflate"`**: "enhanced deflate" is not RFC 1951 (a 64 KB
+window and a different length code 285), so pointing it at the deflate decoder
+would produce plausible wrong bytes for the members that use the extensions.
+Methods 1 (shrink), 2 to 5 (reduce) and 6 (implode) are PKWARE's earliest and
+are read only: they have no end marker, so the reader hands the decoder what the
+container knows - the reduce factor from the method number, the implode
+dictionary and literal tree from two bits of the general purpose flags, and the
+member's size. 98 is refused, with a status and an accessor that
 **name the method number**, so the refusal is a to-do list. ZipCrypto and WinZip
 AES are named separately from each other and from "unsupported", because a caller
 needs to know whether a password could ever help.
@@ -88,13 +93,13 @@ needs to know whether a password could ever help.
 seeks and is `GARC_ERR_NOT_SEEKABLE` on a pipe. The header is read whole (at most
 64 MiB), checked against its CRC, and decoded first when it is encoded, which is
 7-Zip's default. Folders that are a straight chain of coders are read: copy,
-LZMA, LZMA2, bzip2, deflate, delta, and the x86, PowerPC, IA-64, ARM, ARM
+LZMA, LZMA2, bzip2, deflate, deflate64, delta, and the x86, PowerPC, IA-64, ARM, ARM
 Thumb, SPARC, ARM64 and RISC-V branch filters, all through `compress`. **A solid
 archive is one folder**, so reaching a later member means decoding the earlier
 ones and discarding them; that is paid when you advance, not up front. Every
 file's CRC-32 is checked when its last byte is read. What is refused, with
 `GARC_ERR_UNSUPPORTED` on the member's *data* and not on the walk, is BCJ2 (four
-input streams), PPMd, deflate64, and encryption. Names are UTF-16 in the format
+input streams), PPMd, and encryption. Names are UTF-16 in the format
 and are the one place this library converts text: they are reported as UTF-8,
 with a lone surrogate becoming U+FFFD. A time is a FILETIME and is reported with
 `GARC_TIME_FILETIME`; a Unix mode is read from the attribute word's high half
@@ -179,8 +184,10 @@ the input a refusal needs - a header that contradicts its directory, a member co
 that is wrong, a zip64 field one value short - the archive is built byte by byte in
 the test, from a control archive this library reads.
 
-**Reads and writes `tar.gz`, `tar.zst`, `tar.lz4`, `tar.lzma` and `tar.bz2`, with no format
-code for any of them.** `"lzma"` is the `.lzma` container. A codec wraps the stream or the sink, the tar reader and writer
+**Reads and writes `tar.gz`, `tar.zst`, `tar.lz4`, `tar.lzma`, `tar.bz2`, `tar.xz` and `tar.br`, with no format
+code for any of them.** `"lzma"` is the `.lzma` container. Brotli has no magic number, so
+nothing can recognise a `.br` stream: a caller who names `"brotli"` gets it, and one who
+does not gets `GARC_ERR_FORMAT` like any other unrecognised bytes. A codec wraps the stream or the sink, the tar reader and writer
 see the same interface they always saw, and the codec is named by a **string**
 rather than an enum — an enum here would be a second copy of compress's list of
 methods, and the copy goes stale. What a compressed archive gives up is
@@ -424,10 +431,10 @@ composes the type bits from `GARC_Member.type` and takes only the permissions fr
 a zip symlink's target *is* its data, so the writer puts it there and the caller
 writes nothing, exactly as for a tar.
 
-**Stored, deflate, bzip2, zstd, xz or LZMA.** `GARC_Writer_Options.zip_method` takes
-those six and refuses every other value at create — including methods this
+**Stored, deflate, deflate64, bzip2, zstd, xz or LZMA.** `GARC_Writer_Options.zip_method` takes
+those seven and refuses every other value at create — including methods this
 library can *read*, because reading a method means owning a decoder and writing
-one means choosing to produce it. Bzip2, zstd, xz and LZMA are not the default: a
+one means choosing to produce it. Deflate64, bzip2, zstd, xz and LZMA are not the default: a
 caller names them. Stored is the default, and the reason is the zero: every
 field in that struct is written so a zero-filled copy behaves like the defaults or
 is refused, and `GARC_ZIP_METHOD_STORED` is 0. A member with no data is stored
@@ -438,10 +445,10 @@ before the first byte arrives, so there is no point at which it could be taken b
 which is what `zip` can do only because it has the whole file on disk first. And
 zip64's threshold is a compressed-size ceiling rather than the declared size,
 because a codec can make a member *larger* and a compressed size that crossed 4 GiB
-afterwards would have nowhere to go. Deflate, bzip2, zstd and xz ask
+afterwards would have nowhere to go. Deflate, deflate64, bzip2, zstd and xz ask
 `gcomp_encode_bound()`. LZMA has none, so the ceiling is
 `GCOMP_LZMA_MAX_EXPANSION_RATIO` times the declared size, plus the 9-byte header,
-plus any AES framing. Cleartext bzip2 needs version 46; cleartext zstd, xz or LZMA
+plus any AES framing. Deflate64 needs version 21 (45 when the member is also zip64); cleartext bzip2 needs version 46; cleartext zstd, xz or LZMA
 needs 63. A password still writes AE-2, and the real method stays in extra 0x9901;
 AES version-needed stays 51.
 

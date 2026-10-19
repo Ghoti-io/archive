@@ -132,6 +132,12 @@
 /** `version needed`: 2.0, which is what a deflated or a stored member needs. */
 #define ZIP_VERSION_NEEDED 20u
 
+/**
+ * `version needed` for a deflate64 member: 2.1, the number the APPNOTE gives
+ * "enhanced deflate". Lower than zip64's 45, so a member that is both says 45.
+ */
+#define ZIP_VERSION_NEEDED_DEFLATE64 21u
+
 /** `version needed` for a record with a zip64 field in it. */
 #define ZIP_VERSION_NEEDED_ZIP64 45u
 
@@ -202,6 +208,8 @@
  * for opposite directions, and a reader that gained a method the writer must
  * not produce is the case that would break a shared table. Method 8 is
  * `"deflate"`, raw RFC 1951, not `"zlib"`. Method 93 is a bare zstd frame.
+ * Method 9 is `"deflate64"`, raw like method 8 but with the 64 KB window; it is
+ * its own codec because the two disagree about length code 285.
  * Method 14 is `"lzma"` with `lzma.raw`: the zip header is written here, and
  * the encoder must not also write a `.lzma` header.
  *
@@ -212,6 +220,8 @@ static const char * zip_encoder_name(uint16_t method) {
   switch (method) {
     case GARC_ZIP_METHOD_DEFLATE:
       return "deflate";
+    case GARC_ZIP_METHOD_DEFLATE64:
+      return "deflate64";
     case GARC_ZIP_METHOD_BZIP2:
       return "bzip2";
     case GARC_ZIP_METHOD_XZ:
@@ -321,6 +331,9 @@ uint64_t garc_zip_compressed_ceiling(uint64_t size, uint16_t method) {
   if (method == GARC_ZIP_METHOD_DEFLATE) {
     return garc_zip_deflate_bound(size);
   }
+  if (method == GARC_ZIP_METHOD_DEFLATE64) {
+    return zip_encode_bound("deflate64", size);
+  }
   if (method == GARC_ZIP_METHOD_BZIP2) {
     return zip_encode_bound("bzip2", size);
   }
@@ -402,7 +415,7 @@ static int zip_needs_zip64(const GARC_Writer * writer, uint64_t size,
  * AES is 51 even when the real method is bzip2, zstd or LZMA, and even when
  * the member is also zip64. Cleartext zstd or LZMA is 63; cleartext bzip2 is
  * 46. Both beat zip64's 45, so a member that is both says the codec's number.
- * Otherwise zip64 is 45 and a stored or deflated member is 20.
+ * Otherwise zip64 is 45, deflate64 is 21, and a stored or deflated member is 20.
  *
  * @param zip The member being written.
  * @return The version-needed field.
@@ -421,6 +434,9 @@ static uint16_t zip_version_needed(const GARC_Zip_Write_State * zip) {
   }
   if (zip->used_zip64) {
     return ZIP_VERSION_NEEDED_ZIP64;
+  }
+  if (zip->method == GARC_ZIP_METHOD_DEFLATE64) {
+    return ZIP_VERSION_NEEDED_DEFLATE64;
   }
   return ZIP_VERSION_NEEDED;
 }
@@ -683,6 +699,7 @@ GARC_Result garc_zip_write_member(
   // the option.
   const uint16_t asked = writer->options.zip_method;
   const int compresses = asked == GARC_ZIP_METHOD_DEFLATE
+      || asked == GARC_ZIP_METHOD_DEFLATE64
       || asked == GARC_ZIP_METHOD_BZIP2 || asked == GARC_ZIP_METHOD_ZSTD
       || asked == GARC_ZIP_METHOD_XZ || asked == GARC_ZIP_METHOD_LZMA;
   zip->method = compresses && size && member->type != GARC_MEMBER_SYMLINK

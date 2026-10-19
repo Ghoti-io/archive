@@ -88,6 +88,24 @@ typedef struct {
 } GARC_Member_Lzma;
 
 /**
+ * What a zip member of one of PKWARE's early methods says about itself outside
+ * its data.
+ *
+ * Not a public type. Methods 2 to 5 (reduce) and 6 (implode) are raw streams with
+ * no end marker, and the container carries the numbers the decoder needs: the
+ * factor is in the method number, the implode dictionary and tree count are two
+ * bits of the general purpose flags, and the unpacked size is the member's.
+ * ::garc_member_codec_create() writes the keys. NULL on that call means the
+ * method needs none (shrink needs none, nor does any other method).
+ */
+typedef struct {
+  int64_t reduce_factor;      ///< 1 to 4 for reduce, 0 otherwise.
+  uint64_t implode_dictionary; ///< 4096 or 8192 for implode, 0 otherwise.
+  int implode_literal_tree;   ///< Whether implode carries a literal tree.
+  uint64_t uncompressed_size; ///< The member's declared size.
+} GARC_Member_Legacy;
+
+/**
  * Create a decoder over the next @p compressed_length bytes of @p inner.
  *
  * @p inner is borrowed and is read from wherever it is: the caller seeks to the
@@ -111,6 +129,7 @@ typedef struct {
  *   When set, the decoder is given `lzma.raw` and the five keys the zip
  *   header would have carried. Not copied past this call: the options object
  *   keeps the values.
+ * @param legacy Reduce or implode parameters, or NULL for every other method.
  * @param out_codec Receives the decoder on success.
  * @return ::GARC_OK, ::GARC_ERR_UNSUPPORTED for a method `compress` does not
  *   have, ::GARC_ERR_INVALID, or ::GARC_ERR_OOM.
@@ -118,7 +137,7 @@ typedef struct {
 GARC_Result garc_member_codec_create(const GARC_Allocator * allocator,
     GARC_Stream * inner, const char * method, uint64_t compressed_length,
     uint64_t max_output, const GARC_Member_Lzma * lzma,
-    GARC_Member_Codec ** out_codec);
+    const GARC_Member_Legacy * legacy, GARC_Member_Codec ** out_codec);
 
 /**
  * The stream the decoded bytes come out of.

@@ -129,6 +129,12 @@ static const Entry ENTRIES[] = {
    * shape a reader's arithmetic can get wrong and the stored archives cannot
    * produce. */
   {LIT("noise.bin"), GARC_MEMBER_FILE, NULL, 0u, NULL, 0644, 1000000000},
+  /* 41,000 bytes whose last 1,000 repeat the first 1,000: a match 40,000 bytes
+   * back, which deflate's 32 KiB window cannot reach and deflate64's can. Without
+   * a member like this, deflate64.zip would hold only streams that deflate64 and
+   * deflate code identically, and the gate would pass a writer that wrote plain
+   * deflate under method 9. */
+  {LIT("far.bin"), GARC_MEMBER_FILE, NULL, 0u, NULL, 0644, 1000000000},
   /* Modes the high half of external_file_attributes has to carry intact. */
   {LIT("setuid"), GARC_MEMBER_FILE, LIT("root\n"), NULL, 04755, 1000000000},
   {LIT("noperms"), GARC_MEMBER_FILE, LIT("none\n"), NULL, 0000, 1000000000},
@@ -149,12 +155,15 @@ static char BIG[3000];
  */
 static char NOISE[3000];
 
+/** `far.bin`'s contents: noise, filler, then the noise again. */
+static char FAR_BIN[41000];
+
 /**
- * **Ten encodings of one member list**, which is what the gate compares against
+ * **Twelve encodings of one member list**, which is what the gate compares against
  * each other and against the references.
  *
  * The encodings differ in nothing but their encoding, which is what makes "all
- * ten read the same" a statement about the writer rather than about ten
+ * twelve read the same" a statement about the writer rather than about twelve
  * different inputs. `pipe.zip` is the streaming form reached the way a caller
  * reaches it by accident - a sink with no `patch`, which is what a socket is -
  * and it must come out identical to asking for descriptors outright. `aes.zip`
@@ -203,6 +212,10 @@ static const struct {
   // **One xz archive**, treated like zstd.zip: only 7-Zip is asked.
   {"xz.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_XZ, 0,
       "xz members, method 95, a complete .xz file, version 63"},
+  // **One deflate64 archive.** unzip, bsdtar and 7-Zip read method 9; Python's
+  // zipfile raises NotImplementedError, so it is not asked. Version needed is 21.
+  {"deflate64.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_DEFLATE64, 0,
+      "deflate64 members, method 9, a 64 KB window, version 21"},
   {"lzma.zip", GARC_ZIP_SIZES_LOCAL, 1, 0, GARC_ZIP_METHOD_LZMA, 0,
       "LZMA members, method 14, version 0x0119, an end marker, bit 1 set"},
 };
@@ -374,6 +387,10 @@ static int write_one(const char * directory, const char * name,
     else if (strcmp(entry->name, "noise.bin") == 0) {
       data = NOISE;
       data_length = sizeof(NOISE);
+    }
+    else if (strcmp(entry->name, "far.bin") == 0) {
+      data = FAR_BIN;
+      data_length = sizeof(FAR_BIN);
     }
 
     GARC_Member member;
@@ -586,6 +603,16 @@ int main(int argc, char ** argv) {
   for (size_t i = 0; i < sizeof(BIG); ++i) {
     BIG[i] = (char)('a' + (i % 26u));
   }
+  state = 0x2468ACE1u;
+  for (size_t i = 0; i < 1000u; ++i) {
+    state = state * 1103515245u + 12345u;
+    FAR_BIN[i] = (char)(unsigned char)(state >> 16);
+  }
+  for (size_t i = 1000u; i < 40000u; ++i) {
+    state = state * 1103515245u + 12345u;
+    FAR_BIN[i] = (char)('a' + ((state >> 16) % 7u));
+  }
+  memcpy(FAR_BIN + 40000u, FAR_BIN, 1000u);
 
   if (argc == 2 && strcmp(argv[1], "describe") == 0) {
     for (size_t i = 0; i < ARCHIVE_COUNT; ++i) {

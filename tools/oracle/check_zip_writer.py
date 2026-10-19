@@ -104,8 +104,8 @@ COLUMNS = ["archive", "index", "name", "type", "size", "mtime", "mode",
 # green while testing less. These two numbers are the one thing here that has to be
 # edited when a fixture is added, which is where somebody says out loud that the
 # corpus grew - an accidental shrink has no such edit anywhere.
-EXPECTED_ARCHIVES = 11
-EXPECTED_MEMBERS = 132
+EXPECTED_ARCHIVES = 12
+EXPECTED_MEMBERS = 156
 
 # unzip, bsdtar and Python's zipfile cannot read method 99. 7-Zip can, and it
 # is the one reference asked about this archive. The password is the corpus one.
@@ -117,6 +117,8 @@ AES_PASSWORD = "ghoti-password"
 # bytes are ones it accepts, which the inner stage discovers rather than assumes.
 ZSTD_ARCHIVE = "zstd.zip"
 XZ_ARCHIVE = "xz.zip"
+# Method 9. unzip, bsdtar and 7-Zip are asked; Python raises NotImplementedError.
+DEFLATE64_ARCHIVE = "deflate64.zip"
 LZMA_ARCHIVE = "lzma.zip"
 NOT_UNZIP = (AES_ARCHIVE, ZSTD_ARCHIVE, XZ_ARCHIVE, LZMA_ARCHIVE)
 
@@ -374,7 +376,7 @@ def inner(directory):
     # Metadata, from Python, in the same shape.
     meta = []
     for name in sources:
-        if name in (AES_ARCHIVE, ZSTD_ARCHIVE, XZ_ARCHIVE):
+        if name in (AES_ARCHIVE, ZSTD_ARCHIVE, XZ_ARCHIVE, DEFLATE64_ARCHIVE):
             continue
         try:
             handle = zipfile.ZipFile(os.path.join(ours, name))
@@ -432,7 +434,9 @@ def inner(directory):
     os.makedirs(python_out, exist_ok=True)
     for name in sources:
         source = os.path.join(ours, name)
-        if name not in NOT_UNZIP:
+        # libarchive lists a deflate64 member and cannot decode one, so it has
+        # nothing to re-write from deflate64.zip.
+        if name not in NOT_UNZIP and name != DEFLATE64_ARCHIVE:
             finished = subprocess.run(
                 ["bsdtar", "--format", "zip", "-cf",
                     os.path.join(bsdtar_out, name), "@" + source],
@@ -441,7 +445,7 @@ def inner(directory):
                 sys.stderr.write("bsdtar could not re-write %s: %s\n" % (name,
                     finished.stderr.decode("utf-8", "replace").strip()))
                 return 1
-        if name in (AES_ARCHIVE, ZSTD_ARCHIVE, XZ_ARCHIVE):
+        if name in (AES_ARCHIVE, ZSTD_ARCHIVE, XZ_ARCHIVE, DEFLATE64_ARCHIVE):
             continue
         try:
             with zipfile.ZipFile(source) as reader:
@@ -636,10 +640,13 @@ def run(binary, work, ours):
         if status != "0":
             failures.append("%s refused %s (%s) - %s"
                 % (tool, name, status, purposes.get(name, "?")))
-    # Seven archives from unzip, bsdtar and Python, all ten from 7-Zip, and
-    # Python's LZMA verdict only when those bytes were ones it accepted.
+    # The archives all three of unzip, bsdtar and Python read, all of them from
+    # 7-Zip, and Python's LZMA verdict only when those bytes were ones it
+    # accepted. deflate64.zip is in the shared count but Python raises
+    # NotImplementedError on method 9, so it is one verdict short.
     shared = EXPECTED_ARCHIVES - len(NOT_UNZIP)
-    expected_verdicts = shared * 3 + EXPECTED_ARCHIVES + (1 if python_lzma else 0)
+    expected_verdicts = (shared * 3 - 1 + EXPECTED_ARCHIVES
+        + (1 if python_lzma else 0))
     if verdicts != expected_verdicts:
         failures.append("%d verdicts against %d expected"
             % (verdicts, expected_verdicts))
@@ -681,7 +688,7 @@ def run(binary, work, ours):
     #    not. The data length against the declared size is the check that a member
     #    holds what it says.
     python_rows = rows_from(read_tsv("meta-python.tsv"))
-    python_skip = [AES_ARCHIVE, ZSTD_ARCHIVE, XZ_ARCHIVE]
+    python_skip = [AES_ARCHIVE, ZSTD_ARCHIVE, XZ_ARCHIVE, DEFLATE64_ARCHIVE]
     if not any(row[0] == LZMA_ARCHIVE for row in python_rows):
         python_skip.append(LZMA_ARCHIVE)
     py_compared, py_skipped = compare(failures, "pyzipfile",
@@ -710,9 +717,9 @@ def run(binary, work, ours):
         predicates = {"name": lambda row, f=verbatim: f(column(row, "name"))}
         if label == "bsdtar":
             predicates["method"] = deflated_only
-            asked = excluding(intent, NOT_UNZIP)
+            asked = excluding(intent, NOT_UNZIP + (DEFLATE64_ARCHIVE,))
         else:
-            skip = [AES_ARCHIVE, ZSTD_ARCHIVE, XZ_ARCHIVE]
+            skip = [AES_ARCHIVE, ZSTD_ARCHIVE, XZ_ARCHIVE, DEFLATE64_ARCHIVE]
             if not any(row[0] == LZMA_ARCHIVE for row in got):
                 skip.append(LZMA_ARCHIVE)
             asked = excluding(intent, skip)
@@ -737,9 +744,10 @@ def run(binary, work, ours):
             "comparison is against them.\n")
         return 1
 
-    print("check-zip-writer: %d archives, %d accepted by unzip, bsdtar and "
-        "Python, all of them by 7-Zip, Python %s %s; %s"
-        % (EXPECTED_ARCHIVES, shared,
+    print("check-zip-writer: %d archives, %d accepted by unzip and bsdtar "
+        "(%d of them by Python, which cannot read %s), all of them by 7-Zip, "
+        "Python %s %s; %s"
+        % (EXPECTED_ARCHIVES, shared, shared - 1, DEFLATE64_ARCHIVE,
             "accepted" if python_lzma else "was not asked about",
             LZMA_ARCHIVE,
             ", ".join("%d %s" % (count, what) for what, count, _ in counts)))

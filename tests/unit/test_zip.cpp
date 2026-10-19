@@ -725,7 +725,9 @@ TEST(ZipCorpus, EveryDeflatedMemberInTheCorpusReadsAndItsCrcVerifies) {
       // declared is the CRC of what came out".
       EXPECT_EQ(result, GARC_OK) << where << ": " << garc_result_string(result);
       EXPECT_EQ(total, member->size) << where;
-      if (garc_zip_member_method(fixture.archive()) == GARC_ZIP_METHOD_DEFLATE) {
+      const uint16_t method = garc_zip_member_method(fixture.archive());
+      if (method == GARC_ZIP_METHOD_DEFLATE
+          || method == GARC_ZIP_METHOD_DEFLATE64) {
         ++deflated;
       }
       else {
@@ -740,7 +742,39 @@ TEST(ZipCorpus, EveryDeflatedMemberInTheCorpusReadsAndItsCrcVerifies) {
   // And the encrypted members are in it rather than skipped past, which is what
   // makes this test cover the cipher as well as the codec.
   EXPECT_GE(encrypted, 4u);
-  EXPECT_GE(unsupported, 2u) << "ppmd, deflate64";
+  EXPECT_GE(unsupported, 1u) << "ppmd";
+}
+
+TEST(Zip, Deflate64MembersReadAndMatchTheirStoredBytes) {
+  // Method 9 is "enhanced deflate", which is *not* RFC 1951 - a 64 KB window and
+  // a different length code 285 - so it has its own codec in compress, and
+  // pointing it at the deflate decoder would produce plausible wrong bytes for
+  // the members that use the extensions. sevenzip-deflate64.zip is 7-Zip's own,
+  // and the member is compressible.txt, whose bytes python-methods.zip also
+  // holds stored.
+  Fixture fixture("sevenzip-deflate64.zip");
+  ASSERT_EQ(fixture.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
+  EXPECT_EQ(garc_zip_member_method(fixture.archive()),
+      GARC_ZIP_METHOD_DEFLATE64);
+  EXPECT_STREQ(garc_zip_method_string(GARC_ZIP_METHOD_DEFLATE64),
+      "enhanced deflate (deflate64)");
+  GARC_Result status = GARC_ERR_INTERNAL;
+  const std::string got = read_checked(fixture.archive(), &status);
+  EXPECT_EQ(status, GARC_OK);
+  EXPECT_EQ(got.size(), 1160u);
+
+  Fixture methods("python-methods.zip");
+  ASSERT_EQ(methods.open_result(), GARC_OK);
+  std::string stored;
+  while (garc_next(methods.archive(), &member) == GARC_OK) {
+    if (garc_zip_member_method(methods.archive()) == GARC_ZIP_METHOD_STORED) {
+      stored = read_all(methods.archive());
+      break;
+    }
+  }
+  EXPECT_EQ(got, stored);
 }
 
 TEST(Zip, EveryCodecGatedMethodRefusesWithItsNumber) {
@@ -752,12 +786,6 @@ TEST(Zip, EveryCodecGatedMethodRefusesWithItsNumber) {
     uint16_t method;
     const char * name;
   } cases[] = {
-    // Method 9 is the one worth naming: "enhanced deflate" is *not* RFC 1951 - a
-    // 64 KB window and a different length code - so pointing it at the deflate
-    // decoder would produce plausible wrong bytes for the members that use the
-    // extensions and correct ones for the members that do not.
-    {"sevenzip-deflate64.zip", GARC_ZIP_METHOD_DEFLATE64,
-        "enhanced deflate (deflate64)"},
     {"sevenzip-ppmd.zip", GARC_ZIP_METHOD_PPMD, "ppmd"},
   };
   for (const auto & one : cases) {

@@ -37,11 +37,11 @@
  * each file a compressor of its own.
  *
  * **LZMA2 is the default method**, as it is 7-Zip's; `--lzma`, `--bzip2`,
- * `--deflate` and `--copy` name the others. A symlink's target is written as
+ * `--deflate`, `--deflate64` and `--copy` name the others. A symlink's target is written as
  * its data, as zip does, and the library does that for you.
  *
  * Usage: sevenz_write <path.7z> [--non-solid]
- *            [--lzma | --bzip2 | --deflate | --copy]
+ *            [--lzma | --bzip2 | --deflate | --deflate64 | --copy]
  */
 
 #include <inttypes.h>
@@ -95,7 +95,7 @@ int main(int argc, char ** argv) {
   if (argc < 2) {
     fprintf(stderr,
         "usage: %s <path.7z> [--non-solid] "
-        "[--lzma | --bzip2 | --deflate | --copy]\n",
+        "[--lzma | --bzip2 | --deflate | --deflate64 | --copy]\n",
         argv[0]);
     return 2;
   }
@@ -113,6 +113,9 @@ int main(int argc, char ** argv) {
     }
     else if (strcmp(argv[i], "--deflate") == 0) {
       method = GARC_SEVENZ_DEFLATE;
+    }
+    else if (strcmp(argv[i], "--deflate64") == 0) {
+      method = GARC_SEVENZ_DEFLATE64;
     }
     else if (strcmp(argv[i], "--copy") == 0) {
       method = GARC_SEVENZ_COPY;

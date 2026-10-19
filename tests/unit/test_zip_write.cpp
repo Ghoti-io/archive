@@ -1391,6 +1391,44 @@ TEST(ZipWrite, ADeflatedMemberNearTheThresholdGetsZip64WithoutBeingAskedTo) {
   EXPECT_LT(garc_zip_deflate_bound(1u << 28), marker);
 }
 
+TEST(ZipWrite, Deflate64RoundTripsPastTheDeflateWindowAndSaysTwentyOne) {
+  // Data whose second copy of a block sits 40,000 bytes after the first: a
+  // distance only deflate64's window can reach. The reader must give it back, and
+  // the version needed is 2.1, the APPNOTE's number for "enhanced deflate".
+  std::string data;
+  uint32_t state = 12345u;
+  for (size_t i = 0; i < 1000u; ++i) {
+    state = state * 1664525u + 1013904223u;
+    data.push_back(static_cast<char>(state >> 24));
+  }
+  for (size_t i = 0; i < 39000u; ++i) {
+    state = state * 1664525u + 1013904223u;
+    data.push_back(static_cast<char>('a' + ((state >> 24) % 7u)));
+  }
+  data += data.substr(0, 1000u);
+  Built built(GARC_ZIP_SIZES_LOCAL, false, GARC_ZIP_METHOD_DEFLATE64);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  Spec file;
+  file.name = "far.bin";
+  file.data = data;
+  Spec empty;
+  empty.name = "empty";
+  ASSERT_EQ(built.add(file), GARC_OK);
+  ASSERT_EQ(built.add(empty), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+  const std::vector<uint8_t> bytes = built.bytes();
+  EXPECT_EQ(le16(bytes, 4u), 21u);
+  EXPECT_EQ(le16(bytes, 8u), (uint16_t)GARC_ZIP_METHOD_DEFLATE64);
+  Roundtrip trip(bytes);
+  ASSERT_EQ(trip.open_result(), GARC_OK);
+  ASSERT_EQ(trip.walk_result(), GARC_END);
+  ASSERT_EQ(trip.members().size(), 2u);
+  EXPECT_EQ(trip.members()[0].method, (uint16_t)GARC_ZIP_METHOD_DEFLATE64);
+  EXPECT_EQ(trip.members()[0].data, data);
+  EXPECT_EQ(trip.members()[0].read_result, GARC_OK);
+  EXPECT_EQ(trip.members()[1].method, (uint16_t)GARC_ZIP_METHOD_STORED);
+}
+
 TEST(ZipWrite, Bzip2ZstdXzAndLzmaRoundTripAndLzmaCarriesItsHeader) {
   const GARC_Zip_Method methods[] = {GARC_ZIP_METHOD_BZIP2,
       GARC_ZIP_METHOD_ZSTD, GARC_ZIP_METHOD_XZ, GARC_ZIP_METHOD_LZMA};
@@ -1491,6 +1529,12 @@ TEST(ZipWrite, Bzip2AndZstdUseTheEncodeBoundAndLzmaUsesTheExpansionRatio) {
       (uint64_t)xz_bound);
   EXPECT_EQ(garc_zip_compressed_ceiling(size, GARC_ZIP_METHOD_DEFLATE),
       garc_zip_deflate_bound(size));
+  size_t deflate64_bound = 0;
+  ASSERT_EQ(gcomp_encode_bound(
+                nullptr, "deflate64", nullptr, (size_t)size, &deflate64_bound),
+      GCOMP_OK);
+  EXPECT_EQ(garc_zip_compressed_ceiling(size, GARC_ZIP_METHOD_DEFLATE64),
+      (uint64_t)deflate64_bound);
   EXPECT_EQ(garc_zip_compressed_ceiling(size, GARC_ZIP_METHOD_STORED), size);
   EXPECT_EQ(garc_zip_compressed_ceiling(size, GARC_ZIP_METHOD_LZMA),
       size * GCOMP_LZMA_MAX_EXPANSION_RATIO + 9u);
@@ -1589,11 +1633,11 @@ TEST(ZipWrite, AMethodBesideStoredAndDeflateIsRefusedAtCreate) {
   // Refused at create rather than at the first member, so the caller is told
   // before any bytes exist - and with GARC_ERR_UNSUPPORTED rather than
   // GARC_ERR_INVALID, because the value is a real zip method and the answer is
-  // that this writer does not produce it. Bzip2, zstd, xz and LZMA are accepted, and
+  // that this writer does not produce it. Deflate64, bzip2, zstd, xz and LZMA are accepted, and
   // they are not in this list: naming them is how a caller asks for them.
-  const GARC_Zip_Method refused[] = {GARC_ZIP_METHOD_DEFLATE64,
-      GARC_ZIP_METHOD_PPMD, GARC_ZIP_METHOD_AES,
-      GARC_ZIP_METHOD_IMPLODED};
+  const GARC_Zip_Method refused[] = {GARC_ZIP_METHOD_PPMD,
+      GARC_ZIP_METHOD_AES, GARC_ZIP_METHOD_IMPLODED, GARC_ZIP_METHOD_SHRUNK,
+      GARC_ZIP_METHOD_REDUCED_4};
   for (GARC_Zip_Method method : refused) {
     SCOPED_TRACE(garc_zip_method_string((uint16_t)method));
     GARC_Sink * sink = nullptr;
@@ -1672,7 +1716,8 @@ size_t central_offset_of(const std::vector<uint8_t> & bytes) {
 
 TEST(ZipWrite, APasswordRoundTripsStoredAndDeflatedMembers) {
   const GARC_Zip_Method methods[] = {GARC_ZIP_METHOD_STORED,
-      GARC_ZIP_METHOD_DEFLATE, GARC_ZIP_METHOD_BZIP2, GARC_ZIP_METHOD_ZSTD,
+      GARC_ZIP_METHOD_DEFLATE, GARC_ZIP_METHOD_DEFLATE64,
+      GARC_ZIP_METHOD_BZIP2, GARC_ZIP_METHOD_ZSTD,
       GARC_ZIP_METHOD_XZ, GARC_ZIP_METHOD_LZMA};
   for (GARC_Zip_Method method : methods) {
     SCOPED_TRACE(garc_zip_method_string((uint16_t)method));

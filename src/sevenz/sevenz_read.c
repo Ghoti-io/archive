@@ -972,6 +972,7 @@ typedef enum {
   SZM_LZMA2,
   SZM_BZIP2,
   SZM_DEFLATE,
+  SZM_DEFLATE64,
   SZM_DELTA,
   SZM_BCJ,
   SZM_UNSUPPORTED
@@ -992,6 +993,7 @@ static Sz_Kind coder_kind(const Coder * c, const char ** arch) {
     case 0x03u: return SZM_DELTA;
     case 0x040202u: return SZM_BZIP2;
     case 0x040108u: return SZM_DEFLATE;
+    case 0x040109u: return SZM_DEFLATE64;
     case 0x04u: case 0x03030103u: *arch = "x86"; return SZM_BCJ;
     case 0x05u: case 0x03030205u: *arch = "powerpc"; return SZM_BCJ;
     case 0x06u: case 0x03030401u: *arch = "ia64"; return SZM_BCJ;
@@ -1103,6 +1105,9 @@ static GARC_Result chain_open(const GARC_Allocator * a, GARC_Stream * stream,
           break;
         case SZM_DEFLATE:
           method = "deflate";
+          break;
+        case SZM_DEFLATE64:
+          method = "deflate64";
           break;
         case SZM_DELTA:
           method = "delta";

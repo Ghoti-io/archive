@@ -1546,27 +1546,6 @@ TEST(ZipStructure, AMethodThatDoesNotMatchThePayloadIsRefused) {
   EXPECT_NE(out, plain);
 }
 
-TEST(ZipStructure, EnhancedDeflateIsNotPointedAtTheDeflateDecoder) {
-  // **Method 9 is not RFC 1951.** It allows a 64 KB window and a different
-  // length code, so a member using either would decode to plausible wrong bytes -
-  // and one that used neither would decode correctly, which is what makes this
-  // the dangerous kind of nearly-right. Refused by name, with the number
-  // available.
-  const std::string plain(500u, 'c');
-  ZipBuilder builder;
-  add_compressed(builder, "enhanced", plain, GARC_ZIP_METHOD_DEFLATE64,
-      "deflate");
-  Built built(builder.build());
-  ASSERT_EQ(built.open_result(), GARC_OK);
-  const GARC_Member * member = nullptr;
-  ASSERT_EQ(garc_next(built.archive(), &member), GARC_OK);
-  char buffer[64];
-  size_t got = 0;
-  EXPECT_EQ(garc_read_member(built.archive(), buffer, sizeof(buffer), &got),
-      GARC_ERR_UNSUPPORTED);
-  EXPECT_EQ(garc_zip_member_method(built.archive()), GARC_ZIP_METHOD_DEFLATE64);
-}
-
 TEST(ZipStructure, AWrongCrcIsRefusedOnTheCallThatEndsTheMember) {
   // The data is fine and the declared checksum is not, which is the only thing a
   // CRC catches that a size cannot. The refusal arrives on the call that returns

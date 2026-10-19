@@ -153,6 +153,8 @@ static const char * szw_encoder_name(GARC_SevenZ_Method method) {
       return "lzma";
     case GARC_SEVENZ_BZIP2:
       return "bzip2";
+    case GARC_SEVENZ_DEFLATE64:
+      return "deflate64";
     default:
       return "deflate";
   }
@@ -583,6 +585,11 @@ static void put_coder(GARC_Buffer * b, const GARC_Allocator * a,
     }
     case GARC_SEVENZ_DEFLATE: {
       const uint8_t rec[] = {0x03u, 0x04u, 0x01u, 0x08u};
+      put_bytes(b, a, rec, sizeof(rec), status);
+      break;
+    }
+    case GARC_SEVENZ_DEFLATE64: {
+      const uint8_t rec[] = {0x03u, 0x04u, 0x01u, 0x09u};
       put_bytes(b, a, rec, sizeof(rec), status);
       break;
     }

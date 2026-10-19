@@ -24,7 +24,7 @@ reading of the headers is on record beside the library's.
 
 Each archive is written to vary one thing the reader has to get right:
 
-  - the coder: LZMA2 (7-Zip's default), LZMA, bzip2, deflate, copy;
+  - the coder: LZMA2 (7-Zip's default), LZMA, bzip2, deflate, deflate64, copy;
   - the filters in front of it: delta, x86 BCJ, ARM64;
   - solid or not, which decides whether a folder holds one file or many;
   - the header: encoded (the default) or plain, which are two code paths;
@@ -116,6 +116,7 @@ ARCHIVES = [
     ("lzma.7z", ["-m0=lzma"], "LZMA rather than LZMA2: five property bytes"),
     ("bzip2.7z", ["-m0=bzip2"], "bzip2 as the coder"),
     ("deflate.7z", ["-m0=deflate"], "raw deflate as the coder"),
+    ("deflate64.7z", ["-m0=deflate64"], "raw deflate64 (a 64 KB window) as the coder"),
     ("nonsolid.7z", ["-ms=off"],
         "one folder per file, so folder CRCs stand in for file CRCs"),
     ("plainhdr.7z", ["-mhc=off"], "an unencoded header"),

@@ -533,12 +533,32 @@ the same observation: the walk continues, and `garc_read_member()` answers
 been accepted; without one the member is refused before it. An I/O error
 while reading the header still stops the walk.
 
-**Method 9 is refused on purpose, and it is the interesting one.** "Enhanced
+**Method 9 is its own codec, and it is the interesting one.** "Enhanced
 deflate" is not RFC 1951: it allows a 64 KB window and a different length code. A
 reader that pointed it at the deflate decoder would decode the members that used
 neither extension correctly and the ones that used either into plausible wrong
-bytes, which is the worst of the three available outcomes. 95 and 98 are
-refused for the ordinary reason - no codec - and `garc_zip_member_method()` with
+bytes, which is the worst of the three available outcomes. It was refused for as
+long as `compress` had no deflate64 codec, and is read and written now as
+`"deflate64"`; the tests keep the other direction as a control (a stream that uses
+a distance beyond 32 KiB, declared as method 8, must not read as the same bytes).
+The writer says version 21, the number the APPNOTE gives it, or 45 when the
+member is also zip64.
+
+**Methods 1, 2 to 5 and 6 are read, and never written.** Shrink, reduce and
+implode are raw streams with no end marker, and the padding bits after the last
+symbol can read as a symbol or two more, so the decoder cannot find the end by
+itself: the container supplies it. The zip reader therefore passes the member's
+declared size, the reduce factor (the method number less one) and, for implode,
+the dictionary size and whether there is a literal tree - bits 1 and 2 of the
+general purpose flags. Nothing here writes them: `compress` says to write them
+only to test, no reference in the image reads reduce, and a writer nothing reads
+back is a claim rather than a feature. The evidence is real members written by
+PKZIP-era programs, held by other projects as test data and fetched by
+`compress`'s `tools/legacy_zip/fetch.sh` (pinned by hash, not committed here
+either); `GARC_LEGACY_ZIP_DIR` names the directory and the test reads every
+member and checks its own CRC-32, with controls that turn the one flag or the
+factor and must fail. 98 is refused for the ordinary reason - no codec - and
+`garc_zip_member_method()` with
 `garc_zip_method_string()` name the number in every case, so a refusal is a to-do
 list rather than a dead end. unzip 6.00 refuses 14 and 99 itself, with "need PK
 compat. v6.3", which is the format's age: this library reads 14 anyway.
@@ -1555,10 +1575,16 @@ is a predicate on the intent row, and libarchive *agrees* about every member we
 deflated. The skip applies only to the members we stored, which is a statement about
 libarchive rather than a hole in the gate.
 
-What it compares, and what it deliberately does not: eleven archives, the same member
-list encoded eleven ways (stored and deflate sizes disciplines, zip64, AES, bzip2,
-zstd, xz, LZMA), are accepted by the references that can read them. Unzip, bsdtar and
-Python are not asked about AES, zstd or xz; Python is asked about LZMA only when it
+What it compares, and what it deliberately does not: twelve archives, the same member
+list encoded twelve ways (stored and deflate sizes disciplines, zip64, AES, bzip2,
+zstd, xz, LZMA, deflate64), are accepted by the references that can read them. Unzip, bsdtar and
+Python are not asked about AES, zstd or xz; Python is not asked about deflate64
+(it raises NotImplementedError) and bsdtar lists that archive but is not asked to
+re-write it (libarchive 3.7.4 cannot decode method 9). One member of the list,
+`far.bin`, repeats its first kilobyte 40,000 bytes later, beyond deflate's window:
+without it a deflate64 archive would hold only streams that code identically under
+both methods, and the gate would pass a writer that wrote plain deflate under
+method 9; Python is asked about LZMA only when it
 accepts those bytes. Every reference is asked about bzip2. 7-Zip is asked about
 every archive. `unzip -t`, `7z t` and
 `zipfile.testzip()` each recompute every member's CRC they are asked about.

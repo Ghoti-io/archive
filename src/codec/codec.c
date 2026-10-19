@@ -310,7 +310,7 @@ struct GARC_Member_Codec {
 GARC_Result garc_member_codec_create(const GARC_Allocator * allocator,
     GARC_Stream * inner, const char * method, uint64_t compressed_length,
     uint64_t max_output, const GARC_Member_Lzma * lzma,
-    GARC_Member_Codec ** out_codec) {
+    const GARC_Member_Legacy * legacy, GARC_Member_Codec ** out_codec) {
   if (!inner || !method || !out_codec) {
     return GARC_ERR_INVALID;
   }
@@ -332,7 +332,7 @@ GARC_Result garc_member_codec_create(const GARC_Allocator * allocator,
     return result;
   }
 
-  if (max_output || lzma) {
+  if (max_output || lzma || legacy) {
     // The arms below are `compress`'s allocator failing, not this library's,
     // so nothing here can provoke them - `make coverage` reports both as
     // unexecuted and they stay. A cap that silently failed to be set would leave
@@ -374,6 +374,37 @@ GARC_Result garc_member_codec_create(const GARC_Allocator * allocator,
         || gcomp_options_set_uint64(codec->options, "lzma.uncompressed_size",
                lzma->uncompressed_size)
             != GCOMP_OK) {
+      garc_member_codec_destroy(codec);
+      return GARC_ERR_OOM;
+    }
+  }
+
+  if (legacy) {
+    // Reduce and implode have no end marker, and the padding bits after the last
+    // symbol can read as a symbol or two more, so the member's own size is what
+    // stops the decoder. Only the keys of the method asked for are set: compress
+    // refuses a key a method does not know.
+    int failed = 0;
+    if (legacy->reduce_factor) {
+      failed = gcomp_options_set_int64(
+                   codec->options, "reduce.factor", legacy->reduce_factor)
+              != GCOMP_OK
+          || gcomp_options_set_uint64(codec->options,
+                 "reduce.uncompressed_size", legacy->uncompressed_size)
+              != GCOMP_OK;
+    }
+    else if (legacy->implode_dictionary) {
+      failed = gcomp_options_set_uint64(codec->options,
+                   "implode.dictionary_size", legacy->implode_dictionary)
+              != GCOMP_OK
+          || gcomp_options_set_bool(codec->options, "implode.literal_tree",
+                 legacy->implode_literal_tree)
+              != GCOMP_OK
+          || gcomp_options_set_uint64(codec->options,
+                 "implode.uncompressed_size", legacy->uncompressed_size)
+              != GCOMP_OK;
+    }
+    if (failed) {
       garc_member_codec_destroy(codec);
       return GARC_ERR_OOM;
     }

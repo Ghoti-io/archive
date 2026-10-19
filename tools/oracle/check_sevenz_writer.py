@@ -43,8 +43,10 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import oracle_env  # noqa: E402
 
-EXPECTED_ARCHIVES = 6
-EXPECTED_MEMBERS = 12
+# libarchive's 7z reader has no deflate64 coder; only 7-Zip is asked about it.
+DEFLATE64_ARCHIVE = "deflate64.7z"
+EXPECTED_ARCHIVES = 7
+EXPECTED_MEMBERS = 13
 COLUMNS = ["archive", "name", "type", "size", "mtime", "mode", "link", "crc"]
 
 
@@ -203,6 +205,11 @@ def main(argv):
             compared += compare(failures, "7-Zip " + name, want, got,
                 skip=("link",))
 
+        # libarchive has no deflate64 coder, so it is not asked about that
+        # archive: 7-Zip is the one reference there, as it is for the corpus.
+        if name == DEFLATE64_ARCHIVE:
+            continue
+
         # libarchive: structure from the listing, bytes from extraction.
         listed = reference("bsdtar", ["bsdtar", "-tvf", path], work)
         if listed.returncode != 0 or listed.stderr.strip():
@@ -251,8 +258,9 @@ def main(argv):
             sys.stderr.write("  " + line + "\n")
         return 1
     print("check-sevenz-writer: %d archives, %d members each, all accepted "
-        "by 7-Zip and libarchive; %d fields compared against the intent"
-        % (len(archives), EXPECTED_MEMBERS, compared))
+        "by 7-Zip and all but %s by libarchive; %d fields compared against "
+        "the intent" % (len(archives), EXPECTED_MEMBERS, DEFLATE64_ARCHIVE,
+            compared))
     return 0
 
 

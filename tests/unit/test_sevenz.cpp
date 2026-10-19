@@ -168,7 +168,7 @@ std::vector<Row> manifest() {
 }
 
 const char * const kReadable[] = {"basic.7z", "copy.7z", "lzma.7z", "bzip2.7z",
-    "deflate.7z", "nonsolid.7z", "plainhdr.7z", "delta.7z", "bcj.7z",
+    "deflate.7z", "deflate64.7z", "nonsolid.7z", "plainhdr.7z", "delta.7z", "bcj.7z",
     "arm64.7z"};
 
 } // namespace

@@ -105,14 +105,14 @@ extern "C" {
  */
 typedef enum {
   GARC_ZIP_METHOD_STORED = 0,    ///< No compression. Read.
-  GARC_ZIP_METHOD_SHRUNK = 1,    ///< PKWARE shrink. Refused.
-  GARC_ZIP_METHOD_REDUCED_1 = 2, ///< PKWARE reduce, factor 1. Refused.
-  GARC_ZIP_METHOD_REDUCED_2 = 3, ///< Factor 2. Refused.
-  GARC_ZIP_METHOD_REDUCED_3 = 4, ///< Factor 3. Refused.
-  GARC_ZIP_METHOD_REDUCED_4 = 5, ///< Factor 4. Refused.
-  GARC_ZIP_METHOD_IMPLODED = 6,  ///< PKWARE implode. Refused.
+  GARC_ZIP_METHOD_SHRUNK = 1,    ///< PKWARE shrink. Read only.
+  GARC_ZIP_METHOD_REDUCED_1 = 2, ///< PKWARE reduce, factor 1. Read only.
+  GARC_ZIP_METHOD_REDUCED_2 = 3, ///< Factor 2. Read only.
+  GARC_ZIP_METHOD_REDUCED_3 = 4, ///< Factor 3. Read only.
+  GARC_ZIP_METHOD_REDUCED_4 = 5, ///< Factor 4. Read only.
+  GARC_ZIP_METHOD_IMPLODED = 6,  ///< PKWARE implode. Read only.
   GARC_ZIP_METHOD_DEFLATE = 8,   ///< RFC 1951, which compress implements.
-  GARC_ZIP_METHOD_DEFLATE64 = 9, ///< Enhanced deflate. Refused; not RFC 1951.
+  GARC_ZIP_METHOD_DEFLATE64 = 9, ///< Enhanced deflate (64 KB window), not RFC 1951. Read and written.
   GARC_ZIP_METHOD_BZIP2 = 12,    ///< A bzip2 stream. Read and written.
   GARC_ZIP_METHOD_LZMA = 14,     ///< A header, then raw LZMA. Read and written.
   GARC_ZIP_METHOD_ZSTD = 93,     ///< A zstd frame. Read and written.

@@ -72,6 +72,10 @@ static const uint8_t ZIP_SIG_ZIP64_LOCATOR[4] = {'P', 'K', 6, 7};
 #define ZIP_FLAG_ENCRYPTED 0x0001u
 /** Bit 3: the sizes are zero here and correct in a data descriptor. */
 #define ZIP_FLAG_DATA_DESCRIPTOR 0x0008u
+/** Method 6 (implode): set means an 8 KiB dictionary, clear 4 KiB. */
+#define ZIP_FLAG_IMPLODE_8K 0x0002u
+/** Method 6 (implode): set means a literal tree, clear means literals are plain. */
+#define ZIP_FLAG_IMPLODE_LITERALS 0x0004u
 /** Bit 11: the name and comment are UTF-8. */
 #define ZIP_FLAG_UTF8 0x0800u
 
@@ -797,26 +801,41 @@ static GARC_Result zip_read_exact(
  * codec layer takes a string: a second enum here would be a copy of compress's
  * list of methods, and the copy goes stale.
  *
- * Four rows, and each is exact rather than approximate. Method 8 is RFC 1951
+ * Each row is exact rather than approximate. Method 8 is RFC 1951
  * *raw* - no zlib header and no gzip wrapper - which is `compress`'s `"deflate"`
  * and not its `"zlib"`; reading one as the other fails on the first two bytes.
+ * Method 9 is `"deflate64"`, which is *not* RFC 1951 - a 64 KB window, a
+ * different length code 285 and two more distance codes - and is its own codec
+ * for exactly that reason: pointing it at the deflate decoder would produce
+ * plausible wrong bytes for the members that use the extensions.
  * Method 12 is a bare bzip2 stream. Method 95 is a complete `.xz` file. Method 93 is a zstd frame. Method 14 is
  * `"lzma"`, but the bytes are not a `.lzma` file: a header comes first and the
  * rest is raw, which the caller says with the `lzma.*` keys rather than with
  * this name.
  *
- * Method 9 is deliberately absent. "Enhanced deflate" is *not* RFC 1951 - it
- * allows a 64 KB window and a different length code - so pointing it at the
- * deflate decoder would produce plausible wrong bytes for the members that use
- * the extensions, which is worse than refusing it.
+ * Methods 1 to 6 are PKWARE's earliest, read only: 1 is `"shrink"`, 2 to 5 are
+ * `"reduce"` (the factor is the method number less one), and 6 is `"implode"`.
+ * All three are raw streams with no end marker, so the caller also gives the
+ * decoder what the container knows - see zip_legacy_keys().
  *
  * @param method The method number from the central directory.
  * @return A method name, or NULL when this library has no codec for it.
  */
 static const char * zip_codec_name(uint16_t method) {
   switch (method) {
+    case GARC_ZIP_METHOD_SHRUNK:
+      return "shrink";
+    case GARC_ZIP_METHOD_REDUCED_1:
+    case GARC_ZIP_METHOD_REDUCED_2:
+    case GARC_ZIP_METHOD_REDUCED_3:
+    case GARC_ZIP_METHOD_REDUCED_4:
+      return "reduce";
+    case GARC_ZIP_METHOD_IMPLODED:
+      return "implode";
     case GARC_ZIP_METHOD_DEFLATE:
       return "deflate";
+    case GARC_ZIP_METHOD_DEFLATE64:
+      return "deflate64";
     case GARC_ZIP_METHOD_BZIP2:
       return "bzip2";
     case GARC_ZIP_METHOD_LZMA:
@@ -828,6 +847,32 @@ static const char * zip_codec_name(uint16_t method) {
     default:
       return NULL;
   }
+}
+
+/**
+ * What reduce and implode need from the container, or nothing.
+ *
+ * @param method The real method number.
+ * @param flags The member's general purpose flags.
+ * @param size The member's declared uncompressed size.
+ * @param out Filled in; zeroed for every other method.
+ * @return Non-zero when @p out holds keys the decoder needs.
+ */
+static int zip_legacy_keys(
+    uint16_t method, uint16_t flags, uint64_t size, GARC_Member_Legacy * out) {
+  memset(out, 0, sizeof(*out));
+  out->uncompressed_size = size;
+  if (method >= GARC_ZIP_METHOD_REDUCED_1
+      && method <= GARC_ZIP_METHOD_REDUCED_4) {
+    out->reduce_factor = (int64_t)method - (int64_t)GARC_ZIP_METHOD_SHRUNK;
+    return 1;
+  }
+  if (method == GARC_ZIP_METHOD_IMPLODED) {
+    out->implode_dictionary = (flags & ZIP_FLAG_IMPLODE_8K) ? 8192u : 4096u;
+    out->implode_literal_tree = (flags & ZIP_FLAG_IMPLODE_LITERALS) != 0;
+    return 1;
+  }
+  return 0;
 }
 
 /**
@@ -1520,8 +1565,12 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
       }
     }
     if (archive->data_refusal == GARC_OK) {
+      GARC_Member_Legacy legacy_keys;
+      const GARC_Member_Legacy * legacy
+          = zip_legacy_keys(body, zip->flags, size, &legacy_keys)
+          ? &legacy_keys : NULL;
       result = garc_member_codec_create(archive->allocator, source, codec_name,
-          codec_length, size, lzma, &zip->codec);
+          codec_length, size, lzma, legacy, &zip->codec);
       if (result != GARC_OK) {
         // A method compress does not have after all, or no memory. Either way the
         // member's metadata is still good, so this is a refusal on the *data*

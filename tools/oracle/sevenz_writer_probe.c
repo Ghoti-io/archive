@@ -87,6 +87,9 @@ static const Entry ENTRIES[] = {
       NULL, 0644, 1000000000},
   /* Bytes that do not compress, so the packed size exceeds the unpacked. */
   {LIT("noise.bin"), GARC_MEMBER_FILE, NULL, 0u, NULL, 0644, 1000000000},
+  /* The last 1,000 of its 41,000 bytes repeat the first 1,000: a match 40,000
+   * back, beyond deflate's 32 KiB window and within deflate64's. */
+  {LIT("far.bin"), GARC_MEMBER_FILE, NULL, 0u, NULL, 0644, 1000000000},
   {LIT("exec"), GARC_MEMBER_FILE, LIT("#!/bin/sh\nexit 0\n"), NULL, 0755,
       1000000000},
   {LIT("private"), GARC_MEMBER_FILE, LIT("secret\n"), NULL, 0600, 1000000000},
@@ -98,6 +101,7 @@ static const Entry ENTRIES[] = {
 
 static char BIG[20000];
 static char NOISE[3000];
+static char FAR_BIN[41000];
 
 static void fill(void) {
   for (size_t i = 0; i < sizeof(BIG); ++i) {
@@ -108,6 +112,16 @@ static void fill(void) {
     state = state * 1103515245u + 12345u;
     NOISE[i] = (char)(state >> 16);
   }
+  state = 0x2468ACE1u;
+  for (size_t i = 0; i < 1000u; ++i) {
+    state = state * 1103515245u + 12345u;
+    FAR_BIN[i] = (char)(state >> 16);
+  }
+  for (size_t i = 1000u; i < 40000u; ++i) {
+    state = state * 1103515245u + 12345u;
+    FAR_BIN[i] = (char)('a' + ((state >> 16) % 7u));
+  }
+  memcpy(FAR_BIN + 40000u, FAR_BIN, 1000u);
 }
 
 static void print_escaped(const char * bytes, size_t length) {
@@ -240,6 +254,10 @@ static int write_one(const char * directory, const char * name,
       data = BIG;
       data_length = sizeof(BIG);
     }
+    else if (strcmp(entry->name, "far.bin") == 0) {
+      data = FAR_BIN;
+      data_length = sizeof(FAR_BIN);
+    }
     else if (strcmp(entry->name, "noise.bin") == 0) {
       data = NOISE;
       data_length = sizeof(NOISE);
@@ -366,6 +384,7 @@ static const struct {
   {"lzma.7z", GARC_SEVENZ_LZMA, 0},
   {"bzip2.7z", GARC_SEVENZ_BZIP2, 0},
   {"deflate.7z", GARC_SEVENZ_DEFLATE, 0},
+  {"deflate64.7z", GARC_SEVENZ_DEFLATE64, 0},
   {"copy.7z", GARC_SEVENZ_COPY, 0},
 };
 
