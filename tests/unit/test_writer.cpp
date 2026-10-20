@@ -45,6 +45,7 @@
 
 #include "tar_manifest.h"
 #include "test_helpers.h"
+#include "portable.h"
 
 using garctest::BufferDrain;
 using garctest::FailingAllocator;
@@ -2137,9 +2138,8 @@ TEST(WriterFailures, AFailureWritingTheRecordBlocksIsReported) {
 //-----------------------------------------------------------------------------
 
 TEST(WriterDump, SaysWhatTheWriterIsDoing) {
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * out = open_memstream(&buffer, &length);
+  garctest::MemStream out_capture;
+  FILE * out = out_capture.file();
   ASSERT_NE(out, nullptr);
 
   GARC_Sink * sink = nullptr;
@@ -2152,28 +2152,25 @@ TEST(WriterDump, SaysWhatTheWriterIsDoing) {
   ASSERT_EQ(garc_writer_add(writer, &m), GARC_OK);
   garc_writer_dump(writer, out);
   ASSERT_EQ(fflush(out), 0);
-  const std::string text(buffer, length);
+  const std::string text = out_capture.text();
   EXPECT_NE(text.find("tar"), std::string::npos) << text;
   EXPECT_NE(text.find("pax"), std::string::npos) << text;
   EXPECT_NE(text.find("members=1"), std::string::npos) << text;
   EXPECT_NE(text.find("5 data bytes owed"), std::string::npos) << text;
 
-  fclose(out);
-  free(buffer);
+  out_capture.close();
   garc_writer_destroy(writer);
   garc_sink_destroy(sink);
 }
 
 TEST(WriterDump, NullWriterAndNullStreamAreBothHandled) {
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * out = open_memstream(&buffer, &length);
+  garctest::MemStream out_capture;
+  FILE * out = out_capture.file();
   ASSERT_NE(out, nullptr);
   garc_writer_dump(nullptr, out);
   ASSERT_EQ(fflush(out), 0);
-  EXPECT_NE(std::string(buffer, length).find("null"), std::string::npos);
-  fclose(out);
-  free(buffer);
+  EXPECT_NE(out_capture.text().find("null"), std::string::npos);
+  out_capture.close();
   garc_writer_dump(nullptr, nullptr);
 }
 

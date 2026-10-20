@@ -28,6 +28,7 @@
 #include "test_helpers.h"
 #include "zip_builder.h"
 #include "zip/zip_internal.h"
+#include "portable.h"
 
 using garctest::BufferSource;
 using garctest::FailingAllocator;
@@ -861,7 +862,7 @@ TEST(ZipStructure, TheDosConversionAgreesWithTimegmAcrossTheRange) {
     parts.tm_hour = static_cast<int>(one.hour);
     parts.tm_min = static_cast<int>(one.minute);
     parts.tm_sec = static_cast<int>(one.second);
-    EXPECT_EQ(member->mtime_seconds, static_cast<int64_t>(timegm(&parts)))
+    EXPECT_EQ(member->mtime_seconds, garctest::utc_seconds(parts))
         << one.year << "-" << one.month << "-" << one.day;
     EXPECT_EQ(member->mtime_source, GARC_TIME_ZIP_DOS);
   }
@@ -1336,14 +1337,12 @@ TEST(ZipStructure, TheDumpNamesTheStubAndTheEncryption) {
   EXPECT_EQ(garc_zip_member_encryption(built.archive()),
       GARC_ZIP_ENCRYPTION_ZIPCRYPTO);
 
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * out = open_memstream(&buffer, &length);
+  garctest::MemStream out_capture;
+  FILE * out = out_capture.file();
   ASSERT_NE(out, nullptr);
   garc_archive_dump(built.archive(), out);
-  fclose(out);
-  const std::string text(buffer, length);
-  free(buffer);
+  out_capture.close();
+  const std::string text = out_capture.text();
   EXPECT_NE(text.find("64 bytes in front of the archive"), std::string::npos)
       << text;
   EXPECT_NE(text.find("ZipCrypto"), std::string::npos) << text;

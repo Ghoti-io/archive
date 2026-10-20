@@ -92,7 +92,30 @@ def ignored(paths):
     return git(["check-ignore", "-z", "--stdin"], stdin="\0".join(paths))
 
 
+def in_a_checkout():
+    """Whether there is a git index to ask at all.
+
+    A tree shipped without its .git - a release tarball, the EVO job's copy, a
+    cross build's scratch tree - has no index, so the question this gate asks
+    has no answer there. That is said, and is a pass, unless
+    GARC_FIXTURES_REQUIRED=1 asks for the answer anyway.
+    """
+    try:
+        finished = subprocess.run(
+            ["git", "-C", ROOT, "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return False
+    return finished.returncode == 0 and finished.stdout.strip() == b"true"
+
+
 def main():
+    if not in_a_checkout():
+        if os.environ.get("GARC_FIXTURES_REQUIRED") == "1":
+            raise SystemExit("check-fixtures: not a git checkout, and "
+                "GARC_FIXTURES_REQUIRED=1")
+        print("check-fixtures: skipped, not a git checkout (no index to ask)")
+        return
     inputs = []
     for directory, predicate in INPUTS:
         full = os.path.join(ROOT, directory)

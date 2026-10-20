@@ -29,6 +29,7 @@
 #include "sevenz_builder.h"
 #include "tar_manifest.h"
 #include "test_helpers.h"
+#include "portable.h"
 
 using garctest::BufferSource;
 using garctest::SzBuilder;
@@ -231,14 +232,12 @@ TEST(SevenZ, EveryBranchFilterTheReaderMapsDecodesARealArchive) {
 TEST(SevenZ, TheDumpNamesTheFoldersAndEntries) {
   Opened opened(fixture("nonsolid.7z"));
   ASSERT_EQ(opened.open_result(), GARC_OK);
-  char* text = nullptr;
-  size_t length = 0;
-  FILE * out = open_memstream(&text, &length);
+  garctest::MemStream out_capture;
+  FILE * out = out_capture.file();
   ASSERT_NE(out, nullptr);
   garc_archive_dump(opened.archive(), out);
-  fclose(out);
-  const std::string dump(text, length);
-  free(text);
+  out_capture.close();
+  const std::string dump = out_capture.text();
   EXPECT_NE(dump.find("format=7z"), std::string::npos);
   EXPECT_NE(dump.find("7z: "), std::string::npos);
   EXPECT_NE(dump.find("folders"), std::string::npos);

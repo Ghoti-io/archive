@@ -845,6 +845,9 @@ TEST_F(ExtractRoot, DotSlashTargetIsStored) {
 }
 
 TEST_F(ExtractRoot, PackRefusesAFifo) {
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows has no fifo in the filesystem to pack";
+#else
   ASSERT_EQ(0, mkfifo(join_path(root, "pipe").c_str(), 0644));
   GARC_Sink * sink = nullptr;
   ASSERT_EQ(GARC_OK, garc_sink_create_memory(&sink));
@@ -853,6 +856,7 @@ TEST_F(ExtractRoot, PackRefusesAFifo) {
   EXPECT_EQ(GARC_ERR_REFUSED, garc_fs_pack(writer, root.c_str(), 0));
   garc_writer_destroy(writer);
   garc_sink_destroy(sink);
+#endif
 }
 
 TEST(FsApi, UnknownFlagBitsAreInvalid) {

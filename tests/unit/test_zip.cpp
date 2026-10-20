@@ -36,6 +36,7 @@
 #include "test_helpers.h"
 #include "zip_builder.h"
 #include "zip_manifest.h"
+#include "portable.h"
 
 using garctest::BufferSource;
 using garctest::ZipDecryptedRow;
@@ -1536,14 +1537,12 @@ TEST(Zip, TheDumpNamesTheFormatAndTheMember) {
   const GARC_Member * member = nullptr;
   ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
 
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * out = open_memstream(&buffer, &length);
+  garctest::MemStream out_capture;
+  FILE * out = out_capture.file();
   ASSERT_NE(out, nullptr);
   garc_archive_dump(fixture.archive(), out);
-  fclose(out);
-  const std::string text(buffer, length);
-  free(buffer);
+  out_capture.close();
+  const std::string text = out_capture.text();
 
   EXPECT_NE(text.find("format=zip"), std::string::npos) << text;
   EXPECT_NE(text.find("declared members"), std::string::npos) << text;

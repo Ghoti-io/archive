@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "portable.h"
 #include "tar_manifest.h"
 
 namespace garctest {
@@ -96,12 +97,12 @@ struct ZipManifestRow {
   /**
    * The DOS date and time as seconds since the epoch, read as UTC.
    *
-   * **`timegm` on purpose, rather than the library's own conversion.** The point
-   * of comparing against this is that two independent implementations of the
-   * civil-date arithmetic agree; calling into the library would compare it with
-   * itself. `timegm` is not in C17, which is why the library cannot use it - it
-   * is in POSIX, and these tests are built for one platform where the library is
-   * not.
+   * **The tests' own conversion on purpose, rather than the library's.** The
+   * point of comparing against this is that two independent implementations of
+   * the civil-date arithmetic agree; calling into the library would compare it
+   * with itself. It was `timegm`, which is POSIX and absent from the Windows C
+   * runtime, so the tests did not build for win64; garctest::utc_seconds() is
+   * the same arithmetic written in portable.h, still apart from the library.
    */
   int64_t dos_epoch() const {
     std::tm parts;
@@ -118,7 +119,7 @@ struct ZipManifestRow {
     parts.tm_hour = static_cast<int>(hour);
     parts.tm_min = static_cast<int>(minute);
     parts.tm_sec = static_cast<int>(second);
-    return static_cast<int64_t>(timegm(&parts));
+    return garctest::utc_seconds(parts);
   }
 };
 

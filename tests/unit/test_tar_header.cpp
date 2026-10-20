@@ -28,6 +28,7 @@
 // that needs it, and it needs it because the case it covers cannot be reached
 // through the public API on a tar. See TheTotalCannotBeDefeatedByOverflow.
 #include "reader/reader_internal.h"
+#include "portable.h"
 
 using garctest::BufferSource;
 using garctest::file_header;
@@ -2411,16 +2412,14 @@ TEST(TarDump, AHostileNameCannotReachTheTerminal) {
   const GARC_Member * member = nullptr;
   ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
 
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * sink = open_memstream(&buffer, &length);
+  garctest::MemStream sink_capture;
+  FILE * sink = sink_capture.file();
   ASSERT_NE(sink, nullptr);
   garc_member_dump(member, sink);
   garc_archive_dump(opened.archive, sink);
-  fclose(sink);
+  sink_capture.close();
 
-  const std::string text(buffer, length);
-  free(buffer);
+  const std::string text = sink_capture.text();
 
   EXPECT_EQ(text.find('\x1b'), std::string::npos)
       << "an escape byte reached the dump";
@@ -2432,15 +2431,13 @@ TEST(TarDump, AHostileNameCannotReachTheTerminal) {
 }
 
 TEST(TarDump, NullIsAnsweredWithoutCrashing) {
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * sink = open_memstream(&buffer, &length);
+  garctest::MemStream sink_capture;
+  FILE * sink = sink_capture.file();
   ASSERT_NE(sink, nullptr);
   garc_member_dump(nullptr, sink);
   garc_archive_dump(nullptr, sink);
-  fclose(sink);
-  EXPECT_NE(std::string(buffer, length).find("(null)"), std::string::npos);
-  free(buffer);
+  sink_capture.close();
+  EXPECT_NE(sink_capture.text().find("(null)"), std::string::npos);
 
   // And a NULL sink is ignored rather than crashing.
   garc_member_dump(nullptr, nullptr);
@@ -2456,14 +2453,12 @@ TEST(TarDump, TheArchiveDumpNamesTheVariant) {
   const GARC_Member * member = nullptr;
   ASSERT_EQ(garc_next(opened.archive, &member), GARC_OK);
 
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * sink = open_memstream(&buffer, &length);
+  garctest::MemStream sink_capture;
+  FILE * sink = sink_capture.file();
   ASSERT_NE(sink, nullptr);
   garc_archive_dump(opened.archive, sink);
-  fclose(sink);
-  const std::string text(buffer, length);
-  free(buffer);
+  sink_capture.close();
+  const std::string text = sink_capture.text();
 
   EXPECT_NE(text.find("format=tar"), std::string::npos);
   EXPECT_NE(text.find("ustar"), std::string::npos);
@@ -2496,14 +2491,12 @@ TEST(TarDump, EveryFieldShapeIsPrinted) {
   // unreachable through the tar reader and printing "0" for them would be a
   // number a caller could act on.
 
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * sink = open_memstream(&buffer, &length);
+  garctest::MemStream sink_capture;
+  FILE * sink = sink_capture.file();
   ASSERT_NE(sink, nullptr);
   garc_member_dump(&member, sink);
-  fclose(sink);
-  const std::string text(buffer, length);
-  free(buffer);
+  sink_capture.close();
+  const std::string text = sink_capture.text();
 
   EXPECT_NE(text.find("a\\\\b"), std::string::npos) << text;
   EXPECT_NE(text.find("link target: \"target\""), std::string::npos) << text;
@@ -2524,14 +2517,12 @@ TEST(TarDump, AMemberWithNoTimeSaysSoRatherThanPrintingZero) {
   member.name_length = 1;
   member.mtime_source = GARC_TIME_NONE;
 
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * sink = open_memstream(&buffer, &length);
+  garctest::MemStream sink_capture;
+  FILE * sink = sink_capture.file();
   ASSERT_NE(sink, nullptr);
   garc_member_dump(&member, sink);
-  fclose(sink);
-  const std::string text(buffer, length);
-  free(buffer);
+  sink_capture.close();
+  const std::string text = sink_capture.text();
 
   EXPECT_NE(text.find("mtime: none"), std::string::npos) << text;
 }
@@ -2543,14 +2534,12 @@ TEST(TarDump, ANullNameIsPrintedAsSuchRatherThanDereferenced) {
   GARC_Member member;
   std::memset(&member, 0, sizeof(member));
 
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * sink = open_memstream(&buffer, &length);
+  garctest::MemStream sink_capture;
+  FILE * sink = sink_capture.file();
   ASSERT_NE(sink, nullptr);
   garc_member_dump(&member, sink);
-  fclose(sink);
-  const std::string text(buffer, length);
-  free(buffer);
+  sink_capture.close();
+  const std::string text = sink_capture.text();
   EXPECT_NE(text.find("(null)"), std::string::npos) << text;
 }
 
@@ -2561,14 +2550,12 @@ TEST(TarDump, AnArchiveWithNoCurrentMemberSaysSo) {
   Opened opened;
   ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
 
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * sink = open_memstream(&buffer, &length);
+  garctest::MemStream sink_capture;
+  FILE * sink = sink_capture.file();
   ASSERT_NE(sink, nullptr);
   garc_archive_dump(opened.archive, sink);
-  fclose(sink);
-  const std::string text(buffer, length);
-  free(buffer);
+  sink_capture.close();
+  const std::string text = sink_capture.text();
   EXPECT_NE(text.find("member: (none)"), std::string::npos) << text;
 }
 

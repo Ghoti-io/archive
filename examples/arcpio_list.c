@@ -41,6 +41,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #include <ghoti.io/archive/archive.h>
 
@@ -63,6 +67,12 @@ static GARC_Result read_cb(
 int main(void) {
   GARC_Stream_Callbacks callbacks;
   memset(&callbacks, 0, sizeof(callbacks));
+#ifdef _WIN32
+  // Windows opens standard input in text mode, which turns CR LF into LF and
+  // stops at the first 0x1A: an archive read through it arrives altered and
+  // short. Found by running this program under wine.
+  _setmode(_fileno(stdin), _O_BINARY);
+#endif
   callbacks.ctx = stdin;
   callbacks.read = read_cb;
   GARC_Stream * stream = NULL;

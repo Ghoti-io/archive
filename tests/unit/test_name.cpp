@@ -38,6 +38,7 @@
 
 #include "tar_manifest.h"
 #include "test_helpers.h"
+#include "portable.h"
 
 using garctest::VerdictRow;
 using garctest::names_load;
@@ -690,34 +691,29 @@ TEST(NameStrings, EveryFindingHasAStringAndNoneShareOne) {
 }
 
 TEST(NameStrings, TheDumpPrintsEveryFindingAndSaysSoWhenThereAreNone) {
-  char buffer[4096];
-  FILE * out = fmemopen(buffer, sizeof(buffer), "w");
-  ASSERT_NE(out, nullptr);
-  garc_name_findings_dump(check("../CON."), out);
-  fflush(out);
-  fclose(out);
-  const std::string text(buffer);
-  EXPECT_NE(text.find("resolves outside the root"), std::string::npos) << text;
-  EXPECT_NE(text.find("reserved device name"), std::string::npos) << text;
-  EXPECT_NE(text.find("ends in a dot"), std::string::npos) << text;
-
-  std::memset(buffer, 0, sizeof(buffer));
-  out = fmemopen(buffer, sizeof(buffer), "w");
-  ASSERT_NE(out, nullptr);
-  garc_name_findings_dump(0, out);
-  fflush(out);
-  fclose(out);
-  EXPECT_NE(std::string(buffer).find("no findings"), std::string::npos);
-
-  // A bit from outside this build's vocabulary is reported rather than dropped.
-  std::memset(buffer, 0, sizeof(buffer));
-  out = fmemopen(buffer, sizeof(buffer), "w");
-  ASSERT_NE(out, nullptr);
-  garc_name_findings_dump(1u << 20, out);
-  fflush(out);
-  fclose(out);
-  EXPECT_NE(std::string(buffer).find("unrecognised"), std::string::npos)
-      << buffer;
+  {
+    garctest::MemStream out;
+    ASSERT_NE(out.file(), nullptr);
+    garc_name_findings_dump(check("../CON."), out.file());
+    const std::string text = out.text();
+    EXPECT_NE(text.find("resolves outside the root"), std::string::npos) << text;
+    EXPECT_NE(text.find("reserved device name"), std::string::npos) << text;
+    EXPECT_NE(text.find("ends in a dot"), std::string::npos) << text;
+  }
+  {
+    garctest::MemStream out;
+    ASSERT_NE(out.file(), nullptr);
+    garc_name_findings_dump(0, out.file());
+    EXPECT_NE(out.text().find("no findings"), std::string::npos);
+  }
+  {
+    // A bit from outside this build's vocabulary is reported rather than dropped.
+    garctest::MemStream out;
+    ASSERT_NE(out.file(), nullptr);
+    garc_name_findings_dump(1u << 20, out.file());
+    const std::string text = out.text();
+    EXPECT_NE(text.find("unrecognised"), std::string::npos) << text;
+  }
 
   // NULL is ignored rather than crashing.
   garc_name_findings_dump(GARC_NAME_ABSOLUTE, nullptr);

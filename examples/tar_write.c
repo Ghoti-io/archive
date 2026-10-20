@@ -46,6 +46,10 @@
 
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #include <ghoti.io/archive/archive.h>
 #include <ghoti.io/archive/fs.h>
@@ -219,6 +223,11 @@ int main(int argc, char ** argv) {
   // patched, and needs neither for a tar.
   GARC_Sink_Callbacks callbacks;
   memset(&callbacks, 0, sizeof(callbacks));
+#ifdef _WIN32
+  // Windows opens standard output in text mode, which writes every LF as CR LF
+  // and would change the archive's bytes on the way out.
+  _setmode(_fileno(stdout), _O_BINARY);
+#endif
   callbacks.ctx = stdout;
   callbacks.write = file_write;
   GARC_Sink * sink = NULL;

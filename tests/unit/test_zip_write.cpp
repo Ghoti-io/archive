@@ -44,6 +44,7 @@
 
 #include "test_helpers.h"
 #include "zip/zip_internal.h"
+#include "portable.h"
 
 using garctest::BufferDrain;
 using garctest::BufferSource;
@@ -1095,14 +1096,12 @@ TEST(ZipWrite, TheDumpNamesTheDisciplineAndTheDirectory) {
   spec.data = "hello, archive\n";
   ASSERT_EQ(built.add(spec), GARC_OK);
 
-  char * buffer = nullptr;
-  size_t length = 0;
-  FILE * out = open_memstream(&buffer, &length);
+  garctest::MemStream out_capture;
+  FILE * out = out_capture.file();
   ASSERT_NE(out, nullptr);
   garc_writer_dump(built.writer(), out);
-  fclose(out);
-  const std::string text(buffer, length);
-  free(buffer);
+  out_capture.close();
+  const std::string text = out_capture.text();
 
   EXPECT_NE(text.find("format=zip"), std::string::npos) << text;
   EXPECT_NE(text.find("sizes=data descriptor"), std::string::npos) << text;

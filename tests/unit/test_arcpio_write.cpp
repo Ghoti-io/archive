@@ -583,6 +583,11 @@ TEST(SharWrite, TextModeRefusesWhatItCannotCarry) {
 }
 
 TEST(SharWrite, TheScriptWhenRunRecreatesTheTree) {
+#ifdef _WIN32
+  // A shell archive is run by sh, which Windows does not have. The script is
+  // still written there; check-arcpio-writer runs one under a real sh.
+  GTEST_SKIP() << "no POSIX sh to run the script";
+#endif
   char * made = nullptr;
   ASSERT_EQ(GCU_FILE_OK, gcu_dir_temp_create(nullptr, "garc-shar", nullptr, &made));
   const std::string root = made;
