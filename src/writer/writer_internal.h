@@ -233,6 +233,16 @@ struct GARC_Writer {
   int have_member;
   /** Non-zero once the end-of-archive marker has been written. */
   int finished;
+  /**
+   * The status that failed this writer, or ::GARC_OK.
+   *
+   * A failure that may have put bytes in the sink, or left an encoder halfway
+   * through a member, cannot be taken back, and an archive finished after it
+   * would look whole and not be. So it is kept, and every later add, write and
+   * finish returns it without touching the sink. writer_fail() in writer.c
+   * decides which failures changed nothing and are not kept.
+   */
+  GARC_Result failed;
 
   /**
    * The extended records for the member being added.

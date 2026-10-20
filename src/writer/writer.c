@@ -89,6 +89,40 @@ void garc_writer_options_default(GARC_Writer_Options * options) {
  * @param writer The writer.
  * @return GARC_OK, GARC_ERR_INVALID when the member is short, or GARC_ERR_IO.
  */
+/**
+ * Record @p result as the writer's failure unless it provably changed nothing.
+ *
+ * A sink write is all or nothing, so a position that did not move means no byte
+ * of this call reached the sink. That is enough for tar, ar and cpio, whose
+ * writers keep nothing between calls but the sink's position. zip, 7z and shar
+ * keep a CRC, an encoder, a directory or a half-written line, and a failure
+ * there may have moved them, so it fails the writer whatever the position says
+ * - except a refusal from an add, which those formats make before they change
+ * anything.
+ *
+ * @param writer The writer.
+ * @param result The failure.
+ * @param before The sink's position when the call began.
+ * @param refusal_is_clean Whether ::GARC_ERR_INVALID and ::GARC_ERR_UNSUPPORTED
+ *   are refusals made before anything changed, which is true of an add.
+ * @return @p result.
+ */
+static GARC_Result writer_fail(GARC_Writer * writer, GARC_Result result,
+    uint64_t before, int refusal_is_clean) {
+  int clean = garc_sink_tell(writer->sink) == before;
+  if (clean) {
+    const int stateless = writer->format == GARC_FORMAT_TAR
+        || writer->format == GARC_FORMAT_AR || writer->format == GARC_FORMAT_CPIO;
+    const int refusal = refusal_is_clean
+        && (result == GARC_ERR_INVALID || result == GARC_ERR_UNSUPPORTED);
+    clean = stateless || refusal;
+  }
+  if (!clean) {
+    writer->failed = result;
+  }
+  return result;
+}
+
 static GARC_Result writer_close_member(GARC_Writer * writer) {
   if (!writer->have_member) {
     return GARC_OK;
@@ -99,6 +133,7 @@ static GARC_Result writer_close_member(GARC_Writer * writer) {
     // it through would put the next header where a reader is not looking for one.
     return GARC_ERR_INVALID;
   }
+  const uint64_t before = garc_sink_tell(writer->sink);
   // Each format's own closing work, through a hook rather than inline: tar pads
   // and zip writes a descriptor or patches a header and appends a directory
   // entry, and neither rule belongs in the file that has no format in it.
@@ -122,7 +157,7 @@ static GARC_Result writer_close_member(GARC_Writer * writer) {
     result = garc_tar_write_close_member(writer);
   }
   if (result != GARC_OK) {
-    return result;
+    return writer_fail(writer, result, before, 0);
   }
   writer->data_padding = 0;
   writer->have_member = 0;
@@ -293,6 +328,9 @@ GARC_Result garc_writer_add(GARC_Writer * writer, const GARC_Member * member) {
   if (!writer || !member) {
     return GARC_ERR_INVALID;
   }
+  if (writer->failed) {
+    return writer->failed;
+  }
   if (writer->finished) {
     return GARC_ERR_INVALID;
   }
@@ -302,6 +340,7 @@ GARC_Result garc_writer_add(GARC_Writer * writer, const GARC_Member * member) {
     return result;
   }
 
+  const uint64_t before = garc_sink_tell(writer->sink);
   if (writer->format == GARC_FORMAT_AR) {
     result = garc_ar_write_member(writer, member);
   }
@@ -323,8 +362,9 @@ GARC_Result garc_writer_add(GARC_Writer * writer, const GARC_Member * member) {
   if (result != GARC_OK) {
     // have_member stays clear: a header that was not written describes nothing,
     // and leaving a member open would make the next add() pad for data that has
-    // no header in front of it.
-    return result;
+    // no header in front of it. Part of a header in the sink is another matter:
+    // see writer_fail().
+    return writer_fail(writer, result, before, 1);
   }
 
   writer->member_count++;
@@ -336,6 +376,9 @@ GARC_Result garc_writer_write(
     GARC_Writer * writer, const void * data, size_t size) {
   if (!writer || (!data && size)) {
     return GARC_ERR_INVALID;
+  }
+  if (writer->failed) {
+    return writer->failed;
   }
   if (!writer->have_member || writer->finished) {
     return GARC_ERR_INVALID;
@@ -350,6 +393,7 @@ GARC_Result garc_writer_write(
     return GARC_OK;
   }
 
+  const uint64_t before = garc_sink_tell(writer->sink);
   GARC_Result result;
   if (writer->format == GARC_FORMAT_SHAR) {
     result = garc_shar_write_data(writer, data, size);
@@ -364,14 +408,22 @@ GARC_Result garc_writer_write(
     result = garc_sink_write(writer->sink, data, size);
   }
   if (result != GARC_OK) {
-    return result;
+    // Part of the chunk may be out, or inside an encoder, and then the member
+    // cannot be completed honestly.
+    return writer_fail(writer, result, before, 0);
   }
   writer->data_remaining -= (uint64_t)size;
   return GARC_OK;
 }
 
 GARC_Result garc_writer_finish(GARC_Writer * writer) {
-  if (!writer || writer->finished) {
+  if (!writer) {
+    return GARC_ERR_INVALID;
+  }
+  if (writer->failed) {
+    return writer->failed;
+  }
+  if (writer->finished) {
     return GARC_ERR_INVALID;
   }
 
@@ -380,6 +432,7 @@ GARC_Result garc_writer_finish(GARC_Writer * writer) {
     return result;
   }
 
+  const uint64_t before = garc_sink_tell(writer->sink);
   if (writer->format == GARC_FORMAT_AR) {
     result = garc_ar_write_end(writer);
   }
@@ -399,7 +452,7 @@ GARC_Result garc_writer_finish(GARC_Writer * writer) {
     result = garc_tar_write_end(writer);
   }
   if (result != GARC_OK) {
-    return result;
+    return writer_fail(writer, result, before, 0);
   }
   writer->finished = 1;
   return GARC_OK;

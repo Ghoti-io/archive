@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -1460,6 +1461,254 @@ TEST(WriterData, EveryFormatRefusesAShortMemberWhicheverWayItIsClosed) {
   }
 }
 
+namespace {
+
+/**
+ * A memory sink that refuses one write - the first that would take it past
+ * @ref budget bytes - and accepts everything after, as a disk that was briefly
+ * full would.
+ *
+ * It patches, so zip and 7z use it as they use a file, and it counts what it is
+ * asked for after the refusal, which a failed writer must never ask.
+ */
+struct BlipSink {
+  std::string bytes;
+  size_t budget = 0;
+  bool refused = false;
+  int asked_after = 0;
+
+  static GARC_Result write(void * ctx, const void * buffer, size_t size) {
+    BlipSink * self = static_cast<BlipSink *>(ctx);
+    if (self->refused) {
+      ++self->asked_after;
+    }
+    else if (self->bytes.size() + size > self->budget) {
+      self->refused = true;
+      return GARC_ERR_IO;
+    }
+    self->bytes.append(static_cast<const char *>(buffer), size);
+    return GARC_OK;
+  }
+
+  static GARC_Result patch(
+      void * ctx, uint64_t offset, const void * buffer, size_t size) {
+    BlipSink * self = static_cast<BlipSink *>(ctx);
+    if (self->refused) {
+      ++self->asked_after;
+    }
+    std::memcpy(&self->bytes[static_cast<size_t>(offset)], buffer, size);
+    return GARC_OK;
+  }
+
+  GARC_Sink_Callbacks callbacks() {
+    GARC_Sink_Callbacks c{};
+    c.write = write;
+    c.patch = patch;
+    c.ctx = this;
+    return c;
+  }
+};
+
+/** What a caller does: each call in turn, and the one that fails tried once more. */
+struct Outcome {
+  GARC_Result first = GARC_OK;  ///< The first failure, or GARC_OK.
+  GARC_Result retry = GARC_OK;  ///< The same call, made again.
+  std::vector<GARC_Result> after;  ///< Every call after that.
+  bool finished = false;
+};
+
+Outcome write_through_a_blip(GARC_Writer * writer,
+    const std::vector<Captured> & members) {
+  std::vector<std::function<GARC_Result()>> calls;
+  std::vector<GARC_Member> held;
+  held.reserve(members.size());
+  for (const Captured & c : members) {
+    held.push_back(c.as_member());
+    const GARC_Member * m = &held.back();
+    const std::string * data = &c.data;
+    calls.push_back([writer, m] { return garc_writer_add(writer, m); });
+    if (!data->empty()) {
+      const size_t half = data->size() / 2;
+      calls.push_back([writer, data, half] {
+        return garc_writer_write(writer, data->data(), half);
+      });
+      calls.push_back([writer, data, half] {
+        return garc_writer_write(writer, data->data() + half, data->size() - half);
+      });
+    }
+  }
+  calls.push_back([writer] { return garc_writer_finish(writer); });
+
+  Outcome outcome;
+  for (size_t i = 0; i < calls.size(); ++i) {
+    const GARC_Result result = calls[i]();
+    if (outcome.first != GARC_OK) {
+      outcome.after.push_back(result);
+      continue;
+    }
+    if (result != GARC_OK) {
+      outcome.first = result;
+      outcome.retry = calls[i]();
+      if (outcome.retry != GARC_OK) {
+        continue;
+      }
+      // The retry went through, so the caller carries on as if nothing had
+      // happened, and the archive is judged at the end.
+      outcome.first = GARC_OK;
+      outcome.after.clear();
+      if (i + 1 == calls.size()) {
+        outcome.finished = true;
+      }
+      continue;
+    }
+    if (i + 1 == calls.size()) {
+      outcome.finished = true;
+    }
+  }
+  return outcome;
+}
+
+}  // namespace
+
+TEST(WriterFailure, ASinkThatRefusesOnceNeverYieldsAWrongArchive) {
+  // A sink that refuses one write and then recovers, at every point the
+  // archive could be cut - a header, data, a codec flush, a central directory,
+  // an end record. A writer may either refuse for good (and then write nothing
+  // more) or carry on, and then the finished archive must be exactly right. A
+  // writer that carried on over part of a header would pass the first test and
+  // fail the second; one that refused for good on every failure would be
+  // correct and needlessly strict for tar, ar and cpio, so that is asserted too.
+  std::vector<Captured> members = {
+      plain_file("one.txt", std::string(3000, 'a') + "\n"),
+      plain_file("two.txt", "second\n")};
+  for (const GARC_Format format : kEveryWriteFormat) {
+    SCOPED_TRACE(garc_format_string(format));
+    const bool stateless = format == GARC_FORMAT_TAR
+        || format == GARC_FORMAT_AR || format == GARC_FORMAT_CPIO;
+    size_t whole = 0;
+    std::string reference;
+    {
+      BlipSink blip;
+      blip.budget = static_cast<size_t>(-1);
+      const GARC_Sink_Callbacks callbacks = blip.callbacks();
+      GARC_Sink * s = nullptr;
+      ASSERT_EQ(garc_sink_create_callback(&callbacks, &s), GARC_OK);
+      GARC_Writer * writer = nullptr;
+      ASSERT_EQ(garc_writer_create(s, format, nullptr, &writer), GARC_OK);
+      ASSERT_TRUE(write_through_a_blip(writer, members).finished);
+      reference = blip.bytes;
+      whole = reference.size();
+      garc_writer_destroy(writer);
+      garc_sink_destroy(s);
+    }
+    int sticky = 0;
+    int recovered = 0;
+    for (size_t budget = 0; budget < whole; budget += 1 + whole / 211) {
+      SCOPED_TRACE(budget);
+      BlipSink blip;
+      blip.budget = budget;
+      const GARC_Sink_Callbacks callbacks = blip.callbacks();
+      GARC_Sink * s = nullptr;
+      ASSERT_EQ(garc_sink_create_callback(&callbacks, &s), GARC_OK);
+      GARC_Writer * writer = nullptr;
+      const GARC_Result created = garc_writer_create(s, format, nullptr, &writer);
+      if (created != GARC_OK) {
+        // 7z reserves its signature header at create.
+        EXPECT_EQ(created, GARC_ERR_IO);
+        garc_sink_destroy(s);
+        continue;
+      }
+      const Outcome outcome = write_through_a_blip(writer, members);
+      ASSERT_TRUE(blip.refused) << "the budget was short and nothing was refused";
+      if (outcome.first != GARC_OK) {
+        ++sticky;
+        EXPECT_FALSE(outcome.finished);
+        EXPECT_EQ(outcome.retry, outcome.first);
+        for (GARC_Result later : outcome.after) {
+          EXPECT_EQ(later, outcome.first) << garc_result_string(later);
+        }
+        EXPECT_EQ(blip.asked_after, 0) << "a failed writer went on writing";
+      }
+      else {
+        ++recovered;
+        ASSERT_TRUE(outcome.finished);
+        EXPECT_TRUE(stateless) << "a format that keeps state recovered";
+        // Byte for byte what an undisturbed run wrote.
+        EXPECT_EQ(blip.bytes, reference);
+      }
+      garc_writer_destroy(writer);
+      garc_sink_destroy(s);
+    }
+    EXPECT_GT(sticky + recovered, 100);
+    if (stateless) {
+      // A refusal at a call's first write left nothing behind and is recovered
+      // from. One at a later write of the same call - a header and then its
+      // padding - left part of it in the sink, and is not. Both happen here.
+      EXPECT_GT(recovered, 0);
+      EXPECT_GT(sticky, 0);
+    }
+  }
+}
+
+TEST(WriterFailure, ARefusalThatWroteNothingLeavesTheWriterUsable) {
+  for (const GARC_Format format : kEveryWriteFormat) {
+    SCOPED_TRACE(garc_format_string(format));
+    GARC_Sink * sink = nullptr;
+    ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+    GARC_Writer * writer = nullptr;
+    ASSERT_EQ(garc_writer_create(sink, format, nullptr, &writer), GARC_OK);
+    // An empty name is refused by every format before a byte is written.
+    const Captured bad = plain_file("", "");
+    const GARC_Member b = bad.as_member();
+    const uint64_t before = garc_sink_tell(sink);
+    EXPECT_EQ(garc_writer_add(writer, &b), GARC_ERR_INVALID);
+    EXPECT_EQ(garc_sink_tell(sink), before);
+    const Captured good = plain_file("good.txt", "fine\n");
+    const GARC_Member g = good.as_member();
+    ASSERT_EQ(garc_writer_add(writer, &g), GARC_OK);
+    // Short of its size: refused, and still usable once the rest is written.
+    ASSERT_EQ(garc_writer_write(writer, "fi", 2), GARC_OK);
+    EXPECT_EQ(garc_writer_finish(writer), GARC_ERR_INVALID);
+    ASSERT_EQ(garc_writer_write(writer, "ne\n", 3), GARC_OK);
+    EXPECT_EQ(garc_writer_finish(writer), GARC_OK);
+    EXPECT_EQ(garc_writer_member_count(writer), 1u);
+    garc_writer_destroy(writer);
+    garc_sink_destroy(sink);
+  }
+}
+
+TEST(WriterFailure, ATextSharThatMeetsANulOrNoFinalNewlineNeverFinishes) {
+  for (const std::string & data : {std::string("ab\0cd\n", 6), std::string("no newline")}) {
+    SCOPED_TRACE(data.size());
+    GARC_Sink * sink = nullptr;
+    ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+    GARC_Writer * writer = nullptr;
+    ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_SHAR, nullptr, &writer), GARC_OK);
+    const Captured member = plain_file("f", data);
+    const GARC_Member m = member.as_member();
+    ASSERT_EQ(garc_writer_add(writer, &m), GARC_OK);
+    GARC_Result result = garc_writer_write(writer, data.data(), data.size());
+    if (result == GARC_OK) {
+      result = garc_writer_finish(writer);
+    }
+    EXPECT_EQ(result, GARC_ERR_UNSUPPORTED);
+    const uint64_t at = garc_sink_tell(sink);
+    EXPECT_EQ(garc_writer_finish(writer), GARC_ERR_UNSUPPORTED);
+    const Captured next = plain_file("g", "text\n");
+    const GARC_Member n = next.as_member();
+    EXPECT_EQ(garc_writer_add(writer, &n), GARC_ERR_UNSUPPORTED);
+    EXPECT_EQ(garc_sink_tell(sink), at);
+    // A whole script ends "exit 0". This one must not.
+    const void * bytes = nullptr;
+    size_t length = 0;
+    ASSERT_EQ(garc_sink_data(sink, &bytes, &length), GARC_OK);
+    const std::string script(static_cast<const char *>(bytes), length);
+    EXPECT_EQ(script.find("exit 0"), std::string::npos);
+    garc_writer_destroy(writer);
+    garc_sink_destroy(sink);
+  }
+}
+
 TEST(WriterData, WritingWithNoMemberIsRefused) {
   GARC_Sink * sink = nullptr;
   ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
@@ -1824,28 +2073,46 @@ TEST(WriterFailures, AFailureWritingTheEndMarkerIsReported) {
 }
 
 TEST(WriterFailures, AFailureWritingTheRecordBlocksIsReported) {
-  BufferDrain drain;
-  GARC_Sink * sink = nullptr;
-  ASSERT_EQ(garc_sink_create_callback(drain.callbacks(), &sink), GARC_OK);
-  GARC_Writer * writer = nullptr;
-  ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_TAR, nullptr, &writer),
-      GARC_OK);
   const Captured member = plain_file(std::string(160, 'c'), "");
   const GARC_Member m = member.as_member();
   // Four writes go into a member with records: the extended header's own block,
   // its records, the padding after them, and the member's header. Failing only
   // the first would leave three arms looking covered because the function was.
   for (size_t which = 0; which < 4; ++which) {
+    SCOPED_TRACE(which);
+    BufferDrain drain;
+    GARC_Sink * sink = nullptr;
+    ASSERT_EQ(garc_sink_create_callback(drain.callbacks(), &sink), GARC_OK);
+    GARC_Writer * writer = nullptr;
+    ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_TAR, nullptr, &writer),
+        GARC_OK);
     drain.fail_write_at(which);
-    EXPECT_EQ(garc_writer_add(writer, &m), GARC_ERR_IO) << which;
-    EXPECT_EQ(garc_writer_member_count(writer), 0u) << which;
+    EXPECT_EQ(garc_writer_add(writer, &m), GARC_ERR_IO);
+    EXPECT_EQ(garc_writer_member_count(writer), 0u);
+    const size_t accepted = drain.bytes().size();
+    if (which == 0) {
+      // Nothing reached the sink, so trying again is honest, and the archive
+      // that comes out is whole.
+      EXPECT_EQ(accepted, 0u);
+      ASSERT_EQ(garc_writer_add(writer, &m), GARC_OK);
+      ASSERT_EQ(garc_writer_finish(writer), GARC_OK);
+      std::vector<Captured> back;
+      EXPECT_EQ(read_all(std::string(drain.bytes().begin(), drain.bytes().end()),
+                    &back),
+          GARC_OK);
+      EXPECT_EQ(back.size(), 1u);
+    }
+    else {
+      // Part of the header is in the sink. This used to be retried, and the
+      // archive that came out carried that part in front of the real header.
+      EXPECT_GT(accepted, 0u);
+      EXPECT_EQ(garc_writer_add(writer, &m), GARC_ERR_IO);
+      EXPECT_EQ(garc_writer_finish(writer), GARC_ERR_IO);
+      EXPECT_EQ(drain.bytes().size(), accepted);
+    }
+    garc_writer_destroy(writer);
+    garc_sink_destroy(sink);
   }
-  // And with nothing failing it succeeds, so the four above were the arms and not
-  // four spellings of one refusal.
-  EXPECT_EQ(garc_writer_add(writer, &m), GARC_OK);
-  EXPECT_EQ(garc_writer_member_count(writer), 1u);
-  garc_writer_destroy(writer);
-  garc_sink_destroy(sink);
 }
 
 //-----------------------------------------------------------------------------

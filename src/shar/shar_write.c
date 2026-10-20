@@ -35,7 +35,10 @@
  * because every line begins with `X`. It is readable, and it is **text only**: a
  * NUL cannot sit in a shell here-document, and a last line with no newline would
  * gain one when `sed` wrote it. Both are ::GARC_ERR_UNSUPPORTED at the byte or
- * the close where they are met, and the script being written is then unusable.
+ * the close where they are met. A stream cannot know either in advance, and
+ * part of the member is already in the sink by then, so the refusal fails the
+ * writer: it never writes the `exit 0` that ends a whole script, and a file
+ * sink never renames the partial one into place.
  * `shar_uuencode` writes any bytes, as uuencode, and extracting needs
  * `uudecode`.
  *

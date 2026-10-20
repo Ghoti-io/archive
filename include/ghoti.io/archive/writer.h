@@ -391,13 +391,24 @@ GARC_API GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
  * - **A value no field can hold**: a size at or above 2^63, a device number
  *   over 2^62. These are the ranges ::garc_next() refuses from the other side.
  *
+ * **A refusal is not a failure.** One of the refusals above, or
+ * ::GARC_ERR_UNSUPPORTED, writes nothing and leaves the writer usable: skip the
+ * member and add the next. So does any failure of tar, ar or cpio that reached
+ * the sink with no byte - a sink write is all or nothing - since those writers
+ * keep nothing else between calls; try again when the sink can take it. Any
+ * other failure **fails the writer**: bytes already in the sink, or a CRC, an
+ * encoder or a directory already moved, cannot be taken back, so every later
+ * add, write and finish returns that same status and writes nothing. Destroy it,
+ * and with a sink from ::garc_fs_sink_create() nothing reaches the destination.
+ *
  * @param writer The writer.
  * @param member What to write. Borrowed for the duration of the call;
  *   `header_offset` and `data_offset` are ignored.
  * @return ::GARC_OK, ::GARC_ERR_INVALID for one of the refusals above or while
  *   the previous member is still short of its declared size,
  *   ::GARC_ERR_UNSUPPORTED when the chosen variant cannot express the member,
- *   ::GARC_ERR_OOM, or ::GARC_ERR_IO from the sink.
+ *   ::GARC_ERR_OOM, or ::GARC_ERR_IO from the sink; once the writer has failed,
+ *   the status that failed it.
  */
 GARC_API GARC_Result garc_writer_add(
     GARC_Writer * writer, const GARC_Member * member);
@@ -409,14 +420,17 @@ GARC_API GARC_Result garc_writer_add(
  * declared is ::GARC_ERR_INVALID, and the bytes are not written - a header that
  * says one length and a body that is another is an archive no reader can
  * recover, so it is refused at the call that would have done it rather than at
- * the end.
+ * the end. That refusal leaves the writer usable. Any failure past it - the
+ * sink's, the encoder's, or a format refusing the bytes themselves, as a text
+ * shar refuses a NUL - fails the writer, as ::garc_writer_add() describes.
  *
  * @param writer The writer.
  * @param data The bytes. May be NULL only when @p size is 0.
  * @param size How many.
  * @return ::GARC_OK, ::GARC_ERR_INVALID when there is no current member, when
- *   it carries no data, or when this would exceed the declared size, or
- *   ::GARC_ERR_IO.
+ *   it carries no data, or when this would exceed the declared size, the
+ *   format's or the codec's status, or ::GARC_ERR_IO; once the writer has
+ *   failed, the status that failed it.
  */
 GARC_API GARC_Result garc_writer_write(
     GARC_Writer * writer, const void * data, size_t size);
@@ -433,9 +447,14 @@ GARC_API GARC_Result garc_writer_write(
  * destroying without finishing leaves a truncated archive on purpose, which is
  * how a caller abandons a write.
  *
+ * A member still short of its declared size is refused, and the writer stays
+ * usable: write the rest and finish again. Other failures follow the rule
+ * ::garc_writer_add() gives, and a writer that has failed never finishes.
+ *
  * @param writer The writer.
  * @return ::GARC_OK, ::GARC_ERR_INVALID when a member is still short of its
- *   declared size or the archive is already finished, or ::GARC_ERR_IO.
+ *   declared size or the archive is already finished, the format's status, or
+ *   ::GARC_ERR_IO; once the writer has failed, the status that failed it.
  */
 GARC_API GARC_Result garc_writer_finish(GARC_Writer * writer);
 
