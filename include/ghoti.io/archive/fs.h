@@ -53,8 +53,9 @@
  * ::GARC_FS_ALLOW_PORTABLE_NAMES does not allow them: a reserved device name
  * (`CON` would write the member to the console), a component ending in a dot
  * or a space (stripped, so two names reach one file), a backslash traversal, a
- * control byte, and any of `:*?"<>|` in a member name - a `:` would open an
- * alternate data stream. A symbolic link member is ::GARC_ERR_REFUSED there
+ * control byte, and a colon, asterisk, question mark, double quote, angle
+ * bracket or vertical bar in a member name - a colon would open an alternate
+ * data stream. A symbolic link member is ::GARC_ERR_REFUSED there
  * even with ::GARC_FS_ALLOW_LINKS, because cutil does not create one on
  * Windows.
  *
