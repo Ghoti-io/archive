@@ -122,6 +122,9 @@ bool documented(GARC_Result result) {
     case GARC_ERR_LIMIT_NAME_BYTES:
     case GARC_ERR_LIMIT_EXTRA_BYTES:
     case GARC_ERR_LIMIT_CODEC_BYTES:
+    case GARC_ERR_PASSWORD_REQUIRED:
+    case GARC_ERR_PASSWORD_REJECTED:
+    case GARC_ERR_PASSWORD_OR_CORRUPT:
       return true;
     // GARC_ERR_INTERNAL is deliberately absent, for the reason the tar harness
     // gives: it means this library's own invariant failed, so no input should be

@@ -105,6 +105,12 @@ bool documented(GARC_Result result) {
     case GARC_ERR_LIMIT_NAME_BYTES:
     case GARC_ERR_LIMIT_EXTRA_BYTES:
     case GARC_ERR_NOT_SEEKABLE:
+    // A zip read off a pipe, which this harness walks when the input is one:
+    // its codec's cap and its password statuses are the zip reader's own.
+    case GARC_ERR_LIMIT_CODEC_BYTES:
+    case GARC_ERR_PASSWORD_REQUIRED:
+    case GARC_ERR_PASSWORD_REJECTED:
+    case GARC_ERR_PASSWORD_OR_CORRUPT:
       // garc_open returns this for a zip on a stream that cannot seek. It is
       // a documented answer, and the options byte can choose that stream.
       return true;
@@ -255,6 +261,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   }
 
   if (budget >= 0) {
+    if (!documented(result)) {
+      std::fprintf(stderr, "next returned %s\n", garc_result_string(result));
+    }
     REQUIRE(documented(result), "next returned a status it does not document");
     if (result != GARC_OK && result != GARC_END) {
       // After a failure there is no current member, so a caller that ignores the
