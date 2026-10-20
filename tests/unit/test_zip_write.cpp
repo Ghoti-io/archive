@@ -986,6 +986,168 @@ TEST(ZipWrite, ADirectoryEndingLikeALocatorGetsARealOne) {
   }
 }
 
+namespace {
+
+/**
+ * The tail of a file whose first `start` bytes are already there: a sink whose
+ * offsets begin at `start`, and a stream that reads zeros for the part before
+ * it. A member past 4 GiB without writing 4 GiB.
+ */
+struct FarTail {
+  uint64_t start = 0;
+  std::string bytes;
+
+  static GARC_Result write(void * ctx, const void * buffer, size_t size) {
+    static_cast<FarTail *>(ctx)->bytes.append(
+        static_cast<const char *>(buffer), size);
+    return GARC_OK;
+  }
+  static GARC_Result patch(
+      void * ctx, uint64_t offset, const void * buffer, size_t size) {
+    FarTail * self = static_cast<FarTail *>(ctx);
+    std::memcpy(&self->bytes[static_cast<size_t>(offset - self->start)], buffer,
+        size);
+    return GARC_OK;
+  }
+
+  struct Reading {
+    const FarTail * tail;
+    uint64_t at = 0;
+  };
+  static GARC_Result read(void * ctx, void * buffer, size_t size, size_t * got) {
+    Reading * r = static_cast<Reading *>(ctx);
+    const uint64_t end = r->tail->start + r->tail->bytes.size();
+    size_t n = 0;
+    while (n < size && r->at < end) {
+      if (r->at < r->tail->start) {
+        const uint64_t zeros = r->tail->start - r->at;
+        const size_t take = static_cast<size_t>(
+            zeros < (uint64_t)(size - n) ? zeros : (uint64_t)(size - n));
+        std::memset(static_cast<char *>(buffer) + n, 0, take);
+        // A real zip of that size starts with a local header, not with zeros a
+        // reader would take for an empty tar.
+        static const char signature[4] = {'P', 'K', 3, 4};
+        for (size_t i = 0; i < take && r->at + i < 4u; ++i) {
+          static_cast<char *>(buffer)[n + i] = signature[r->at + i];
+        }
+        n += take;
+        r->at += take;
+      }
+      else {
+        const uint64_t left = end - r->at;
+        const size_t take = static_cast<size_t>(
+            left < (uint64_t)(size - n) ? left : (uint64_t)(size - n));
+        std::memcpy(static_cast<char *>(buffer) + n,
+            r->tail->bytes.data() + (r->at - r->tail->start), take);
+        n += take;
+        r->at += take;
+      }
+    }
+    *got = n;
+    return GARC_OK;
+  }
+  static GARC_Result seek(void * ctx, uint64_t offset) {
+    static_cast<Reading *>(ctx)->at = offset;
+    return GARC_OK;
+  }
+  static GARC_Result size(void * ctx, uint64_t * out) {
+    const Reading * r = static_cast<Reading *>(ctx);
+    *out = r->tail->start + r->tail->bytes.size();
+    return GARC_OK;
+  }
+};
+
+uint32_t le32_at(const std::string & bytes, size_t at) {
+  const unsigned char * p = reinterpret_cast<const unsigned char *>(bytes.data()) + at;
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16)
+      | ((uint32_t)p[3] << 24);
+}
+
+/** Write two members starting at @p start, and return the far tail. */
+FarTail far_zip(uint64_t start) {
+  FarTail tail;
+  tail.start = start;
+  GARC_Sink_Callbacks callbacks{};
+  callbacks.write = FarTail::write;
+  callbacks.patch = FarTail::patch;
+  callbacks.ctx = &tail;
+  callbacks.start = start;
+  GARC_Sink * sink = nullptr;
+  EXPECT_EQ(garc_sink_create_callback(&callbacks, &sink), GARC_OK);
+  EXPECT_EQ(garc_sink_tell(sink), start);
+  GARC_Writer * writer = nullptr;
+  EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, nullptr, &writer), GARC_OK);
+  for (const char * name : {"first.txt", "second.txt"}) {
+    Spec spec;
+    spec.name = name;
+    spec.data = std::string("contents of ") + name + "\n";
+    const GARC_Member member = member_of(spec);
+    EXPECT_EQ(garc_writer_add(writer, &member), GARC_OK);
+    EXPECT_EQ(garc_writer_write(writer, spec.data.data(), spec.data.size()),
+        GARC_OK);
+  }
+  EXPECT_EQ(garc_writer_finish(writer), GARC_OK);
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  return tail;
+}
+
+} // namespace
+
+TEST(ZipWrite, AMemberPastFourGibibytesRecordsItsOffsetInZip64) {
+  // Every member's header starts past 4 GiB here. Its central entry has to say
+  // 0xFFFFFFFF and carry the real offset in the zip64 field; the writer used to
+  // truncate the offset into 32 bits with no marker, so a reader went to the
+  // wrong place for every member past the first 4 GiB of a large archive.
+  const uint64_t start = (uint64_t)5 << 30;
+  const FarTail tail = far_zip(start);
+  FarTail::Reading reading{&tail};
+  GARC_Stream_Callbacks callbacks{};
+  callbacks.read = FarTail::read;
+  callbacks.seek = FarTail::seek;
+  callbacks.size = FarTail::size;
+  callbacks.ctx = &reading;
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(garc_stream_create_callback(&callbacks, &stream), GARC_OK);
+  // Opened from the start of the file, as a real one would be: the offsets the
+  // writer recorded are the file's.
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+  const GARC_Member * member = nullptr;
+  std::vector<std::string> names;
+  while (garc_next(archive, &member) == GARC_OK) {
+    EXPECT_GE(member->header_offset, start);
+    EXPECT_TRUE(garc_zip_member_used_zip64(archive));
+    std::string data;
+    char buffer[64];
+    size_t got = 0;
+    while (garc_read_member(archive, buffer, sizeof(buffer), &got) == GARC_OK && got) {
+      data.append(buffer, got);
+    }
+    const std::string name(member->name, member->name_length);
+    EXPECT_EQ(data, "contents of " + name + "\n");
+    names.push_back(name);
+  }
+  EXPECT_EQ(names, (std::vector<std::string>{"first.txt", "second.txt"}));
+  garc_close(archive);
+  garc_stream_destroy(stream);
+
+  // And the field itself, read from the directory's bytes: the marker.
+  const size_t central = tail.bytes.find(std::string("PK\x01\x02", 4));
+  ASSERT_NE(central, std::string::npos);
+  EXPECT_EQ(le32_at(tail.bytes, central + 42u), 0xFFFFFFFFu);
+}
+
+TEST(ZipWrite, AMemberBelowFourGibibytesKeepsItsPlainOffset) {
+  // The control: the same writer at the start of a file writes the offset
+  // itself, and no zip64 field, because nothing needs one.
+  const FarTail tail = far_zip(0);
+  const size_t central = tail.bytes.find(std::string("PK\x01\x02", 4));
+  ASSERT_NE(central, std::string::npos);
+  EXPECT_EQ(le32_at(tail.bytes, central + 42u), 0u);
+  EXPECT_EQ(tail.bytes.find(std::string("\x01\x00\x08\x00", 4)), std::string::npos);
+}
+
 TEST(ZipWrite, AShortMemberIsRefusedRatherThanPadded) {
   // The same rule the tar writer has, and it matters more here: the central
   // directory would carry a size the data does not have, and the directory is what

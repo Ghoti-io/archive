@@ -134,6 +134,17 @@ typedef struct GARC_Sink_Callbacks {
 
   /** Passed to `write` and `patch`. Borrowed; must outlive the sink. */
   void * ctx;
+  /**
+   * The offset the first byte written will have, for a sink that continues a
+   * file already partly written. Zero, the value a zeroed struct gives, is a
+   * new file.
+   *
+   * ::garc_sink_tell() starts here, so a writer's offsets are the file's: a zip
+   * appended after an existing archive's members records where its own members
+   * really are. A patch below it is refused, because those bytes are not this
+   * sink's.
+   */
+  uint64_t start;
 } GARC_Sink_Callbacks;
 
 /**

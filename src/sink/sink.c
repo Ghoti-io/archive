@@ -192,6 +192,7 @@ GARC_Result garc_sink_create_callback_with_allocator(
   // Copied, so the caller's struct need not outlive this call. ctx inside it
   // is borrowed and must; the header says so.
   sink->cb = *callbacks;
+  sink->pos = callbacks->start;
 
   *out_sink = sink;
   return GARC_OK;
@@ -265,7 +266,8 @@ GARC_Result garc_sink_patch(
   // a gap this library never wrote - or be silently truncated. Both are worse
   // than a refusal, and checking it here is what lets the memory sink's own
   // implementation be a memcpy with no arithmetic of its own.
-  if (offset > sink->pos || (uint64_t)size > sink->pos - offset) {
+  if (offset < sink->cb.start || offset > sink->pos
+      || (uint64_t)size > sink->pos - offset) {
     return GARC_ERR_INVALID;
   }
   return sink->cb.patch(sink->cb.ctx, offset, data, size);

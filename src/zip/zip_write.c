@@ -1148,6 +1148,7 @@ static GARC_Result zip_central_fit_compressed(GARC_Writer * writer) {
   if (zip->compressed < (uint64_t)ZIP_MARKER32) {
     return GARC_OK;
   }
+  // Only the 8-byte form is widened, and so only before the offset is added.
   uint8_t * extra = (uint8_t *)zip->extra.bytes;
   if (!extra || zip->extra.length < 12u || garc_zip_le16(extra) != 0x0001u
       || garc_zip_le16(extra + 2u) != 8u) {
@@ -1163,6 +1164,45 @@ static GARC_Result zip_central_fit_compressed(GARC_Writer * writer) {
   memmove(extra + 20u, extra + 12u, length - 12u);
   garc_zip_put16(extra + 2u, 16u);
   garc_zip_put64(extra + 12u, zip->compressed);
+  zip->extra.length = length + 8u;
+  return GARC_OK;
+}
+
+/**
+ * Record a local header offset that does not fit the central entry's field.
+ *
+ * Called after ::zip_central_fit_compressed, because the zip64 payload's fields
+ * come in a fixed order - uncompressed size, compressed size, local header
+ * offset - and each is present only when its 32-bit field holds the marker. A
+ * member whose header starts past 4 GiB already has the field, because
+ * ::zip_needs_zip64 asks where the sink is. The offset used to be written
+ * truncated into the 32-bit field with no marker and no zip64 value, so every
+ * member past 4 GiB in a large archive pointed at the wrong place.
+ *
+ * @param writer The writer.
+ * @return ::GARC_OK, or ::GARC_ERR_OOM.
+ */
+static GARC_Result zip_central_fit_offset(GARC_Writer * writer) {
+  GARC_Zip_Write_State * zip = &writer->zip;
+  if (zip->local_offset < (uint64_t)ZIP_MARKER32) {
+    return GARC_OK;
+  }
+  uint8_t * extra = (uint8_t *)zip->extra.bytes;
+  if (!extra || zip->extra.length < 12u || garc_zip_le16(extra) != 0x0001u) {
+    return GARC_ERR_INTERNAL; // zip_needs_zip64() guarantees the field
+  }
+  const uint16_t payload = garc_zip_le16(extra + 2u);
+  const size_t at = 4u + payload;
+  const size_t length = zip->extra.length;
+  const GARC_Result grown
+      = garc_buffer_grow(writer->allocator, &zip->extra, length + 8u);
+  if (grown != GARC_OK) {
+    return grown;
+  }
+  extra = (uint8_t *)zip->extra.bytes;
+  memmove(extra + at + 8u, extra + at, length - at);
+  garc_zip_put16(extra + 2u, (uint16_t)(payload + 8u));
+  garc_zip_put64(extra + at, zip->local_offset);
   zip->extra.length = length + 8u;
   return GARC_OK;
 }
@@ -1215,6 +1255,9 @@ GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
   // benefit, and the directory has never had an excuse. The compressed size
   // includes the authentication code, so this is the first moment it is known.
   result = zip_central_fit_compressed(writer);
+  if (result == GARC_OK) {
+    result = zip_central_fit_offset(writer);
+  }
   if (result != GARC_OK) {
     return result;
   }
@@ -1239,7 +1282,8 @@ GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
   garc_zip_put16(entry + 34u, 0u); // Disk 0, which is the only disk there is.
   garc_zip_put16(entry + 36u, 0u); // Internal attributes: no writer sets these.
   garc_zip_put32(entry + 38u, zip->external_attributes);
-  garc_zip_put32(entry + 42u, (uint32_t)zip->local_offset);
+  garc_zip_put32(entry + 42u, zip->local_offset >= (uint64_t)ZIP_MARKER32
+      ? ZIP_MARKER32 : (uint32_t)zip->local_offset);
 
   result = zip_central_append(writer, entry, sizeof(entry));
   if (result != GARC_OK) {
