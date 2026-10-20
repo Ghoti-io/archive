@@ -174,8 +174,15 @@ decoder's output cap is the member's **declared** size, which is tighter than
 `compress`'s 512 MiB default for the small members a bomb hides among and looser
 for the legitimate member that is bigger than that.
 
-Reading a zip needs a seekable stream, and a zip on a pipe is
-`GARC_ERR_NOT_SEEKABLE` rather than "not an archive".
+A zip on a pipe is read from the front, by its local headers, and every record
+the walk kept is compared with the central directory when it is reached; any
+disagreement is `GARC_ERR_CORRUPT` from that last `garc_next()`, so what a streamed
+walk hands over is provisional until it ends. A member written with a data
+descriptor has `size_unknown` set until its data is read, which is possible for
+the methods whose decoder knows where it ends (deflate, deflate64, zstd, LZMA with
+its marker); stored members with a descriptor are refused there, because nothing
+marks where stored data ends, and so for now are bzip2 and xz, whose decoders in
+compress read on past the end of the first stream.
 
 The zip fixtures are 23 archives from four writers - Info-ZIP's `zip`,
 libarchive's `bsdtar`, 7-Zip and Python's `zipfile` - with what `zipfile` and

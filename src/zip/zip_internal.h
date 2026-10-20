@@ -545,6 +545,53 @@ GARC_Result garc_zip_skip(GARC_Archive * archive);
 GARC_Result garc_zip_next(GARC_Archive * archive);
 
 /**
+ * Begin reading a zip from a stream that cannot seek: by its local headers,
+ * checking the central directory when the walk reaches it.
+ *
+ * @param archive An archive whose first bytes said zip.
+ * @return ::GARC_OK or ::GARC_ERR_OOM.
+ */
+GARC_Result garc_zip_stream_open(GARC_Archive * archive);
+
+/**
+ * ::garc_zip_next() for a streamed zip.
+ *
+ * @param archive The archive.
+ * @return ::GARC_OK, ::GARC_END once the directory agreed with the walk,
+ *   ::GARC_ERR_CORRUPT when it did not, ::GARC_ERR_UNSUPPORTED past a member
+ *   whose end cannot be found, or another failure.
+ */
+GARC_Result garc_zip_stream_next(GARC_Archive * archive);
+
+/**
+ * ::garc_zip_read() for a streamed zip.
+ *
+ * @param archive The archive.
+ * @param buffer Destination.
+ * @param capacity Its size.
+ * @param out_read Receives the count; 0 at the end of the member.
+ * @return ::GARC_OK, ::GARC_ERR_CORRUPT for a CRC or a descriptor that
+ *   disagrees, a cap, or a stream failure.
+ */
+GARC_Result garc_zip_stream_read(
+    GARC_Archive * archive, void * buffer, size_t capacity, size_t * out_read);
+
+/**
+ * ::garc_zip_skip() for a streamed zip: the member is read to its end.
+ *
+ * @param archive The archive.
+ * @return As ::garc_zip_stream_next() finishing a member.
+ */
+GARC_Result garc_zip_stream_skip(GARC_Archive * archive);
+
+/**
+ * Release what streaming holds.
+ *
+ * @param archive The archive.
+ */
+void garc_zip_stream_release(GARC_Archive * archive);
+
+/**
  * A central directory entry as it was written, for copying a member unchanged.
  *
  * Everything a raw copy writes back that is not derived from where the copy

@@ -26,6 +26,7 @@
 #include <ghoti.io/archive/archive.h>
 
 #include "tar_manifest.h"
+#include "test_helpers.h"
 
 using garctest::read_fixture;
 
@@ -492,6 +493,91 @@ TEST(CopyMember, ARawCopyThatLandsPastFourGibibytesGetsAZip64Offset) {
     at += 4;
   }
   EXPECT_EQ(entries, copied);
+}
+
+/** Copy every member of a zip read off a pipe into a tar, into @p out. */
+GARC_Result copy_piped_zip_to_tar(const std::vector<uint8_t> & zip,
+    std::vector<uint8_t> * out, uint64_t * failed_at_offset) {
+  garctest::BufferSource source(zip.data(), zip.size(), false, false);
+  GARC_Stream * stream = nullptr;
+  EXPECT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+  GARC_Archive * archive = nullptr;
+  EXPECT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+  GARC_Sink * sink = nullptr;
+  EXPECT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  GARC_Writer * writer = nullptr;
+  EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_TAR, nullptr, &writer), GARC_OK);
+  const GARC_Member * member = nullptr;
+  GARC_Result result = GARC_OK;
+  GARC_Result walked;
+  while ((walked = garc_next(archive, &member)) == GARC_OK) {
+    const uint64_t before = garc_sink_tell(sink);
+    result = garc_writer_copy_member(writer, archive, nullptr, 0);
+    if (result != GARC_OK) {
+      *failed_at_offset = before;
+      EXPECT_EQ(garc_sink_tell(sink), before) << "a refused copy wrote";
+      break;
+    }
+  }
+  if (result == GARC_OK) {
+    EXPECT_EQ(walked, GARC_END);
+    result = garc_writer_finish(writer);
+  }
+  const void * data = nullptr;
+  size_t length = 0;
+  garc_sink_data(sink, &data, &length);
+  out->assign(static_cast<const uint8_t *>(data),
+      static_cast<const uint8_t *>(data) + length);
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  garc_close(archive);
+  garc_stream_destroy(stream);
+  return result;
+}
+
+TEST(CopyMember, AMemberOfUnknownSizeIsSpooledAndCopiedWhole) {
+  // Off a pipe, a descriptor member's size is not known until its data has been
+  // read, and a tar header needs it first. The copy reads the member to its end
+  // into a temporary file, and writes it with the size it turned out to have.
+  const std::vector<uint8_t> zip
+      = read_fixture(std::string(GARC_TEST_DATA) + "/zip/bsdtar-descriptors.zip");
+  ASSERT_FALSE(zip.empty());
+  std::vector<uint8_t> tar;
+  uint64_t failed_at = 0;
+  ASSERT_EQ(copy_piped_zip_to_tar(zip, &tar, &failed_at), GARC_OK);
+
+  GARC_Result opened = GARC_ERR_INTERNAL;
+  const std::vector<Read> want = read_all(zip, &opened);
+  ASSERT_EQ(opened, GARC_OK);
+  const std::vector<Read> got = read_all(tar, &opened);
+  ASSERT_EQ(opened, GARC_OK);
+  ASSERT_EQ(got.size(), want.size());
+  size_t with_data = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    SCOPED_TRACE(want[i].name);
+    EXPECT_EQ(got[i].name, want[i].name);
+    EXPECT_EQ(got[i].data, want[i].data);
+    EXPECT_EQ(got[i].result, GARC_OK);
+    with_data += want[i].data.empty() ? 0u : 1u;
+  }
+  EXPECT_GE(with_data, 2u) << "the fixture no longer has descriptor members with data";
+}
+
+TEST(CopyMember, AnUnknownSizeMemberThatFailsItsCheckWritesNothing) {
+  // Spooling first means the verdict on the data - CRC-32, or the decoder's -
+  // arrives before the header is written, so a bad member is refused cleanly
+  // where a known-size one would already be half written.
+  std::vector<uint8_t> zip
+      = read_fixture(std::string(GARC_TEST_DATA) + "/zip/bsdtar-descriptors.zip");
+  ASSERT_FALSE(zip.empty());
+  // The first member's descriptor CRC-32, one bit off.
+  const std::string haystack(zip.begin(), zip.end());
+  const size_t descriptor = haystack.find(std::string("PK\x07\x08", 4));
+  ASSERT_NE(descriptor, std::string::npos);
+  zip[descriptor + 4] ^= 0x01u;
+  std::vector<uint8_t> tar;
+  uint64_t failed_at = 0;
+  EXPECT_EQ(copy_piped_zip_to_tar(zip, &tar, &failed_at), GARC_ERR_CORRUPT);
 }
 
 int main(int argc, char ** argv) {

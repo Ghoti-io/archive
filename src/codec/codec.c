@@ -107,10 +107,27 @@ typedef struct {
   int inner_done;                   ///< The inner stream returned zero bytes.
   int finishing;                    ///< Draining gcomp_decoder_finish().
   int complete;                     ///< finish() said the stream is complete.
+  /**
+   * Stop where the codec stream ends instead of refusing what follows it.
+   *
+   * For a member whose length nothing declared - a zip member with a data
+   * descriptor, read from a pipe - the end of the codec stream is the only end
+   * there is, and the bytes read past it are the descriptor and the next header.
+   * They stay in @ref staged for garc_codec_stream_leftover().
+   */
+  int stop_at_end;
+  /**
+   * The failure a read returned, returned again by every read after it.
+   *
+   * A decoder that has failed is not asked again: what it answers then is its
+   * own business (compress's zstd decoder answered an internal error), and the
+   * caller deserves the status that described the bytes.
+   */
+  GARC_Result failed;
 } Codec_Stream;
 
 /**
- * Read decompressed bytes.
+ * One read, before codec_stream_read() makes a failure stick.
  *
  * @param ctx The ::Codec_Stream.
  * @param buffer Destination.
@@ -118,7 +135,7 @@ typedef struct {
  * @param out_read Receives the number of bytes produced; 0 at end of stream.
  * @return ::GARC_OK or a failure.
  */
-static GARC_Result codec_stream_read(
+static GARC_Result codec_stream_read_once(
     void * ctx, void * buffer, size_t size, size_t * out_read) {
   Codec_Stream * state = (Codec_Stream *)ctx;
   *out_read = 0;
@@ -187,6 +204,12 @@ static GARC_Result codec_stream_read(
     // will never take. Either way the next move is finish(), whose job includes
     // validating the trailer.
     if (!in.used) {
+      if (state->staged_offset < state->staged_length && state->stop_at_end) {
+        // What follows the codec stream is not the codec's: finish here and
+        // leave it staged for the caller to take back.
+        state->finishing = 1;
+        continue;
+      }
       if (state->staged_offset < state->staged_length) {
         // Input the decoder will not consume, after a stream it considers done:
         // a second concatenated member, which three of the four codecs here do
@@ -204,6 +227,30 @@ static GARC_Result codec_stream_read(
 }
 
 /**
+ * Read decompressed bytes.
+ *
+ * @param ctx The ::Codec_Stream.
+ * @param buffer Destination.
+ * @param size Its capacity.
+ * @param out_read Receives the number of bytes produced; 0 at end of stream.
+ * @return ::GARC_OK or a failure, which every later read returns too.
+ */
+static GARC_Result codec_stream_read(
+    void * ctx, void * buffer, size_t size, size_t * out_read) {
+  Codec_Stream * state = (Codec_Stream *)ctx;
+  if (state->failed != GARC_OK) {
+    *out_read = 0;
+    return state->failed;
+  }
+  const GARC_Result result = codec_stream_read_once(ctx, buffer, size, out_read);
+  if (result != GARC_OK) {
+    *out_read = 0;
+    state->failed = result;
+  }
+  return result;
+}
+
+/**
  * Tear down a decompressing stream's state.
  *
  * @param stream The stream.
@@ -216,6 +263,20 @@ static void codec_stream_destroy(GARC_Stream * stream) {
   // The inner stream is borrowed and is not touched.
   gcu_allocator_free(state->allocator, state->staged);
   gcu_allocator_free(state->allocator, state);
+}
+
+void garc_codec_stream_stop_at_end(GARC_Stream * stream) {
+  ((Codec_Stream *)stream->cb.ctx)->stop_at_end = 1;
+}
+
+void garc_codec_stream_leftover(const GARC_Stream * stream,
+    const uint8_t ** out_kept, size_t * out_kept_length,
+    const uint8_t ** out_staged, size_t * out_staged_length) {
+  const Codec_Stream * state = (const Codec_Stream *)stream->cb.ctx;
+  // Cannot fail: every argument is non-NULL here.
+  (void)gcomp_decoder_unconsumed(state->decoder, out_kept, out_kept_length);
+  *out_staged = state->staged + state->staged_offset;
+  *out_staged_length = state->staged_length - state->staged_offset;
 }
 
 GARC_Result garc_stream_create_decompress(GARC_Stream * inner,

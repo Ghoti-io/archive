@@ -136,6 +136,14 @@ typedef struct {
   /** Whether this member's records carry zip64 fields. */
   int used_zip64;
   /**
+   * Whether its local header was written complete: CRC-32 and both sizes.
+   *
+   * Only for a member whose contents are known when it is added - a directory,
+   * an empty file, a stored symlink - going to a sink that cannot patch, where
+   * the alternative is a descriptor no streaming reader can use.
+   */
+  int header_complete;
+  /**
    * Whether this member is WinZip AES.
    *
    * A directory is never encrypted. A file, an empty file and a symlink are,

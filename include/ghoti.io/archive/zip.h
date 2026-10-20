@@ -41,13 +41,32 @@
  *
  * Three consequences a caller meets:
  *
- * **A zip needs a seekable stream, and a zip on a pipe is refused by name.**
- * ::GARC_ERR_NOT_SEEKABLE, from ::garc_open(), for a stream whose first bytes
- * are a zip signature and which cannot seek. tar can be read from a pipe
- * because a tar is a sequence of headers from the front; a zip cannot, because
- * the answer to "what members are in this" is at the other end of the file.
- * There is no streaming mode here, and adding one would mean reading the local
- * headers, which is the thing that cannot be trusted.
+ * **A zip on a stream that cannot seek is read from the front, and checked
+ * against its directory at the end.** The answer to "what members are in this"
+ * is at the other end of the file, which a pipe cannot reach first, so on such
+ * a stream the walk goes by local headers instead - and because the local
+ * header is the thing that cannot be trusted, every member's record is kept
+ * (name, offset, method, CRC-32, both sizes) and compared with the central
+ * directory when it arrives. Any disagreement, a member the directory does not
+ * list, or one it lists that the walk never met, is ::GARC_ERR_CORRUPT from the
+ * ::garc_next() that reaches the directory: a streamed walk can only be told
+ * the archive was lying after it has handed the lie over, so a caller that acts
+ * on members as they arrive must treat everything as provisional until
+ * ::garc_next() has returned ::GARC_END.
+ *
+ * A member whose local header says its sizes follow the data (a data
+ * descriptor) has ::GARC_Member::size_unknown set and a size of 0 until its
+ * data has been read; the decoder's own end of stream says where the data
+ * stops, so what can be read that way is deflate, deflate64, zstd, and LZMA
+ * with its end marker. A stored member with a descriptor has no end of its own
+ * and is ::GARC_ERR_UNSUPPORTED on the walk, as is an encrypted member with
+ * one. So, for now, are bzip2 and xz with one: both formats mark their own end,
+ * but compress's decoders read on into a following stream (and xz's into zero
+ * padding) instead of stopping at the first, and neither yet reports the bytes
+ * it took past that end, so the descriptor's position cannot be found. An encrypted member with sizes in
+ * its header is listed and skipped; its data is refused. A symlink is reported
+ * as a file, because the bit that says otherwise is in the directory. On a
+ * seekable stream none of this applies: the directory is read first, as above.
  *
  * **A zip must end where the stream ends.** The scan for the end record starts
  * at the end and goes back at most 65,557 bytes, which is the largest a record
@@ -407,6 +426,11 @@ GARC_API uint64_t garc_zip_base_offset(const GARC_Archive * archive);
  *
  * The declared count, which is what the walk is bounded by. A central directory
  * that runs out early is ::GARC_ERR_CORRUPT rather than a shorter archive.
+ *
+ * On a stream that cannot seek the end record is reached last, so this is 0
+ * until ::garc_next() has returned ::GARC_END, and is then what it declared.
+ * ::garc_zip_has_zip64_end_record() and ::garc_zip_archive_comment() are
+ * likewise known only then.
  *
  * @param archive The archive. NULL or not a zip returns 0.
  * @return The declared number of central directory entries.

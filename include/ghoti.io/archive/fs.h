@@ -386,8 +386,9 @@ GARC_API GARC_Result garc_fs_sink_create_with_allocator(const char * path,
  * codec is detected as the file comment says, and the containers are tried
  * again on the decompressed bytes. Only one layer is removed, so a `.tar.gz.gz`
  * is not opened. A compressed archive cannot seek, so ::garc_find() on it is
- * ::GARC_ERR_NOT_SEEKABLE, and a zip or 7z inside a codec cannot be read at
- * all.
+ * ::GARC_ERR_NOT_SEEKABLE. A zip inside a codec is read from the front, as
+ * zip.h describes for any stream that cannot seek; a 7z inside one cannot be
+ * read at all.
  *
  * The archive owns the file and any decompressing stream, and ::garc_close()
  * closes both.
@@ -430,6 +431,10 @@ GARC_API GARC_Result garc_fs_open_with_allocator(const char * path,
  * archive's current member, so a caller who has already stepped has already
  * chosen where extraction begins; the usual call is on an archive just
  * opened.
+ *
+ * Every member's data is read to the reader's end, which is where a zip
+ * member's CRC-32 or AES tag is checked, so a damaged member is a failure
+ * and not a file.
  *
  * @param archive The archive to read. Not NULL.
  * @param root The directory to write into. Not NULL.

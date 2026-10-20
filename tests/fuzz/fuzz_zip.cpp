@@ -11,12 +11,10 @@
  * arms, the skip path and every line of the decryption stack unexplored while
  * reporting coverage of the parser.
  *
- * **There is no stream-shape axis, and that is the difference from fuzz_tar.**
- * A zip requires a seekable, sized stream: one on a pipe is
- * ::GARC_ERR_NOT_SEEKABLE before a byte is parsed, so a harness that spent half
- * its inputs on non-seekable streams would spend half its budget on one branch.
- * The memory stream is the shape that reaches the parser, and it is the only one
- * used.
+ **Every input is walked twice by shape: from memory, and from a pipe.** A zip
+ * on a stream that cannot seek is read by its local headers and checked against
+ * its directory at the end (zip.h), which is a second parser over the same
+ * bytes - so it gets the same invariants, and one of its own below.
  *
  * The invariants, each of which a wrong answer can satisfy by accident on one
  * input and not across a corpus:
@@ -32,6 +30,12 @@
  *   directory, and the base offset never exceeds the input's length.
  * - A refusal is final in the sense that matters: after a failure there is no
  *   current member, so read_member must refuse too.
+ * - **A streamed walk that ends cleanly agrees with the seekable one.** The
+ *   piped walk believes the local headers, and its whole defence is the check
+ *   against the directory at the end. If that check passes, every member it
+ *   handed over must be the member the directory-first walk reports - same name,
+ *   sizes, method, CRC, encryption and data offset - or an archive can show a
+ *   streaming reader one thing and every other reader another.
  * - **A password changes no metadata.** The archive is walked twice, once with a
  *   password and once without, and every member's name, size, method, CRC and
  *   encryption must match. zip leaves its metadata in the clear at every password
@@ -109,11 +113,15 @@ struct Seen {
   uint32_t crc = 0;
   int encryption = 0;
   uint64_t data_offset = 0;
+  /** Off a pipe, sizes and CRC that follow the data and were never reached. */
+  bool sizes_unread = false;
 
   bool operator!=(const Seen & other) const {
-    return name != other.name || size != other.size
-        || compressed_size != other.compressed_size || method != other.method
-        || crc != other.crc || encryption != other.encryption
+    const bool sizes = sizes_unread || other.sizes_unread
+        || (size == other.size && compressed_size == other.compressed_size
+            && crc == other.crc);
+    return name != other.name || !sizes || method != other.method
+        || encryption != other.encryption
         || data_offset != other.data_offset;
   }
 };
@@ -130,12 +138,44 @@ struct Seen {
  * @param out_seen Receives one entry per member handed out.
  * @return Whether the archive opened at all.
  */
-bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
+/** A pipe over a buffer: reads, and nothing else. */
+struct Pipe {
+  const uint8_t * bytes;
+  size_t size;
+  size_t at = 0;
+};
+
+GARC_Result pipe_read(void * ctx, void * buffer, size_t size, size_t * out_read) {
+  Pipe * pipe = static_cast<Pipe *>(ctx);
+  const size_t left = pipe->size - pipe->at;
+  const size_t n = size < left ? size : left;
+  if (n) {
+    std::memcpy(buffer, pipe->bytes + pipe->at, n);
+  }
+  pipe->at += n;
+  *out_read = n;
+  return GARC_OK;
+}
+
+/** How a walk ended, for the streamed-against-seekable comparison. */
+struct Ended {
+  bool opened = false;
+  GARC_Result last = GARC_ERR_INTERNAL; ///< What ended the walk.
+};
+
+Ended walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     const GARC_Allocator * allocator, const char * password, bool read_data,
-    std::vector<Seen> * out_seen) {
+    bool piped, std::vector<Seen> * out_seen) {
+  Ended ended;
   GARC_Stream * stream = nullptr;
-  if (garc_stream_create_memory(body, body_size, &stream) != GARC_OK) {
-    return false;
+  Pipe pipe{body, body_size};
+  GARC_Stream_Callbacks callbacks{};
+  callbacks.read = pipe_read;
+  callbacks.ctx = &pipe;
+  if ((piped ? garc_stream_create_callback(&callbacks, &stream)
+             : garc_stream_create_memory(body, body_size, &stream))
+      != GARC_OK) {
+    return ended;
   }
 
   GARC_Archive * archive = nullptr;
@@ -145,7 +185,7 @@ bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     REQUIRE(documented(opened), "open returned a status it does not document");
     REQUIRE(archive == nullptr, "a failed open handed back an archive");
     garc_stream_destroy(stream);
-    return false;
+    return ended;
   }
   REQUIRE(archive != nullptr, "open succeeded without producing an archive");
 
@@ -154,7 +194,7 @@ bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     // harness's business, and the tar harness's population is its own.
     garc_close(archive);
     garc_stream_destroy(stream);
-    return false;
+    return ended;
   }
 
   if (password) {
@@ -165,7 +205,7 @@ bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     if (set == GARC_ERR_OOM) {
       garc_close(archive);
       garc_stream_destroy(stream);
-      return false;
+      return ended;
     }
     REQUIRE(set == GARC_OK, "a zip archive refused a password");
   }
@@ -179,10 +219,10 @@ bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
   int budget = 4096; // So that a long directory cannot become a timeout.
   while (budget-- > 0 && (result = garc_next(archive, &member)) == GARC_OK) {
     REQUIRE(member != nullptr, "GARC_OK without a member");
-    REQUIRE(member->name != nullptr || member->name_length == 0,
-        "a member with a length and no name pointer");
+    REQUIRE(member->name != nullptr, "a member with no name pointer");
 
-    REQUIRE(garc_member_count(archive) <= declared,
+    // A pipe has not reached the end record yet, so there is nothing declared.
+    REQUIRE(piped || garc_member_count(archive) <= declared,
         "more members handed out than the end record declared");
     REQUIRE(garc_member_count(archive) <= limits.max_members,
         "the member count passed max_members");
@@ -208,12 +248,16 @@ bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     seen.crc = garc_zip_member_crc32(archive);
     seen.encryption = (int)garc_zip_member_encryption(archive);
     seen.data_offset = member->data_offset;
+    // Off a pipe, a member with a data descriptor has its CRC and compressed
+    // size only once its data is read - a directory too, whose size is known.
+    seen.sizes_unread = piped && (garc_zip_member_flags(archive) & 0x0008u);
     out_seen->push_back(seen);
 
     if (!read_data) {
       continue;
     }
     uint64_t produced = 0;
+    bool clean = false;
     uint8_t buffer[97]; // Not a round number, so the last read is a short one.
     for (;;) {
       size_t got = 0;
@@ -225,12 +269,25 @@ bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
         break;
       }
       if (!got) {
+        clean = true;
         break;
       }
       produced += got;
       // The one that catches a reader handing over the bytes behind the member.
-      REQUIRE(produced <= member->size,
+      // A member off a pipe whose sizes follow its data declares nothing yet,
+      // so the cap is what bounds it.
+      REQUIRE(produced <= (member->size_unknown ? limits.max_member_bytes
+                                                : member->size),
           "read_member produced more than the member declared");
+    }
+    REQUIRE(!member->size_unknown || !clean || produced == member->size,
+        "a member's size, once known, is not the size of its data");
+    if (out_seen->back().sizes_unread && clean) {
+      // Known now, and from here on comparable with the seekable walk's.
+      out_seen->back().size = member->size;
+      out_seen->back().compressed_size = garc_zip_member_compressed_size(archive);
+      out_seen->back().crc = garc_zip_member_crc32(archive);
+      out_seen->back().sizes_unread = false;
     }
   }
 
@@ -249,7 +306,9 @@ bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
 
   garc_close(archive);
   garc_stream_destroy(stream);
-  return true;
+  ended.opened = true;
+  ended.last = budget >= 0 ? result : GARC_ERR_INTERNAL;
+  return ended;
 }
 
 } // namespace
@@ -295,10 +354,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         starve ? fail_at : static_cast<size_t>(-1));
     std::vector<Seen> seen;
     const bool opened = walk(body, body_size, limits, allocator.get(), password,
-        read_data, &seen);
+        read_data, false, &seen).opened;
     allocator.stop_failing();
     if (opened) {
       REQUIRE(allocator.live() == 0u, "the walk leaked");
+    }
+  }
+  {
+    // The same input off a pipe, under the same allocator rule.
+    garctest::FailingAllocator allocator(
+        starve ? fail_at : static_cast<size_t>(-1));
+    std::vector<Seen> seen;
+    const bool opened = walk(body, body_size, limits, allocator.get(), password,
+        read_data, true, &seen).opened;
+    allocator.stop_failing();
+    if (opened) {
+      REQUIRE(allocator.live() == 0u, "the piped walk leaked");
     }
   }
 
@@ -314,16 +385,33 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   // bug.
   std::vector<Seen> with;
   std::vector<Seen> without;
-  const bool a = walk(body, body_size, limits, nullptr, "ghoti-password",
-      read_data, &with);
-  const bool b = walk(body, body_size, limits, nullptr, nullptr, read_data,
-      &without);
+  const Ended a_end = walk(body, body_size, limits, nullptr, "ghoti-password",
+      read_data, false, &with);
+  const Ended b_end = walk(body, body_size, limits, nullptr, nullptr, read_data,
+      false, &without);
+  const bool a = a_end.opened;
+  const bool b = b_end.opened;
   REQUIRE(a == b, "the same archive opened with a password and not without one");
   REQUIRE(with.size() == without.size(),
       "a password changed how many members the walk reported");
   for (size_t i = 0; i < with.size(); ++i) {
     REQUIRE(!(with[i] != without[i]),
         "a password changed a member's metadata, which is in the clear");
+  }
+
+  // **A streamed walk that the directory approved is the seekable walk.**
+  std::vector<Seen> piped;
+  const Ended p_end = walk(body, body_size, limits, nullptr, nullptr, read_data,
+      true, &piped);
+  if (p_end.opened && p_end.last == GARC_END) {
+    REQUIRE(b && b_end.last == GARC_END,
+        "a pipe read to the end an archive the seekable reader refuses");
+    REQUIRE(piped.size() == without.size(),
+        "a pipe and a seek found different numbers of members");
+    for (size_t i = 0; i < piped.size(); ++i) {
+      REQUIRE(!(piped[i] != without[i]),
+          "a pipe handed over a member the directory describes differently");
+    }
   }
   return 0;
 }

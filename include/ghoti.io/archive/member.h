@@ -153,7 +153,10 @@ typedef enum {
  * something to rely on.
  */
 typedef struct GARC_Member {
-  /** Member name, as bytes. Not necessarily NUL-terminated; see above. */
+  /**
+   * Member name, as bytes. Not necessarily NUL-terminated; see above. Never
+   * NULL from a reader, even when the name is empty.
+   */
   const char * name;
   /** Length of @ref name in bytes. */
   size_t name_length;
@@ -251,6 +254,18 @@ typedef struct GARC_Member {
    * member's compressed length is a question for zip.h.
    */
   uint64_t stored_size;
+
+  /**
+   * Non-zero when the container does not say how large the member is.
+   *
+   * Only a zip member with a data descriptor, read from a stream that cannot
+   * seek: its local header carries no sizes, and the central directory that
+   * does has not been reached. @ref size is 0, and ::garc_read_member() is read
+   * until it returns no bytes, as for any member. Once it has, @ref size and
+   * @ref stored_size are filled in. `max_member_bytes` is applied to the bytes
+   * as they come out.
+   */
+  int size_unknown;
 } GARC_Member;
 
 /**

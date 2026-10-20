@@ -612,22 +612,34 @@ static GARC_Result fs_write_file(GARC_Archive * archive,
   if (result != GARC_OK) {
     return result;
   }
-  while (left) {
-    size_t want = left > sizeof(buffer) ? sizeof(buffer) : (size_t)left;
+  // **Read until the reader says the member is over, not until `size` bytes
+  // have arrived.** The read that returns no bytes is where a zip member's
+  // CRC-32 and a WinZip AES member's authentication code are checked, and
+  // stopping one call short of it extracted a corrupted member without a word.
+  // It is also how a member whose size the container does not state ends.
+  for (;;) {
     size_t got = 0;
-    result = garc_read_member(archive, buffer, want, &got);
+    result = garc_read_member(archive, buffer, sizeof(buffer), &got);
     if (result != GARC_OK) {
       break;
     }
     if (got == 0) {
-      result = GARC_ERR_CORRUPT;
+      if (!member->size_unknown && left) {
+        result = GARC_ERR_CORRUPT;
+      }
+      break;
+    }
+    if (!member->size_unknown && (uint64_t)got > left) {
+      result = GARC_ERR_INTERNAL; // a reader handed out more than it declared
       break;
     }
     result = garc_fs_from_file(gcu_file_write_bytes(&handle, buffer, got));
     if (result != GARC_OK) {
       break;
     }
-    left -= got;
+    if (!member->size_unknown) {
+      left -= got;
+    }
   }
   if (result == GARC_OK) {
     result = garc_fs_from_file(gcu_file_close(&handle));

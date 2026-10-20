@@ -154,6 +154,37 @@ GARC_Stream * garc_member_codec_stream(GARC_Member_Codec * codec);
  */
 void garc_member_codec_destroy(GARC_Member_Codec * codec);
 
+/**
+ * Make a decompressing stream stop at the end of its codec stream.
+ *
+ * Without this, bytes after a complete codec stream are ::GARC_ERR_CORRUPT,
+ * which is right for a `tar.gz` and wrong for a zip member whose end only the
+ * codec can find: there what follows is the data descriptor and the next local
+ * header, read ahead into the staging buffer.
+ *
+ * @param stream A stream from ::garc_stream_create_decompress().
+ */
+void garc_codec_stream_stop_at_end(GARC_Stream * stream);
+
+/**
+ * The bytes a stopped-at-end stream read past the codec stream's end.
+ *
+ * They come in two pieces, in this order: what the decoder itself kept from an
+ * earlier call (deflate's bit buffer holds up to eight bytes ahead; see
+ * `gcomp_decoder_unconsumed()`), then what is still staged here. A caller
+ * putting them back in front of the stream puts back the staged piece first.
+ * Valid once the stream has returned its end, until it is destroyed.
+ *
+ * @param stream A stream given ::garc_codec_stream_stop_at_end().
+ * @param out_kept Receives the decoder's kept bytes, or NULL.
+ * @param out_kept_length Receives how many.
+ * @param out_staged Receives the staged bytes.
+ * @param out_staged_length Receives how many.
+ */
+void garc_codec_stream_leftover(const GARC_Stream * stream,
+    const uint8_t ** out_kept, size_t * out_kept_length,
+    const uint8_t ** out_staged, size_t * out_staged_length);
+
 #ifdef __cplusplus
 }
 #endif

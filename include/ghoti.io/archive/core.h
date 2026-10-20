@@ -76,9 +76,12 @@ typedef enum {
   /**
    * The source cannot seek, and what was asked for needs to.
    *
-   * ::garc_find() and nothing else, today. Not ::GARC_ERR_UNSUPPORTED, which
-   * says *this library* does not implement something: finding a member is
-   * implemented, and this stream cannot be rewound to do it. The difference is
+   * From ::garc_find() on a stream that cannot be rewound, from ::garc_open()
+   * on a 7z that cannot seek (its header is at the end), and from
+   * ::garc_writer_create() when a 7z, or a zip asked for
+   * ::GARC_ZIP_SIZES_LOCAL, is given a sink that cannot patch. Not
+   * ::GARC_ERR_UNSUPPORTED, which says *this library* does not implement
+   * something: each of these is implemented, and this stream cannot do it. The difference is
    * the caller's next move - a feature this library lacks is a wait, and a
    * stream that cannot seek is a different stream or a different approach.
    *

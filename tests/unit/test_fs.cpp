@@ -27,6 +27,7 @@
 #include "sevenz_builder.h"
 #include "tar_builder.h"
 #include "tar_manifest.h"
+#include "test_helpers.h"
 
 using garctest::TarArchive;
 using garctest::file_header;
@@ -250,6 +251,107 @@ TEST_F(ExtractRoot, MalPathsZipWritesNothing) {
   EXPECT_TRUE(list_dir(root).empty());
   EXPECT_FALSE(tree_has_symlink(root));
   expect_parent_unchanged();
+}
+
+/** A zip of one stored member, so its data is in the archive verbatim. */
+std::vector<uint8_t> stored_zip(const std::string & name, const std::string & data) {
+  std::vector<uint8_t> bytes;
+  GARC_Sink * sink = nullptr;
+  if (garc_sink_create_memory(&sink) != GARC_OK) {
+    return bytes;
+  }
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_method = GARC_ZIP_METHOD_STORED;
+  GARC_Writer * writer = nullptr;
+  if (garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer) == GARC_OK) {
+    GARC_Member member;
+    std::memset(&member, 0, sizeof(member));
+    member.name = name.data();
+    member.name_length = name.size();
+    member.type = GARC_MEMBER_FILE;
+    member.size = data.size();
+    member.mode = 0644;
+    member.mode_valid = 1;
+    const void * raw = nullptr;
+    size_t size = 0;
+    if (garc_writer_add(writer, &member) == GARC_OK
+        && garc_writer_write(writer, data.data(), data.size()) == GARC_OK
+        && garc_writer_finish(writer) == GARC_OK
+        && garc_sink_data(sink, &raw, &size) == GARC_OK && raw) {
+      bytes.assign(static_cast<const uint8_t *>(raw),
+          static_cast<const uint8_t *>(raw) + size);
+    }
+    garc_writer_destroy(writer);
+  }
+  garc_sink_destroy(sink);
+  return bytes;
+}
+
+TEST_F(ExtractRoot, AZipMemberWhoseCrcDoesNotMatchIsNotExtractedAsGood) {
+  // Extraction used to read exactly the member's size and stop, so it never made
+  // the call that returns no bytes - which is where a zip member's CRC-32 is
+  // compared. A member with one byte changed was written out and reported as
+  // GARC_OK.
+  const std::string data = "the bytes a CRC-32 covers\n";
+  std::vector<uint8_t> good = stored_zip("checked.txt", data);
+  ASSERT_FALSE(good.empty());
+  {
+    // The control: the same archive unchanged extracts.
+    Opened opened(good);
+    opened.open();
+    EXPECT_EQ(GARC_OK, garc_fs_extract(opened.archive, root.c_str(), 0));
+    EXPECT_EQ(read_file(join_path(root, "checked.txt")), data);
+    gcu_file_remove(join_path(root, "checked.txt").c_str());
+  }
+  const std::string haystack(good.begin(), good.end());
+  const size_t at = haystack.find(data);
+  ASSERT_NE(at, std::string::npos);
+  ASSERT_EQ(haystack.find(data, at + 1), std::string::npos);
+  good[at] ^= 0x01u;
+  Opened opened(good);
+  opened.open();
+  EXPECT_EQ(GARC_ERR_CORRUPT, garc_fs_extract(opened.archive, root.c_str(), 0));
+}
+
+TEST_F(ExtractRoot, AZipReadOffAPipeExtractsTheSameFiles) {
+  // bsdtar writes a descriptor after every member, so off a pipe each file's
+  // size is unknown until its data has been read; extraction reads until the
+  // reader says the member is over, not until a size it was never told.
+  const std::vector<uint8_t> bytes
+      = read_fixture(zip_fixture("bsdtar-descriptors.zip"));
+  ASSERT_FALSE(bytes.empty());
+  garctest::BufferSource source(bytes.data(), bytes.size(), false, false);
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_callback(source.callbacks(), &stream));
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(GARC_OK, garc_open(stream, nullptr, &archive));
+  EXPECT_EQ(GARC_OK, garc_fs_extract(archive, root.c_str(), 0));
+  garc_close(archive);
+  garc_stream_destroy(stream);
+
+  // The reference is the same archive extracted from memory.
+  char * made = nullptr;
+  ASSERT_EQ(GCU_FILE_OK, gcu_dir_temp_create(nullptr, "garc-fs-ref", nullptr, &made));
+  const std::string reference = made;
+  gcu_dir_free_path(nullptr, made);
+  Opened opened(bytes);
+  opened.open();
+  EXPECT_EQ(GARC_OK, garc_fs_extract(opened.archive, reference.c_str(), 0));
+  const std::set<std::string> names = list_dir(reference);
+  EXPECT_FALSE(names.empty());
+  EXPECT_EQ(list_dir(root), names);
+  size_t files = 0;
+  for (const std::string & name : names) {
+    struct stat info;
+    if (stat(join_path(reference, name).c_str(), &info) == 0 && S_ISREG(info.st_mode)) {
+      EXPECT_EQ(read_file(join_path(root, name)), read_file(join_path(reference, name)))
+          << name;
+      ++files;
+    }
+  }
+  EXPECT_GE(files, 1u);
+  remove_tree(reference);
 }
 
 TEST_F(ExtractRoot, MalLinksWithoutTheFlagCreatesNoSymlink) {

@@ -77,10 +77,11 @@ const char * garc_format_string(GARC_Format format) {
  *
  * 1. Is this a tar? Answered from the front, from one block, on any stream.
  * 2. Do the first bytes say zip? A local file header, or an end record for an
- *    archive with no members. This is where a zip on a *pipe* is caught: the
- *    answer is yes and the format cannot be read that way, so it is
- *    ::GARC_ERR_NOT_SEEKABLE rather than ::GARC_ERR_FORMAT - "this is a zip and
- *    I need to seek" rather than "I do not know what this is".
+ *    archive with no members. On a stream that cannot seek this is also where
+ *    the zip is marked for reading from the front, by its local headers (see
+ *    zip_read.c's "Streaming" section). A 7z is caught at the same step, and on
+ *    a pipe it is ::GARC_ERR_NOT_SEEKABLE rather than ::GARC_ERR_FORMAT - "this
+ *    is a 7z and I need to seek" rather than "I do not know what this is".
  * 3. Failing both, and only on a seekable stream: is there an end record within
  *    the last 65,557 bytes? That is the only way to find a zip behind a
  *    self-extracting stub, whose first bytes are an executable's.
@@ -148,13 +149,9 @@ static GARC_Result reader_identify(GARC_Archive * archive) {
   }
 
   if (garc_zip_identify(archive->peek, total)) {
-    if (!garc_stream_is_seekable(archive->stream)) {
-      // A zip, and unreadable this way. Saying so by name matters: a caller
-      // handed GARC_ERR_FORMAT for a file every other tool opens would go
-      // looking for the wrong thing, and the fix - give me a seekable stream -
-      // is only discoverable from this status.
-      return GARC_ERR_NOT_SEEKABLE;
-    }
+    // A stream that cannot seek is read by its local headers, with the central
+    // directory checked at the end: see zip_read.c's "Streaming" section.
+    archive->zip.streaming = !garc_stream_is_seekable(archive->stream);
     archive->format = GARC_FORMAT_ZIP;
     return GARC_OK;
   }
@@ -199,6 +196,9 @@ static GARC_Result reader_open_format(GARC_Archive * archive) {
   }
   if (archive->format != GARC_FORMAT_ZIP) {
     return GARC_OK;
+  }
+  if (archive->zip.streaming) {
+    return garc_zip_stream_open(archive);
   }
   uint64_t eocd_offset = archive->zip.eocd_offset;
   if (!archive->zip.eocd_found) {

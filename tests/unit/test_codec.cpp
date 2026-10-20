@@ -583,6 +583,46 @@ TEST(Codec, CorruptCompressedBytesAreReported) {
   EXPECT_TRUE(garc_result_is_error(unpack("gzip", packed, &got)));
 }
 
+TEST(Codec, AReadAfterAFailureReturnsTheSameFailure) {
+  // A failed decoder is not asked again. Before, a second read went back to it,
+  // and compress's zstd decoder answered that with an internal error - which a
+  // zip read off a pipe passed on from garc_next() as GARC_ERR_INTERNAL, a status
+  // no input should be able to cause. Every method, because which decoder says
+  // what after a failure is each decoder's own business.
+  size_t failed = 0;
+  for (const char * method : {"gzip", "zstd", "xz", "bzip2", "lz4", "zlib", "lzma"}) {
+    SCOPED_TRACE(method);
+    std::string packed;
+    ASSERT_EQ(GARC_OK, pack(method, big_entries(), &packed));
+    // Past any header, into the data.
+    for (size_t i = packed.size() / 3; i < packed.size() / 3 + 8; ++i) {
+      packed[i] = static_cast<char>(packed[i] ^ 0x5A);
+    }
+    GARC_Stream * inner = nullptr;
+    ASSERT_EQ(GARC_OK, garc_stream_create_memory(packed.data(), packed.size(), &inner));
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(GARC_OK, garc_stream_create_decompress(inner, method, nullptr, &stream));
+    char buffer[4096];
+    size_t got = 0;
+    GARC_Result first = GARC_OK;
+    for (int i = 0; i < 100000 && first == GARC_OK; ++i) {
+      first = garc_stream_read(stream, buffer, sizeof(buffer), &got);
+      if (first == GARC_OK && !got) {
+        break;
+      }
+    }
+    if (first != GARC_OK) {
+      ++failed;
+      for (int again = 0; again < 3; ++again) {
+        EXPECT_EQ(garc_stream_read(stream, buffer, sizeof(buffer), &got), first);
+      }
+    }
+    garc_stream_destroy(stream);
+    garc_stream_destroy(inner);
+  }
+  EXPECT_GE(failed, 5u) << "too few methods noticed the damage to test anything";
+}
+
 TEST(Codec, AMethodCompressDoesNotHaveIsUnsupported) {
   GARC_Sink * file = nullptr;
   ASSERT_EQ(GARC_OK, garc_sink_create_memory(&file));

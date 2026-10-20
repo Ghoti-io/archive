@@ -32,6 +32,7 @@
 #include <ghoti.io/archive/reader.h>
 #include <ghoti.io/archive/tar.h>
 #include <ghoti.io/archive/zip.h>
+#include <ghoti.io/compress/options.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -381,6 +382,37 @@ typedef struct {
   uint16_t internal_attributes;  ///< The entry's internal attributes.
   uint64_t comment_offset;       ///< Absolute offset of the member's comment.
   uint16_t comment_length;       ///< Its length; read only when a copy asks.
+  /** @} */
+
+  /**
+   * @name Reading from a stream that cannot seek
+   *
+   * The members are walked by their local headers, in order, and the central
+   * directory is read last and checked against what the walk saw. zip_read.c's
+   * "Streaming" section says why each piece is the way it is.
+   * @{
+   */
+  int streaming;                 ///< Whether this zip is being read this way.
+  /** Reads @ref pushback, then the archive's stream; counts @ref position. */
+  GARC_Stream * seq;
+  GARC_Buffer pushback;          ///< Bytes read ahead and given back.
+  size_t pushback_offset;        ///< How many of them have been read again.
+  uint64_t position;             ///< Bytes of the archive consumed so far.
+  GARC_Buffer records;           ///< What each member was, for the directory.
+  size_t record_count;           ///< How many records.
+  GARC_Buffer s_names;           ///< Every record's name, end to end.
+  GARC_Stream * s_slice;         ///< The current member's stored bytes.
+  GARC_Stream * s_decoder;       ///< Its decoder when it has a descriptor.
+  gcomp_options_t * s_options;   ///< That decoder's options.
+  uint64_t s_data_start;         ///< Where its data began.
+  uint64_t s_produced;           ///< Bytes of it handed out.
+  uint64_t s_local_offset;       ///< Where its local header began.
+  int s_descriptor;              ///< Whether it has a data descriptor.
+  int s_zip64;                   ///< Whether its local header had zip64.
+  int s_open;                    ///< Whether a member is current and unfinished.
+  int s_data_done;               ///< Whether its data has all been read.
+  GARC_Result s_stuck;           ///< Why the walk cannot pass this member.
+  int s_dir_descriptor;          ///< A stored directory whose descriptor follows its header.
   /** @} */
   /** @} */
 } GARC_Zip_State;

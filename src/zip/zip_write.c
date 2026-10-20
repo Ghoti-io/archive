@@ -769,7 +769,17 @@ GARC_Result garc_zip_write_member(
   const int descriptor = writer->options.zip_sizes == GARC_ZIP_SIZES_DESCRIPTOR
       || (writer->options.zip_sizes == GARC_ZIP_SIZES_AUTO
           && !garc_sink_is_seekable(writer->sink));
-  if (descriptor) {
+  // **A member whose contents are already known needs no descriptor**, and a
+  // stored one cannot be read from a pipe with one: nothing in stored data says
+  // where it ends. A directory, an empty file and a symlink's target are all
+  // known here, so on a sink that cannot patch their CRC and sizes go in the
+  // local header now. Only for AUTO - DESCRIPTOR asks for one on every member -
+  // and not for AES or zip64, whose local records carry more than this fills.
+  zip->header_complete = descriptor
+      && writer->options.zip_sizes == GARC_ZIP_SIZES_AUTO
+      && zip->method == GARC_ZIP_METHOD_STORED && !zip->aes && !zip->used_zip64
+      && (member->type == GARC_MEMBER_DIRECTORY || !size || data);
+  if (descriptor && !zip->header_complete) {
     zip->flags |= ZIP_FLAG_DATA_DESCRIPTOR;
   }
 
@@ -902,10 +912,20 @@ GARC_Result garc_zip_write_member(
   garc_zip_put16(header + 12u, zip->dos_date);
   // Zero here in every discipline: with a descriptor these stay zero, and with
   // the patching form they are filled in when the data is done. Writing the CRC
-  // now is impossible either way - it is of bytes the caller has not handed over.
-  garc_zip_put32(header + 14u, 0u);
-  garc_zip_put32(header + 18u, zip->used_zip64 ? ZIP_MARKER32 : 0u);
-  garc_zip_put32(header + 22u, zip->used_zip64 ? ZIP_MARKER32 : 0u);
+  // now is impossible either way - it is of bytes the caller has not handed over
+  // - except for the members whose bytes are already here (see above).
+  if (zip->header_complete) {
+    const uint32_t known = size ? gcomp_crc32_finalize(gcomp_crc32_update(
+        GCOMP_CRC32_INIT, (const uint8_t *)data, (size_t)size)) : 0u;
+    garc_zip_put32(header + 14u, known);
+    garc_zip_put32(header + 18u, (uint32_t)size);
+    garc_zip_put32(header + 22u, (uint32_t)size);
+  }
+  else {
+    garc_zip_put32(header + 14u, 0u);
+    garc_zip_put32(header + 18u, zip->used_zip64 ? ZIP_MARKER32 : 0u);
+    garc_zip_put32(header + 22u, zip->used_zip64 ? ZIP_MARKER32 : 0u);
+  }
   garc_zip_put16(header + 26u, (uint16_t)name_length);
   garc_zip_put16(header + 28u, (uint16_t)local_extra);
 
@@ -1257,7 +1277,8 @@ GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
   // AE-2 does not treat that 0 as a mismatch.
   const uint32_t recorded = zip->aes ? 0u : crc;
 
-  GARC_Result result = (zip->flags & ZIP_FLAG_DATA_DESCRIPTOR)
+  GARC_Result result = zip->header_complete ? GARC_OK
+      : (zip->flags & ZIP_FLAG_DATA_DESCRIPTOR)
       ? zip_write_descriptor(writer, recorded)
       : zip_patch_header(writer, recorded);
   if (result != GARC_OK) {

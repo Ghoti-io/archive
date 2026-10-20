@@ -34,6 +34,7 @@
 #include <ghoti.io/archive/allocator.h>
 #include <ghoti.io/archive/writer.h>
 #include <ghoti.io/cutil/allocator.h>
+#include <ghoti.io/cutil/file.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -510,6 +511,63 @@ static GARC_Result copy_read_target(GARC_Archive * archive,
   return GARC_OK;
 }
 
+/**
+ * Copy a member whose size its container does not state.
+ *
+ * A writer puts the size in the header, ahead of the data, so the data is read
+ * to its end into a temporary file first - the reader's own caps bound how much
+ * that can be - and then written with the size it turned out to have.
+ */
+static GARC_Result copy_spooled(GARC_Writer * writer, GARC_Archive * archive,
+    GARC_Member * member, uint8_t * chunk) {
+  GCU_File_Temp temp;
+  if (gcu_file_temp_create(&temp, NULL, "garc-copy", writer->allocator)
+      != GCU_FILE_OK) {
+    return GARC_ERR_IO;
+  }
+  GCU_File_Handle file = gcu_file_temp_handle(&temp);
+  uint64_t total = 0;
+  GARC_Result result = GARC_OK;
+  for (;;) {
+    size_t got = 0;
+    result = garc_read_member(archive, chunk, GARC_COPY_CHUNK, &got);
+    if (result != GARC_OK || !got) {
+      break;
+    }
+    if (gcu_file_write_bytes(&file, chunk, got) != GCU_FILE_OK) {
+      result = GARC_ERR_IO;
+      break;
+    }
+    total += (uint64_t)got;
+  }
+  if (result == GARC_OK
+      && gcu_file_seek(&file, 0, GCU_FILE_SEEK_SET) != GCU_FILE_OK) {
+    result = GARC_ERR_IO;
+  }
+  if (result == GARC_OK) {
+    member->size = total;
+    member->size_unknown = 0;
+    result = garc_writer_add(writer, member);
+  }
+  while (result == GARC_OK && total) {
+    const size_t want
+        = total < GARC_COPY_CHUNK ? (size_t)total : (size_t)GARC_COPY_CHUNK;
+    size_t got = 0;
+    if (gcu_file_read_bytes(&file, chunk, want, &got) != GCU_FILE_OK
+        || got != want) {
+      // The spool is ours, so a short read is the disk failing: the member's
+      // header is out and the writer cannot finish it.
+      result = GARC_ERR_IO;
+      writer->failed = result;
+      break;
+    }
+    result = garc_writer_write(writer, chunk, got);
+    total -= (uint64_t)got;
+  }
+  gcu_file_temp_abort(&temp);
+  return result;
+}
+
 GARC_Result garc_writer_copy_member(GARC_Writer * writer,
     GARC_Archive * archive, const GARC_Member * as, uint32_t flags) {
   if (!writer || !archive || (flags & ~GARC_COPY_KNOWN)) {
@@ -582,6 +640,11 @@ GARC_Result garc_writer_copy_member(GARC_Writer * writer,
   chunk = (uint8_t *)gcu_allocator_malloc(writer->allocator, GARC_COPY_CHUNK);
   if (!chunk) {
     return GARC_ERR_OOM;
+  }
+  if (source->size_unknown) {
+    result = copy_spooled(writer, archive, &member, chunk);
+    gcu_allocator_free(writer->allocator, chunk);
+    return result;
   }
   // The first bytes before the header. A member that cannot be read at all -
   // encrypted with no password, a method with no codec - is refused here, with
