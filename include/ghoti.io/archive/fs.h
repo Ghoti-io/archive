@@ -160,6 +160,153 @@ extern "C" {
 #define GARC_FS_NAME_HINT ((uint32_t)1u << 3)
 
 /**
+ * @brief Append to an uncompressed tar where it ends, instead of rewriting it.
+ *
+ * For ::garc_fs_update_begin(). See there for what it gives up.
+ */
+#define GARC_FS_IN_PLACE ((uint32_t)1u << 4)
+
+/**
+ * @brief An archive file being changed: deleted from, added to, renamed in.
+ *
+ * Made by ::garc_fs_update_begin(), which hands back two halves - a reader
+ * over the archive as it is, and a writer for what it will be - and ended by
+ * ::garc_fs_update_commit() or ::garc_fs_update_destroy().
+ */
+typedef struct GARC_Fs_Update GARC_Fs_Update;
+
+/**
+ * @brief Begin changing an archive file.
+ *
+ * **By default the archive is rewritten**, which works for every format this
+ * library both reads and writes. ::garc_fs_update_archive() walks the archive as
+ * it is; each member the caller wants kept goes to the writer with
+ * ::garc_fs_update_keep(), each it does not is passed over, and new members go
+ * to ::garc_fs_update_writer() as to any writer. So deleting is not keeping,
+ * replacing is not keeping plus adding, renaming is
+ * ::garc_writer_copy_member() with a new name, and appending is
+ * ::garc_fs_update_keep_rest() plus adding. The writer writes a temporary file
+ * beside the archive, and ::garc_fs_update_commit() renames it over the
+ * original, so until then - and if anything fails - the original is exactly as
+ * it was.
+ *
+ * A kept zip member is copied as stored, with ::GARC_COPY_RAW: nothing is
+ * recompressed, an encrypted one needs no password, and a method this library
+ * cannot write survives. A compressed tar is written back through the codec it
+ * was read through. A kept 7z member is decoded and encoded again, because 7z's
+ * members share their compressed streams; one this library cannot decode (BCJ2,
+ * encrypted) is refused by ::garc_fs_update_keep() before anything is written,
+ * and the caller decides.
+ *
+ * **With ::GARC_FS_IN_PLACE**, for an uncompressed tar only, nothing is
+ * rewritten: the writer starts where the archive's end marker was, as `tar -r`
+ * does, and ::garc_fs_update_archive() is NULL. That is quick for a large
+ * archive and it is **not atomic**. If the process dies partway, the members
+ * that were there are still read, and the one being written is cut short. A
+ * destroy without a commit writes the end marker back where it was, so an
+ * abandoned append leaves the archive reading as it did. A tar with a pax global
+ * header is refused in place, because the header would apply to the appended
+ * members too.
+ *
+ * @param path The archive. UTF-8. Not NULL.
+ * @param limits Caps for reading it, or NULL for the defaults.
+ * @param options For the writer, or NULL for the defaults. The format is the
+ *   archive's whatever is set here, and the options apply to what the writer
+ *   writes: new members, and kept members of formats that are re-encoded.
+ * @param flags Zero, or ::GARC_FS_IN_PLACE, ::GARC_FS_NO_SYNC and
+ *   ::GARC_FS_NAME_HINT. Any other bit is ::GARC_ERR_INVALID.
+ * @param out_update Receives the update.
+ * @return ::GARC_OK; ::GARC_ERR_UNSUPPORTED for ::GARC_FS_IN_PLACE on anything
+ *   but an uncompressed tar, or for a format this library does not write;
+ *   otherwise as ::garc_fs_open() and ::garc_fs_sink_create().
+ */
+GARC_API GARC_Result garc_fs_update_begin(const char * path,
+    const GARC_Limits * limits, const GARC_Writer_Options * options,
+    uint32_t flags, GARC_Fs_Update ** out_update);
+
+/**
+ * @brief Begin changing an archive file, using a given allocator.
+ *
+ * @param path The archive. UTF-8. Not NULL.
+ * @param limits Caps for reading it, or NULL.
+ * @param options For the writer, or NULL.
+ * @param flags As ::garc_fs_update_begin().
+ * @param allocator Allocator for everything the update holds. NULL uses the
+ *   default.
+ * @param out_update Receives the update.
+ * @return As ::garc_fs_update_begin().
+ */
+GARC_API GARC_Result garc_fs_update_begin_with_allocator(const char * path,
+    const GARC_Limits * limits, const GARC_Writer_Options * options,
+    uint32_t flags, const GARC_Allocator * allocator,
+    GARC_Fs_Update ** out_update);
+
+/**
+ * @brief The archive as it is, to walk with ::garc_next().
+ *
+ * @param update The update.
+ * @return The reader, owned by the update; NULL for an in-place append.
+ */
+GARC_API GARC_Archive * garc_fs_update_archive(GARC_Fs_Update * update);
+
+/**
+ * @brief The writer for what the archive will be.
+ *
+ * Add members to it as to any writer. Do not finish it:
+ * ::garc_fs_update_commit() does.
+ *
+ * @param update The update.
+ * @return The writer, owned by the update.
+ */
+GARC_API GARC_Writer * garc_fs_update_writer(GARC_Fs_Update * update);
+
+/**
+ * @brief Keep the reader's current member, unchanged.
+ *
+ * ::garc_writer_copy_member() with ::GARC_COPY_RAW for zip and plainly for the
+ * rest, so nothing is changed that can be kept as it was.
+ *
+ * @param update A rewriting update.
+ * @return As ::garc_writer_copy_member(); ::GARC_ERR_INVALID for an in-place one.
+ */
+GARC_API GARC_Result garc_fs_update_keep(GARC_Fs_Update * update);
+
+/**
+ * @brief Keep every member the reader has not reached yet.
+ *
+ * The walk, from where it is to the end, with ::garc_fs_update_keep() for each.
+ * Appending to a rewritten archive is this, then the new members.
+ *
+ * @param update A rewriting update.
+ * @return ::GARC_OK when the walk ended, or the first failure.
+ */
+GARC_API GARC_Result garc_fs_update_keep_rest(GARC_Fs_Update * update);
+
+/**
+ * @brief Finish the archive and put it in place.
+ *
+ * Finishes the writer, closes the original - which Windows needs before
+ * anything is renamed over it - and renames the new file over it. An in-place
+ * append is finished, synced unless ::GARC_FS_NO_SYNC, and closed. The update is
+ * spent either way: destroy it.
+ *
+ * @param update The update.
+ * @return ::GARC_OK, or what the writer or the rename failed with, in which
+ *   case the original is unchanged (for a rewrite).
+ */
+GARC_API GARC_Result garc_fs_update_commit(GARC_Fs_Update * update);
+
+/**
+ * @brief Release an update, abandoning it if it was not committed.
+ *
+ * A rewrite's temporary file is removed. An in-place append's end marker is
+ * written back where the original's was.
+ *
+ * @param update The update. NULL is accepted.
+ */
+GARC_API void garc_fs_update_destroy(GARC_Fs_Update * update);
+
+/**
  * @brief Open a file as a stream.
  *
  * The stream can seek and knows its size, which are what zip and 7z need. It

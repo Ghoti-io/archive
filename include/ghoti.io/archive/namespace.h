@@ -48,6 +48,7 @@
 #define GARC_Allocator GHOTIIO_ARCHIVE(GARC_Allocator)
 #define GARC_Archive GHOTIIO_ARCHIVE(GARC_Archive)
 #define GARC_Format GHOTIIO_ARCHIVE(GARC_Format)
+#define GARC_Fs_Update GHOTIIO_ARCHIVE(GARC_Fs_Update)
 #define GARC_Limits GHOTIIO_ARCHIVE(GARC_Limits)
 #define GARC_Member GHOTIIO_ARCHIVE(GARC_Member)
 #define GARC_Member_Type GHOTIIO_ARCHIVE(GARC_Member_Type)
@@ -75,6 +76,15 @@
   GHOTIIO_ARCHIVE(garc_fs_open_with_allocator)
 #define garc_fs_pack GHOTIIO_ARCHIVE(garc_fs_pack)
 #define garc_fs_sink_create GHOTIIO_ARCHIVE(garc_fs_sink_create)
+#define garc_fs_update_archive GHOTIIO_ARCHIVE(garc_fs_update_archive)
+#define garc_fs_update_begin GHOTIIO_ARCHIVE(garc_fs_update_begin)
+#define garc_fs_update_begin_with_allocator                                    \
+  GHOTIIO_ARCHIVE(garc_fs_update_begin_with_allocator)
+#define garc_fs_update_commit GHOTIIO_ARCHIVE(garc_fs_update_commit)
+#define garc_fs_update_destroy GHOTIIO_ARCHIVE(garc_fs_update_destroy)
+#define garc_fs_update_keep GHOTIIO_ARCHIVE(garc_fs_update_keep)
+#define garc_fs_update_keep_rest GHOTIIO_ARCHIVE(garc_fs_update_keep_rest)
+#define garc_fs_update_writer GHOTIIO_ARCHIVE(garc_fs_update_writer)
 #define garc_fs_sink_create_with_allocator                                     \
   GHOTIIO_ARCHIVE(garc_fs_sink_create_with_allocator)
 #define garc_fs_stream_open GHOTIIO_ARCHIVE(garc_fs_stream_open)

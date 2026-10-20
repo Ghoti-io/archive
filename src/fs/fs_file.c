@@ -475,15 +475,11 @@ static const char * fs_sniff(
   return NULL;
 }
 
-GARC_Result garc_fs_open_with_allocator(const char * path,
+GARC_Result garc_fs_open_detecting(const char * path,
     const GARC_Limits * limits, gcomp_options_t * options, uint32_t flags,
-    const GARC_Allocator * allocator, GARC_Archive ** out_archive) {
-  if (!path || !out_archive || (flags & ~GARC_FS_OPEN_FLAGS_KNOWN)) {
-    return GARC_ERR_INVALID;
-  }
-  if (!allocator) {
-    allocator = garc_allocator_default();
-  }
+    const GARC_Allocator * allocator, GARC_Archive ** out_archive,
+    const char ** out_method) {
+  *out_method = NULL;
 
   GARC_Stream * file = NULL;
   GARC_Result result = garc_fs_stream_open_with_allocator(path, allocator, &file);
@@ -527,7 +523,22 @@ GARC_Result garc_fs_open_with_allocator(const char * path,
   archive->owned_stream = decoded;
   archive->owned_inner = file;
   *out_archive = archive;
+  *out_method = method;
   return GARC_OK;
+}
+
+GARC_Result garc_fs_open_with_allocator(const char * path,
+    const GARC_Limits * limits, gcomp_options_t * options, uint32_t flags,
+    const GARC_Allocator * allocator, GARC_Archive ** out_archive) {
+  if (!path || !out_archive || (flags & ~GARC_FS_OPEN_FLAGS_KNOWN)) {
+    return GARC_ERR_INVALID;
+  }
+  if (!allocator) {
+    allocator = garc_allocator_default();
+  }
+  const char * method = NULL;
+  return garc_fs_open_detecting(
+      path, limits, options, flags, allocator, out_archive, &method);
 }
 
 GARC_Result garc_fs_open(const char * path, const GARC_Limits * limits,

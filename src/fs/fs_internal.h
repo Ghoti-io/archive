@@ -29,6 +29,7 @@
 
 #include <ghoti.io/archive/core.h>
 #include <ghoti.io/archive/macros.h>
+#include <ghoti.io/archive/fs.h>
 #include <ghoti.io/cutil/file.h>
 
 /**
@@ -42,5 +43,22 @@
  * @return The archive status.
  */
 GARC_Result garc_fs_from_file(GCU_File_Result result);
+
+/**
+ * ::garc_fs_open() past its argument checks, saying which codec it removed.
+ *
+ * @param path The file.
+ * @param limits Caps, or NULL.
+ * @param options `compress` options for a decoder, or NULL.
+ * @param flags As ::garc_fs_open().
+ * @param allocator The allocator. Not NULL.
+ * @param out_archive Receives the archive.
+ * @param out_method Receives the codec's name, or NULL when there was none.
+ * @return As ::garc_fs_open().
+ */
+GARC_Result garc_fs_open_detecting(const char * path,
+    const GARC_Limits * limits, gcomp_options_t * options, uint32_t flags,
+    const GARC_Allocator * allocator, GARC_Archive ** out_archive,
+    const char ** out_method);
 
 #endif // GHOTI_IO_GARC_SRC_FS_FS_INTERNAL_H
