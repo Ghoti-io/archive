@@ -434,7 +434,9 @@ GARC_API GARC_Result garc_fs_open_with_allocator(const char * path,
  *
  * Every member's data is read to the reader's end, which is where a zip
  * member's CRC-32 or AES tag is checked, so a damaged member is a failure
- * and not a file.
+ * and not a file. A sparse member is written with its holes left as holes:
+ * each 4 KiB block of zeros, aligned to the file's offsets, is sought over
+ * rather than written. The bytes are the same either way.
  *
  * @param archive The archive to read. Not NULL.
  * @param root The directory to write into. Not NULL.
@@ -451,7 +453,13 @@ GARC_API GARC_Result garc_fs_extract(GARC_Archive * archive, const char * root,
 /**
  * @brief Pack the tree at @p root into an open writer.
  *
- * Does not finish the writer. A symlink is stored as a symlink, including
+ * Does not finish the writer. Each file is streamed from disk rather than read
+ * whole. A file with holes - where the filesystem says so, through
+ * `gcu_file_next_data()` - is written as a sparse member when the writer can
+ * write one (tar with ::GARC_TAR_PAX, the default), so the archive holds its
+ * data and not its holes; every other writer gets the file's real content. A
+ * file that shrinks while it is being packed is ::GARC_ERR_IO, because its
+ * header already gave its size. A symlink is stored as a symlink, including
  * one whose target is outside the tree, and the outside file's bytes are not
  * read. A hard link to a path inside the tree is a hard link member. A hard
  * link to a path outside it is ::GARC_ERR_REFUSED. A fifo, a device, or any

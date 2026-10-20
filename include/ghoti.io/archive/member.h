@@ -137,6 +137,16 @@ typedef enum {
 } GARC_Time_Source;
 
 /**
+ * @brief One stored run of a sparse file: `length` bytes at `offset`.
+ *
+ * Everything outside the runs is a hole, which reads as zeros.
+ */
+typedef struct GARC_Sparse_Region {
+  uint64_t offset; ///< Where the run starts in the file.
+  uint64_t length; ///< How many bytes it holds.
+} GARC_Sparse_Region;
+
+/**
  * @brief One member of an archive.
  *
  * **Borrowed, and valid only until the next ::garc_next().** The struct and
@@ -266,6 +276,28 @@ typedef struct GARC_Member {
    * as they come out.
    */
   int size_unknown;
+
+  /**
+   * For writing a sparse file: its stored runs, in order, or NULL for an
+   * ordinary member.
+   *
+   * Set by a caller and never by a reader, which hands a sparse member over as
+   * its real content (see @ref sparse) - so a member copied from a reader and
+   * written back is written whole, as it was read. When this is set, @ref size
+   * is the file's real size and the caller writes only the runs' bytes, one run
+   * after another: the sum of their lengths, which is what
+   * ::garc_writer_data_remaining() reports. The runs must be in increasing
+   * order, must not overlap, and must end within @ref size; a file that is all
+   * hole has none, with this pointing anywhere and @ref sparse_region_count 0.
+   *
+   * tar only, written as GNU's pax sparse format 1.0 with the writer's
+   * ::GARC_TAR_PAX variant; every other format and variant refuses it with
+   * ::GARC_ERR_UNSUPPORTED. The pointer is borrowed for the one
+   * ::garc_writer_add() call.
+   */
+  const GARC_Sparse_Region * sparse_regions;
+  /** How many runs @ref sparse_regions holds. */
+  size_t sparse_region_count;
 } GARC_Member;
 
 /**

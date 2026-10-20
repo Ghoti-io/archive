@@ -117,6 +117,9 @@ ROUNDTRIP_SKIP = {}
 # corpus grew, and an accidental shrink has no such edit anywhere.
 EXPECTED_ARCHIVES = 13
 EXPECTED_MEMBERS = 56
+# sparse.tar, written apart from the corpus above because its members' data is
+# not one fill byte, and checked by extracting rather than by listing.
+EXPECTED_SPARSE_MEMBERS = 5
 
 # What a listing reference is allowed to say on stderr, matched whole.
 #
@@ -328,6 +331,46 @@ def inner(directory):
             encoding="utf-8") as handle:
         handle.write("\n".join(rows) + "\n")
 
+    # The sparse archive, extracted: the only way to see a reference understood
+    # the map is that the file it wrote has the bytes. A reference that did not
+    # know pax sparse 1.0 would extract GNUSparseFile.0/<name> with the map and
+    # the runs in it, which the host half finds missing at the real name.
+    sparse_dir = os.path.join(directory, "sparse")
+    sparse_tar = os.path.join(sparse_dir, "sparse.tar")
+    if os.path.exists(sparse_tar):
+        import hashlib
+        import tempfile
+        for tool, argv in (("tar", ["tar", "-xf", sparse_tar]),
+                ("bsdtar", ["bsdtar", "-xf", sparse_tar])):
+            out = tempfile.mkdtemp(prefix="sparse-%s-" % tool, dir=directory)
+            finished = subprocess.run(argv, cwd=out, capture_output=True)
+            if finished.returncode != 0:
+                sys.stderr.write("%s could not extract sparse.tar: %s\n" % (tool,
+                    finished.stderr.decode("utf-8", "replace").strip()))
+                return 1
+            rows = []
+            for parent, _, files in os.walk(out):
+                for leaf in files:
+                    full = os.path.join(parent, leaf)
+                    with open(full, "rb") as handle:
+                        data = handle.read()
+                    rows.append("%s\t%d\t%s" % (os.path.relpath(full, out),
+                        len(data), hashlib.sha256(data).hexdigest()))
+            with open(os.path.join(directory, "sparse-%s.tsv" % tool), "w",
+                    encoding="utf-8") as handle:
+                handle.write("\n".join(sorted(rows)) + "\n")
+        rows = []
+        with tarfile.open(sparse_tar, "r:") as archive:
+            for info in archive:
+                if not info.isreg():
+                    continue
+                data = archive.extractfile(info).read()
+                rows.append("%s\t%d\t%s" % (info.name, len(data),
+                    hashlib.sha256(data).hexdigest()))
+        with open(os.path.join(directory, "sparse-tarfile.tsv"), "w",
+                encoding="utf-8") as handle:
+            handle.write("\n".join(sorted(rows)) + "\n")
+
     # And the round trips: read what we wrote, write it out again.
     tarfile_out = os.path.join(directory, "rt-tarfile")
     bsdtar_out = os.path.join(directory, "rt-bsdtar")
@@ -438,8 +481,12 @@ def run(binary, work, ours):
         if len(parts) >= 4:
             purposes[parts[0]] = (parts[1], parts[2], parts[3])
     intent = rows_from(probe(binary, ["write", ours]))
+    sparse_dir = os.path.join(work, "sparse")
+    os.makedirs(sparse_dir, exist_ok=True)
+    sparse_intent = rows_from(probe(binary, ["write-sparse", sparse_dir]))
     written = sorted(n for n in os.listdir(ours) if n.endswith(".tar"))
-    if len(written) != EXPECTED_ARCHIVES or len(intent) != EXPECTED_MEMBERS:
+    if (len(written) != EXPECTED_ARCHIVES or len(intent) != EXPECTED_MEMBERS
+            or len(sparse_intent) != EXPECTED_SPARSE_MEMBERS):
         sys.stderr.write(
             "### The probe's corpus is not the one this gate measures ###\n"
             "  writer_probe wrote %d archives and %d members; this gate expects\n"
@@ -496,6 +543,27 @@ def run(binary, work, ours):
     compare(failures, "tarfile", [strip_dir_slash(r) for r in intent],
         [strip_dir_slash(r) for r in theirs])
 
+    # The sparse members, by content: what each reference extracted against the
+    # bytes the run list in the intent says the file holds.
+    import hashlib
+    want_sparse = []
+    for row in sparse_intent:
+        _, name, size, runs = (list(row) + [""])[:4]
+        content = bytearray(int(size))
+        for index, run in enumerate(r for r in runs.split(",") if r):
+            offset, length = (int(v) for v in run.split(":"))
+            for j in range(length):
+                content[offset + j] = ord("a") + (index + j) % 26
+        want_sparse.append("%s\t%d\t%s" % (name, len(content),
+            hashlib.sha256(bytes(content)).hexdigest()))
+    want_sparse.sort()
+    for tool in ("tar", "bsdtar", "tarfile"):
+        got = [line for line in read_tsv("sparse-%s.tsv" % tool).splitlines()
+            if line.strip()]
+        if got != want_sparse:
+            failures.append("%s: sparse.tar extracted as %s, not %s"
+                % (tool, got, want_sparse))
+
     # Us, on our own output: the identity that makes a later failure localisable.
     compare(failures, "ours", intent, read_directory(binary, ours))
 
@@ -534,9 +602,10 @@ def run(binary, work, ours):
 
     print("check-writer: %d members across %d archives. Names: tar %d byte for "
         "byte, bsdtar %d byte for byte and %d counted only (its quoting). "
-        "tarfile's metadata and both round trips agree on every column."
+        "tarfile's metadata and both round trips agree on every column. "
+        "%d sparse members extract to the same bytes under all three."
         % (len(intent), len(written), tallies["tar"][0], tallies["bsdtar"][0],
-            tallies["bsdtar"][1]))
+            tallies["bsdtar"][1], len(sparse_intent)))
     return 0
 
 

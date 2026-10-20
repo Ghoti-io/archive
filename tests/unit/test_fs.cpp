@@ -354,6 +354,158 @@ TEST_F(ExtractRoot, AZipReadOffAPipeExtractsTheSameFiles) {
   remove_tree(reference);
 }
 
+/** Bytes the filesystem allocated to @p path, or -1 where it cannot say. */
+long long allocated_bytes(const std::string & path) {
+#ifdef _WIN32
+  (void)path;
+  return -1;
+#else
+  struct stat info;
+  if (stat(path.c_str(), &info) != 0) {
+    return -1;
+  }
+  return static_cast<long long>(info.st_blocks) * 512;
+#endif
+}
+
+TEST_F(ExtractRoot, ASparseMemberIsExtractedWithItsHolesLeftAsHoles) {
+  // The bytes are the member's real content, holes as zeros, and a filesystem
+  // that keeps holes is left one: all-hole.bin is 256 KiB of nothing and
+  // should cost no blocks. The control is a file made with a hole by hand, so
+  // a filesystem that keeps none (or Windows, where st_blocks does not exist)
+  // is told apart from an extraction that wrote the zeros.
+  const std::string probe = join_path(root, "probe-hole");
+  GCU_File_Handle handle;
+  std::memset(&handle, 0, sizeof(handle));
+  ASSERT_EQ(GCU_FILE_OK, gcu_file_open(&handle, probe.c_str(), GCU_FILE_OPEN_WRITE,
+      GCU_FILE_PERMS_PRIVATE, nullptr));
+  ASSERT_EQ(GCU_FILE_OK, gcu_file_truncate(&handle, 1u << 20));
+  ASSERT_EQ(GCU_FILE_OK, gcu_file_close(&handle));
+  const long long probe_blocks = allocated_bytes(probe);
+  const bool holes_kept = probe_blocks >= 0 && probe_blocks < (1 << 19);
+  gcu_file_remove(probe.c_str());
+
+  size_t checked = 0;
+  for (const char * fixture : {"gnu-sparse.tar", "pax-sparse-0.0.tar",
+           "pax-sparse-0.1.tar", "pax-sparse-1.0.tar"}) {
+    SCOPED_TRACE(fixture);
+    const std::vector<uint8_t> bytes = read_fixture(tar_fixture(fixture));
+    ASSERT_FALSE(bytes.empty());
+    char * made = nullptr;
+    ASSERT_EQ(GCU_FILE_OK, gcu_dir_temp_create(nullptr, "garc-sparse", nullptr, &made));
+    const std::string out = made;
+    gcu_dir_free_path(nullptr, made);
+    {
+      Opened opened(bytes);
+      opened.open();
+      EXPECT_EQ(GARC_OK, garc_fs_extract(opened.archive, out.c_str(), 0));
+    }
+    // What the reader says each member is, which test_tar_sparse holds to the
+    // references; the extracted file must be those bytes.
+    Opened opened(bytes);
+    opened.open();
+    const GARC_Member * member = nullptr;
+    while (garc_next(opened.archive, &member) == GARC_OK) {
+      const std::string name(member->name, member->name_length);
+      SCOPED_TRACE(name);
+      ASSERT_TRUE(member->sparse);
+      std::string want;
+      char buffer[8192];
+      size_t got = 0;
+      while (garc_read_member(opened.archive, buffer, sizeof(buffer), &got) == GARC_OK
+          && got) {
+        want.append(buffer, got);
+      }
+      const std::string path = join_path(out, name);
+      EXPECT_EQ(read_file(path), want);
+      if (holes_kept) {
+        const long long used = allocated_bytes(path);
+        // Never more than the stored regions plus a block at each end of each.
+        EXPECT_LE(used, static_cast<long long>(member->stored_size)
+                + 2 * 4096 * 16)
+            << "the holes were written as zeros";
+        if (name == "all-hole.bin") {
+          EXPECT_LT(used, 4096 * 2);
+        }
+      }
+      ++checked;
+    }
+    remove_tree(out);
+  }
+  EXPECT_EQ(checked, 16u);
+}
+
+/** Pack @p dir with @p format and the default options; the archive's bytes. */
+std::vector<uint8_t> pack_tree(const std::string & dir, GARC_Format format) {
+  std::vector<uint8_t> bytes;
+  GARC_Sink * sink = nullptr;
+  EXPECT_EQ(GARC_OK, garc_sink_create_memory(&sink));
+  GARC_Writer * writer = nullptr;
+  EXPECT_EQ(GARC_OK, garc_writer_create(sink, format, nullptr, &writer));
+  EXPECT_EQ(GARC_OK, garc_fs_pack(writer, dir.c_str(), 0));
+  EXPECT_EQ(GARC_OK, garc_writer_finish(writer));
+  const void * data = nullptr;
+  size_t size = 0;
+  if (garc_sink_data(sink, &data, &size) == GARC_OK && data) {
+    bytes.assign(static_cast<const uint8_t *>(data),
+        static_cast<const uint8_t *>(data) + size);
+  }
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  return bytes;
+}
+
+TEST_F(ExtractRoot, AFileWithHolesIsPackedSparseWhereTheFormatCanSayIt) {
+  // 4 MiB with data at the start and the end and a hole between. Into tar it
+  // goes as pax sparse 1.0 - the archive holds the data, not the hole - and
+  // into zip, which has no way to say it, as its real content. Both extract to
+  // the same bytes.
+  const std::string path = join_path(root, "disk.img");
+  GCU_File_Handle handle;
+  std::memset(&handle, 0, sizeof(handle));
+  ASSERT_EQ(GCU_FILE_OK, gcu_file_open(&handle, path.c_str(), GCU_FILE_OPEN_WRITE,
+      GCU_FILE_PERMS_PRIVATE, nullptr));
+  const std::string head(8192, 'h');
+  const std::string tail(4096, 't');
+  ASSERT_EQ(GCU_FILE_OK, gcu_file_write_bytes(&handle, head.data(), head.size()));
+  ASSERT_EQ(GCU_FILE_OK, gcu_file_seek(&handle, (4 << 20) - 4096, GCU_FILE_SEEK_SET));
+  ASSERT_EQ(GCU_FILE_OK, gcu_file_write_bytes(&handle, tail.data(), tail.size()));
+  ASSERT_EQ(GCU_FILE_OK, gcu_file_close(&handle));
+  std::string want = head;
+  want.append((4u << 20) - 4096u - head.size(), '\0');
+  want += tail;
+  ASSERT_EQ(read_file(path), want);
+  const bool holes = allocated_bytes(path) >= 0 && allocated_bytes(path) < (1 << 20);
+
+  for (GARC_Format format : {GARC_FORMAT_TAR, GARC_FORMAT_ZIP}) {
+    SCOPED_TRACE(format == GARC_FORMAT_TAR ? "tar" : "zip");
+    const std::vector<uint8_t> bytes = pack_tree(root, format);
+    ASSERT_FALSE(bytes.empty());
+    Opened opened(bytes);
+    opened.open();
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(GARC_OK, garc_next(opened.archive, &member));
+    EXPECT_EQ(std::string(member->name, member->name_length), "disk.img");
+    EXPECT_EQ(member->size, want.size());
+    if (format == GARC_FORMAT_TAR && holes) {
+      EXPECT_TRUE(member->sparse);
+      EXPECT_LT(bytes.size(), 64u * 1024u) << "the hole was stored";
+    }
+    if (format == GARC_FORMAT_ZIP) {
+      EXPECT_FALSE(member->sparse);
+    }
+    char * made = nullptr;
+    ASSERT_EQ(GCU_FILE_OK, gcu_dir_temp_create(nullptr, "garc-holes", nullptr, &made));
+    const std::string out = made;
+    gcu_dir_free_path(nullptr, made);
+    Opened again(bytes);
+    again.open();
+    EXPECT_EQ(GARC_OK, garc_fs_extract(again.archive, out.c_str(), 0));
+    EXPECT_TRUE(read_file(join_path(out, "disk.img")) == want);
+    remove_tree(out);
+  }
+}
+
 TEST_F(ExtractRoot, MalLinksWithoutTheFlagCreatesNoSymlink) {
   Opened opened(read_fixture(tar_fixture("mal-links.tar")));
   opened.open();

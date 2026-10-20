@@ -35,6 +35,7 @@
 #include <ghoti.io/cutil/path.h>
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "fs/fs_internal.h"
@@ -600,6 +601,67 @@ static GARC_Result fs_apply_mode(const char * path, const GARC_Member * member) 
   return garc_fs_from_file(result);
 }
 
+/** The block a sparse member's holes are found in, and the unit a hole is. */
+#define FS_HOLE_BLOCK 4096u
+
+static int fs_all_zero(const uint8_t * bytes, size_t length) {
+  for (size_t i = 0; i < length; ++i) {
+    if (bytes[i]) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/**
+ * Write a sparse member's bytes, seeking over each block that is all zeros.
+ *
+ * The reader hands a sparse member over as its real content, holes as zeros,
+ * so the holes are found again here the way `cp --sparse` finds them: by block,
+ * aligned to the file's own offsets, because a filesystem only leaves whole
+ * blocks unallocated. The file's bytes are the same either way; what is saved
+ * is the disk a multi-gigabyte image of mostly nothing would take.
+ *
+ * @param handle The file, at @p *offset.
+ * @param bytes The data.
+ * @param length Its length.
+ * @param offset Where in the file it goes, advanced past it.
+ * @param pending Bytes of hole not yet sought over, which the next write or
+ *   the final length accounts for.
+ */
+static GARC_Result fs_write_sparse(GCU_File_Handle * handle,
+    const uint8_t * bytes, size_t length, uint64_t * offset, uint64_t * pending) {
+  while (length) {
+    const uint64_t to_boundary = FS_HOLE_BLOCK - (*offset % FS_HOLE_BLOCK);
+    const size_t run = (uint64_t)length < to_boundary ? length : (size_t)to_boundary;
+    if (run == FS_HOLE_BLOCK && fs_all_zero(bytes, run)) {
+      *pending += run;
+    }
+    else {
+      if (*pending) {
+        if (*pending > (uint64_t)INT64_MAX) {
+          return GARC_ERR_IO;
+        }
+        GARC_Result result = garc_fs_from_file(
+            gcu_file_seek(handle, (int64_t)*pending, GCU_FILE_SEEK_CUR));
+        if (result != GARC_OK) {
+          return result;
+        }
+        *pending = 0;
+      }
+      GARC_Result result
+          = garc_fs_from_file(gcu_file_write_bytes(handle, bytes, run));
+      if (result != GARC_OK) {
+        return result;
+      }
+    }
+    bytes += run;
+    length -= run;
+    *offset += (uint64_t)run;
+  }
+  return GARC_OK;
+}
+
 static GARC_Result fs_write_file(GARC_Archive * archive,
     const GARC_Member * member, const char * path) {
   GCU_File_Handle handle;
@@ -617,6 +679,16 @@ static GARC_Result fs_write_file(GARC_Archive * archive,
   // CRC-32 and a WinZip AES member's authentication code are checked, and
   // stopping one call short of it extracted a corrupted member without a word.
   // It is also how a member whose size the container does not state ends.
+  uint64_t offset = 0;
+  uint64_t pending = 0;
+  if (member->sparse) {
+    // NTFS leaves a hole only in a file marked sparse; elsewhere a no-op.
+    result = garc_fs_from_file(gcu_file_allow_holes(&handle));
+    if (result != GARC_OK) {
+      gcu_file_close(&handle);
+      return result;
+    }
+  }
   for (;;) {
     size_t got = 0;
     result = garc_read_member(archive, buffer, sizeof(buffer), &got);
@@ -633,13 +705,19 @@ static GARC_Result fs_write_file(GARC_Archive * archive,
       result = GARC_ERR_INTERNAL; // a reader handed out more than it declared
       break;
     }
-    result = garc_fs_from_file(gcu_file_write_bytes(&handle, buffer, got));
+    result = member->sparse
+        ? fs_write_sparse(&handle, buffer, got, &offset, &pending)
+        : garc_fs_from_file(gcu_file_write_bytes(&handle, buffer, got));
     if (result != GARC_OK) {
       break;
     }
     if (!member->size_unknown) {
       left -= got;
     }
+  }
+  if (result == GARC_OK && pending) {
+    // A hole at the end: nothing was written there, so the length is set.
+    result = garc_fs_from_file(gcu_file_truncate(&handle, offset));
   }
   if (result == GARC_OK) {
     result = garc_fs_from_file(gcu_file_close(&handle));
@@ -1211,14 +1289,154 @@ static GARC_Result fs_mark_links(FsList * list) {
   return GARC_OK;
 }
 
+/** Copy @p length bytes from @p handle at @p offset into the writer. */
+static GARC_Result fs_copy_run(GARC_Writer * writer, GCU_File_Handle * handle,
+    uint64_t offset, uint64_t length) {
+  if (offset > (uint64_t)INT64_MAX) {
+    return GARC_ERR_IO;
+  }
+  GARC_Result result = garc_fs_from_file(
+      gcu_file_seek(handle, (int64_t)offset, GCU_FILE_SEEK_SET));
+  uint8_t buffer[8192];
+  while (result == GARC_OK && length) {
+    const size_t want
+        = length < sizeof(buffer) ? (size_t)length : sizeof(buffer);
+    size_t got = 0;
+    result = garc_fs_from_file(gcu_file_read_bytes(handle, buffer, want, &got));
+    if (result == GARC_OK && got != want) {
+      // Shorter than when it was measured: the file changed while it was being
+      // packed, and the header already says how long it is.
+      result = GARC_ERR_IO;
+    }
+    if (result == GARC_OK) {
+      result = garc_writer_write(writer, buffer, got);
+    }
+    length -= (uint64_t)got;
+  }
+  return result;
+}
+
+/**
+ * The runs of data in a file of @p size, as the filesystem has them.
+ *
+ * NULL with a count of 0 and GARC_OK when the file is all data, which is the
+ * answer on a filesystem or platform that keeps no holes.
+ */
+static GARC_Result fs_file_runs(GCU_File_Handle * handle, uint64_t size,
+    GARC_Sparse_Region ** out_runs, size_t * out_count) {
+  GARC_Sparse_Region * runs = NULL;
+  size_t count = 0;
+  size_t capacity = 0;
+  uint64_t stored = 0;
+  uint64_t from = 0;
+  *out_runs = NULL;
+  *out_count = 0;
+  while (from < size) {
+    uint64_t start = 0;
+    uint64_t end = 0;
+    GARC_Result result
+        = garc_fs_from_file(gcu_file_next_data(handle, from, &start, &end));
+    if (result != GARC_OK) {
+      gcu_allocator_free(NULL, runs);
+      return result;
+    }
+    if (end > size) {
+      end = size;
+    }
+    if (start == 0 && end == size) {
+      return GARC_OK; // all data, the common case: one run is no sparse file
+    }
+    if (start >= end || start < from) {
+      break; // no more data: the rest is a hole
+    }
+    if (count == capacity) {
+      const size_t grown = capacity ? capacity * 2u : 8u;
+      GARC_Sparse_Region * bigger = (GARC_Sparse_Region *)gcu_allocator_realloc(
+          NULL, runs, grown * sizeof(*runs));
+      if (!bigger) {
+        gcu_allocator_free(NULL, runs);
+        return GARC_ERR_OOM;
+      }
+      runs = bigger;
+      capacity = grown;
+    }
+    runs[count].offset = start;
+    runs[count].length = end - start;
+    stored += end - start;
+    ++count;
+    from = end;
+  }
+  if (stored == size && count) {
+    // Runs that cover the file are not holes.
+    gcu_allocator_free(NULL, runs);
+    return GARC_OK;
+  }
+  if (!count && size) {
+    // Every byte a hole: keep the empty list, which says so.
+    runs = (GARC_Sparse_Region *)gcu_allocator_malloc(NULL, sizeof(*runs));
+    if (!runs) {
+      return GARC_ERR_OOM;
+    }
+  }
+  *out_runs = runs;
+  *out_count = count;
+  return GARC_OK;
+}
+
+/**
+ * One regular file, streamed from a handle rather than read whole.
+ *
+ * A file with holes is offered to the writer as a sparse member first; a writer
+ * that cannot write one refuses before writing a byte, and the file then goes
+ * in as its real content.
+ */
+static GARC_Result fs_emit_file(
+    GARC_Writer * writer, GARC_Member * member, const char * path, uint64_t size) {
+  GCU_File_Handle handle;
+  memset(&handle, 0, sizeof(handle));
+  GARC_Result result = garc_fs_from_file(gcu_file_open(
+      &handle, path, GCU_FILE_OPEN_READ, GCU_FILE_PERMS_DEFAULT, NULL));
+  if (result != GARC_OK) {
+    return result;
+  }
+  GARC_Sparse_Region * runs = NULL;
+  size_t count = 0;
+  result = fs_file_runs(&handle, size, &runs, &count);
+  member->size = size;
+  int sparse = 0;
+  if (result == GARC_OK && runs) {
+    member->sparse_regions = runs;
+    member->sparse_region_count = count;
+    result = garc_writer_add(writer, member);
+    sparse = result == GARC_OK;
+    if (result == GARC_ERR_UNSUPPORTED) {
+      result = GARC_OK;
+    }
+    member->sparse_regions = NULL;
+    member->sparse_region_count = 0;
+  }
+  if (result == GARC_OK && sparse) {
+    for (size_t i = 0; result == GARC_OK && i < count; ++i) {
+      result = fs_copy_run(writer, &handle, runs[i].offset, runs[i].length);
+    }
+  }
+  else if (result == GARC_OK) {
+    result = garc_writer_add(writer, member);
+    if (result == GARC_OK) {
+      result = fs_copy_run(writer, &handle, 0, size);
+    }
+  }
+  gcu_allocator_free(NULL, runs);
+  gcu_file_close(&handle);
+  return result;
+}
+
 static GARC_Result fs_emit(GARC_Writer * writer, const FsList * list) {
   size_t i;
   for (i = 0; i < list->count; ++i) {
     const FsEntry * entry = &list->items[i];
     GARC_Member member;
     GARC_Result result;
-    void * data = NULL;
-    size_t length = 0;
     memset(&member, 0, sizeof(member));
     member.name = entry->rel;
     member.name_length = strlen(entry->rel);
@@ -1255,27 +1473,15 @@ static GARC_Result fs_emit(GARC_Writer * writer, const FsList * list) {
       if (again.type != GCU_FILE_TYPE_REGULAR) {
         return GARC_ERR_REFUSED;
       }
-      looked = gcu_file_read(entry->full, GCU_FILE_UNLIMITED,
-          NULL, &data, &length);
-      if (looked != GCU_FILE_OK) {
-        return garc_fs_from_file(looked);
-      }
-      member.size = length;
-    }
-    result = garc_writer_add(writer, &member);
-    if (result != GARC_OK) {
-      gcu_file_free(NULL, data);
-      return result;
-    }
-    if (length) {
-      result = garc_writer_write(writer, data, length);
-      gcu_file_free(NULL, data);
+      result = fs_emit_file(writer, &member, entry->full, again.size);
       if (result != GARC_OK) {
         return result;
       }
+      continue;
     }
-    else {
-      gcu_file_free(NULL, data);
+    result = garc_writer_add(writer, &member);
+    if (result != GARC_OK) {
+      return result;
     }
   }
   return GARC_OK;

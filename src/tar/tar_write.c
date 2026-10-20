@@ -421,7 +421,8 @@ static GARC_Result tar_check_member(const GARC_Member * member) {
  * reads the forms they came out as.
  */
 static GARC_Result tar_build_records(GARC_Writer * writer,
-    const GARC_Member * member, const GARC_Tar_Name_Split * split,
+    const GARC_Member * member, const GARC_Member * sparse_of,
+    const GARC_Tar_Name_Split * split,
     GARC_Tar_Number_Form size_form, GARC_Tar_Number_Form mtime_form,
     GARC_Tar_Number_Form uid_form, GARC_Tar_Number_Form gid_form) {
   writer->records.length = 0;
@@ -451,6 +452,9 @@ static GARC_Result tar_build_records(GARC_Writer * writer,
     binary = 1;
   }
   if (long_gname && !tar_is_utf8(member->gname, member->gname_length)) {
+    binary = 1;
+  }
+  if (sparse_of && !tar_is_utf8(sparse_of->name, sparse_of->name_length)) {
     binary = 1;
   }
   if (binary) {
@@ -496,6 +500,28 @@ static GARC_Result tar_build_records(GARC_Writer * writer,
   }
   if (result == GARC_OK && gid_form != GARC_TAR_NUMBER_OCTAL) {
     result = tar_record_int(writer, GARC_PAX_GID, member->gid);
+  }
+  if (sparse_of) {
+    // GNU's pax sparse format 1.0: the version, the real name (the header's is
+    // the placeholder a reader that does not know the format extracts), and
+    // the real size. The map is in the data, ahead of the runs.
+    if (result == GARC_OK) {
+      result = tar_record_int(writer, GARC_PAX_SPARSE_MAJOR, 1);
+    }
+    if (result == GARC_OK) {
+      result = tar_record_int(writer, GARC_PAX_SPARSE_MINOR, 0);
+    }
+    if (result == GARC_OK) {
+      result = tar_record_append(writer, GARC_PAX_SPARSE_NAME, sparse_of->name,
+          sparse_of->name_length);
+    }
+    if (result == GARC_OK) {
+      if (sparse_of->size > (uint64_t)INT64_MAX) {
+        return GARC_ERR_UNSUPPORTED;
+      }
+      result = tar_record_int(
+          writer, GARC_PAX_SPARSE_REALSIZE, (int64_t)sparse_of->size);
+    }
   }
   return result;
 }
@@ -555,8 +581,15 @@ static GARC_Result tar_write_carrier(GARC_Writer * writer) {
   return garc_sink_fill(writer->sink, 0, padding);
 }
 
-GARC_Result garc_tar_write_member(
-    GARC_Writer * writer, const GARC_Member * member) {
+/**
+ * Write one member's header and whatever goes in front of it.
+ *
+ * @param sparse_of For a sparse member, the caller's member, whose name and
+ *   real size go in the records; @p member is then the placeholder that is in
+ *   the archive. NULL otherwise.
+ */
+static GARC_Result tar_write_header(GARC_Writer * writer,
+    const GARC_Member * member, const GARC_Member * sparse_of) {
   GARC_Result result = tar_check_member(member);
   if (result != GARC_OK) {
     return result;
@@ -647,8 +680,8 @@ GARC_Result garc_tar_write_member(
     return result;
   }
 
-  result = tar_build_records(
-      writer, member, &split, size_form, mtime_form, uid_form, gid_form);
+  result = tar_build_records(writer, member, sparse_of, &split, size_form,
+      mtime_form, uid_form, gid_form);
   if (result != GARC_OK) {
     return result;
   }
@@ -679,6 +712,260 @@ GARC_Result garc_tar_write_member(
   writer->data_padding
       = (GARC_TAR_BLOCK - (member->size % GARC_TAR_BLOCK)) % GARC_TAR_BLOCK;
   return GARC_OK;
+}
+
+/** Append @p value and a newline to the map being built. */
+static GARC_Result tar_map_line(
+    GARC_Writer * writer, GARC_Buffer * map, uint64_t value) {
+  char text[GARC_TAR_RECORD_NUMBER_MAX];
+  const int written
+      = snprintf(text, sizeof(text), "%llu\n", (unsigned long long)value);
+  GARC_Result result
+      = garc_buffer_grow(writer->allocator, map, map->length + (size_t)written);
+  if (result != GARC_OK) {
+    return result;
+  }
+  memcpy(map->bytes + map->length, text, (size_t)written);
+  map->length += (size_t)written;
+  return GARC_OK;
+}
+
+/**
+ * A sparse member, as GNU's pax sparse format 1.0.
+ *
+ * Defined in the GNU tar manual, "Sparse Formats": the extended header names
+ * the version and carries the real name and size; the ustar header carries a
+ * placeholder name, `GNUSparseFile.0/` in front of the base name, and a size
+ * that is the map plus the runs; the data starts with the map - the number of
+ * runs, then each run's offset and length, one decimal number to a line,
+ * padded with NULs to a block - and then the runs' bytes, in order.
+ *
+ * **Two things the manual leaves out, which GNU tar 1.35 depends on** (found by
+ * check-writer, which extracts what this writes with GNU tar, bsdtar and
+ * tarfile):
+ *
+ * - GNU tar reads each run's bytes as whole blocks, so a run that is not a
+ *   multiple of 512 bytes is followed, for it, by padding that bsdtar and
+ *   tarfile read as the next run's data. Every run but the last is therefore
+ *   lengthened here to a multiple of 512 with the zeros of the hole after it,
+ *   or merged with the next run when the hole is shorter than that, and the
+ *   writer adds those zeros itself: the caller still writes only its own bytes.
+ * - GNU tar takes the file's length from the end of the last run, so a file
+ *   that ends in a hole - or is all hole - gets a last run of no bytes at its
+ *   real size, as GNU tar writes one itself.
+ */
+static GARC_Result tar_write_sparse_member(
+    GARC_Writer * writer, const GARC_Member * member) {
+  if (writer->options.tar_variant != GARC_TAR_PAX) {
+    return GARC_ERR_UNSUPPORTED;
+  }
+  if (member->type != GARC_MEMBER_FILE || !member->name
+      || !member->name_length) {
+    return GARC_ERR_INVALID;
+  }
+  const GARC_Sparse_Region * runs = member->sparse_regions;
+  const size_t count = member->sparse_region_count;
+  uint64_t owed = 0;
+  uint64_t end = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (runs[i].offset < end || runs[i].length > member->size
+        || runs[i].offset > member->size - runs[i].length) {
+      return GARC_ERR_INVALID;
+    }
+    if (runs[i].length) {
+      end = runs[i].offset + runs[i].length;
+    }
+    owed += runs[i].length;
+  }
+
+  // The plan and the map together, one run of the map at a time.
+  writer->sparse_plan.length = 0;
+  GARC_Buffer map;
+  memset(&map, 0, sizeof(map));
+  GARC_Buffer lines;
+  memset(&lines, 0, sizeof(lines));
+  uint64_t map_runs = 0;
+  uint64_t stored = 0;
+  uint64_t map_end = 0;
+  GARC_Result result = GARC_OK;
+  size_t i = 0;
+  while (result == GARC_OK && i < count) {
+    if (!runs[i].length) {
+      ++i;
+      continue;
+    }
+    const uint64_t run_start = runs[i].offset;
+    uint64_t run_end = runs[i].offset + runs[i].length;
+    GARC_Tar_Sparse_Piece piece = {runs[i].length, 0};
+    for (;;) {
+      size_t next = i + 1u;
+      while (next < count && !runs[next].length) {
+        ++next;
+      }
+      if (next >= count) {
+        break; // the last run is not lengthened: the member's padding follows
+      }
+      const uint64_t span = run_end - run_start;
+      const uint64_t want = run_start + span
+          + (GARC_TAR_BLOCK - (span % GARC_TAR_BLOCK)) % GARC_TAR_BLOCK;
+      if (want <= runs[next].offset) {
+        piece.zeros = want - run_end;
+        run_end = want;
+        break;
+      }
+      // The hole is shorter than the padding: the runs become one.
+      piece.zeros = runs[next].offset - run_end;
+      result = garc_buffer_grow(writer->allocator, &writer->sparse_plan,
+          writer->sparse_plan.length + sizeof(piece));
+      if (result != GARC_OK) {
+        break;
+      }
+      memcpy(writer->sparse_plan.bytes + writer->sparse_plan.length, &piece,
+          sizeof(piece));
+      writer->sparse_plan.length += sizeof(piece);
+      i = next;
+      piece.caller = runs[i].length;
+      piece.zeros = 0;
+      run_end = runs[i].offset + runs[i].length;
+    }
+    if (result == GARC_OK) {
+      result = garc_buffer_grow(writer->allocator, &writer->sparse_plan,
+          writer->sparse_plan.length + sizeof(piece));
+    }
+    if (result == GARC_OK) {
+      memcpy(writer->sparse_plan.bytes + writer->sparse_plan.length, &piece,
+          sizeof(piece));
+      writer->sparse_plan.length += sizeof(piece);
+      result = tar_map_line(writer, &lines, run_start);
+    }
+    if (result == GARC_OK) {
+      result = tar_map_line(writer, &lines, run_end - run_start);
+    }
+    stored += run_end - run_start;
+    map_end = run_end;
+    ++map_runs;
+    ++i;
+  }
+  if (result == GARC_OK && (!map_runs || map_end < member->size)) {
+    result = tar_map_line(writer, &lines, member->size);
+    if (result == GARC_OK) {
+      result = tar_map_line(writer, &lines, 0);
+    }
+    ++map_runs;
+  }
+  if (result == GARC_OK) {
+    result = tar_map_line(writer, &map, map_runs);
+  }
+  if (result == GARC_OK) {
+    result = garc_buffer_grow(writer->allocator, &map, map.length + lines.length);
+  }
+  if (result == GARC_OK && lines.length) {
+    memcpy(map.bytes + map.length, lines.bytes, lines.length);
+    map.length += lines.length;
+  }
+  garc_buffer_free(writer->allocator, &lines);
+  const size_t map_padded = map.length
+      + (GARC_TAR_BLOCK - (map.length % GARC_TAR_BLOCK)) % GARC_TAR_BLOCK;
+
+  // The placeholder name: the directory, then GNUSparseFile.0/, then the base.
+  static const char placeholder[] = "GNUSparseFile.0/";
+  const size_t length = member->name_length;
+  size_t base = length;
+  while (base > 0 && member->name[base - 1u] != '/') {
+    --base;
+  }
+  GARC_Buffer name;
+  memset(&name, 0, sizeof(name));
+  if (result == GARC_OK) {
+    result = garc_buffer_grow(
+        writer->allocator, &name, length + sizeof(placeholder) - 1u);
+  }
+  if (result == GARC_OK) {
+    memcpy(name.bytes, member->name, base);
+    memcpy(name.bytes + base, placeholder, sizeof(placeholder) - 1u);
+    memcpy(name.bytes + base + sizeof(placeholder) - 1u, member->name + base,
+        length - base);
+    name.length = length + sizeof(placeholder) - 1u;
+
+    GARC_Member carrier = *member;
+    carrier.name = name.bytes;
+    carrier.name_length = name.length;
+    carrier.size = (uint64_t)map_padded + stored;
+    carrier.sparse_regions = NULL;
+    carrier.sparse_region_count = 0;
+    carrier.sparse = 0;
+    result = tar_write_header(writer, &carrier, member);
+  }
+  if (result == GARC_OK) {
+    result = garc_sink_write(writer->sink, map.bytes, map.length);
+  }
+  if (result == GARC_OK) {
+    result = garc_sink_fill(writer->sink, 0, (uint64_t)(map_padded - map.length));
+  }
+  garc_buffer_free(writer->allocator, &map);
+  garc_buffer_free(writer->allocator, &name);
+  if (result != GARC_OK) {
+    writer->sparse_plan.length = 0;
+    return result;
+  }
+  // What the caller owes is its own bytes; the map is written, and the zeros
+  // the plan adds are the writer's.
+  writer->data_remaining = owed;
+  writer->sparse_piece = 0;
+  writer->sparse_left = writer->sparse_plan.length
+      ? ((const GARC_Tar_Sparse_Piece *)(const void *)writer->sparse_plan.bytes)
+            ->caller
+      : 0u;
+  return GARC_OK;
+}
+
+GARC_Result garc_tar_write_data(
+    GARC_Writer * writer, const void * data, size_t size) {
+  if (!writer->sparse_plan.length) {
+    return garc_sink_write(writer->sink, data, size);
+  }
+  const uint8_t * bytes = (const uint8_t *)data;
+  const size_t pieces = writer->sparse_plan.length / sizeof(GARC_Tar_Sparse_Piece);
+  while (size) {
+    if (writer->sparse_piece >= pieces) {
+      return GARC_ERR_INTERNAL; // more than was owed, which writer.c refuses
+    }
+    GARC_Tar_Sparse_Piece piece;
+    memcpy(&piece, writer->sparse_plan.bytes
+            + writer->sparse_piece * sizeof(piece), sizeof(piece));
+    const size_t take = (uint64_t)size < writer->sparse_left
+        ? size : (size_t)writer->sparse_left;
+    GARC_Result result = garc_sink_write(writer->sink, bytes, take);
+    if (result != GARC_OK) {
+      return result;
+    }
+    bytes += take;
+    size -= take;
+    writer->sparse_left -= (uint64_t)take;
+    if (!writer->sparse_left) {
+      // The piece's own bytes are done: the zeros that follow it, then on.
+      result = garc_sink_fill(writer->sink, 0, piece.zeros);
+      if (result != GARC_OK) {
+        return result;
+      }
+      ++writer->sparse_piece;
+      if (writer->sparse_piece < pieces) {
+        memcpy(&piece, writer->sparse_plan.bytes
+                + writer->sparse_piece * sizeof(piece), sizeof(piece));
+        writer->sparse_left = piece.caller;
+      }
+    }
+  }
+  return GARC_OK;
+}
+
+GARC_Result garc_tar_write_member(
+    GARC_Writer * writer, const GARC_Member * member) {
+  if (member->sparse_regions) {
+    return tar_write_sparse_member(writer, member);
+  }
+  writer->sparse_plan.length = 0;
+  return tar_write_header(writer, member, NULL);
 }
 
 GARC_Result garc_tar_write_close_member(GARC_Writer * writer) {

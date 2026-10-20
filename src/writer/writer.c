@@ -343,6 +343,10 @@ GARC_Result garc_writer_add(GARC_Writer * writer, const GARC_Member * member) {
   }
 
   const uint64_t before = garc_sink_tell(writer->sink);
+  if (member->sparse_regions && writer->format != GARC_FORMAT_TAR) {
+    // Only tar has a way to say where the holes are.
+    return GARC_ERR_UNSUPPORTED;
+  }
   if (writer->format == GARC_FORMAT_AR) {
     result = garc_ar_write_member(writer, member);
   }
@@ -405,6 +409,9 @@ GARC_Result garc_writer_write(
   }
   else if (writer->format == GARC_FORMAT_ZIP) {
     result = garc_zip_write_data(writer, data, size);
+  }
+  else if (writer->format == GARC_FORMAT_TAR) {
+    result = garc_tar_write_data(writer, data, size);
   }
   else {
     result = garc_sink_write(writer->sink, data, size);
@@ -722,6 +729,7 @@ void garc_writer_destroy(GARC_Writer * writer) {
   }
   const GARC_Allocator * allocator = writer->allocator;
   garc_buffer_free(allocator, &writer->records);
+  garc_buffer_free(allocator, &writer->sparse_plan);
   // Unconditionally, not behind a format test: the zip state's buffers are NULL
   // for a tar writer and garc_buffer_free() of a NULL buffer is a no-op, so a
   // condition here would be a second place the format lives for no gain.

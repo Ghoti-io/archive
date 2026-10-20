@@ -450,6 +450,171 @@ TEST(TarSparse, EveryWrongMapIsRefusedAndSaysHow) {
 // The caps
 //-----------------------------------------------------------------------------
 
+/** The bytes of a file of @p size whose runs hold @p fill, and zeros elsewhere. */
+std::string sparse_content(uint64_t size,
+    const std::vector<GARC_Sparse_Region> & runs, std::string * stored) {
+  std::string content(size, '\0');
+  stored->clear();
+  for (size_t i = 0; i < runs.size(); ++i) {
+    for (uint64_t j = 0; j < runs[i].length; ++j) {
+      const char byte = static_cast<char>('a' + (i + j) % 26);
+      content[runs[i].offset + j] = byte;
+      stored->push_back(byte);
+    }
+  }
+  return content;
+}
+
+/** A pax tar holding one sparse member, written by this library. */
+GARC_Result write_sparse(const std::string & name, uint64_t size,
+    const std::vector<GARC_Sparse_Region> & runs, const std::string & stored,
+    GARC_Tar_Variant variant, std::string * out) {
+  GARC_Sink * sink = nullptr;
+  if (garc_sink_create_memory(&sink) != GARC_OK) {
+    return GARC_ERR_OOM;
+  }
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.tar_variant = variant;
+  GARC_Writer * writer = nullptr;
+  GARC_Result result = garc_writer_create(sink, GARC_FORMAT_TAR, &options, &writer);
+  if (result == GARC_OK) {
+    GARC_Member member;
+    std::memset(&member, 0, sizeof(member));
+    member.name = name.data();
+    member.name_length = name.size();
+    member.type = GARC_MEMBER_FILE;
+    member.size = size;
+    member.mode = 0644;
+    member.mode_valid = 1;
+    static const GARC_Sparse_Region none{0, 0};
+    member.sparse_regions = runs.empty() ? &none : runs.data();
+    member.sparse_region_count = runs.size();
+    result = garc_writer_add(writer, &member);
+    if (result == GARC_OK) {
+      EXPECT_EQ(garc_writer_data_remaining(writer), stored.size());
+      result = garc_writer_write(writer, stored.data(), stored.size());
+    }
+    if (result == GARC_OK) {
+      result = garc_writer_finish(writer);
+    }
+    const void * data = nullptr;
+    size_t length = 0;
+    if (result == GARC_OK && garc_sink_data(sink, &data, &length) == GARC_OK) {
+      out->assign(static_cast<const char *>(data), length);
+    }
+    garc_writer_destroy(writer);
+  }
+  garc_sink_destroy(sink);
+  return result;
+}
+
+TEST(TarSparse, AWrittenSparseMemberReadsBackAsItsRealContent) {
+  // Written as pax sparse 1.0 and read by this library's 1.0 reader, which the
+  // fixtures hold to GNU tar's own output. check-writer hands the same shapes
+  // to GNU tar, bsdtar and tarfile.
+  struct Shape {
+    const char * name;
+    uint64_t size;
+    std::vector<GARC_Sparse_Region> runs;
+  };
+  const Shape shapes[] = {
+      {"dir/many.bin", 300000, {{0, 10}, {4096, 4096}, {100000, 1}, {299990, 10}}},
+      {"tail-hole.bin", 1 << 20, {{0, 512}}},
+      {"lead-hole.bin", 204800, {{200000, 4800}}},
+      {"all-hole.bin", 262144, {}},
+      // Closer than a block apart: the writer merges them (GNU tar reads each
+      // run as whole blocks), and the merged run's gap is zeros it adds.
+      {"close.bin", 10000, {{0, 10}, {100, 10}, {700, 3}, {5000, 3}}},
+  };
+  for (const Shape & shape : shapes) {
+    SCOPED_TRACE(shape.name);
+    std::string stored;
+    const std::string content = sparse_content(shape.size, shape.runs, &stored);
+    std::string tar;
+    ASSERT_EQ(GARC_OK, write_sparse(shape.name, shape.size, shape.runs, stored,
+                           GARC_TAR_PAX, &tar));
+    // The holes are not in the archive: what is, past the caller's bytes, is
+    // at most a block of padding per run (see tar_write_sparse_member()).
+    const size_t slack = (shape.runs.size() + 1) * 512;
+    EXPECT_LT(tar.size(), stored.size() + slack + 8 * 512);
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(GARC_OK, garc_stream_create_memory(tar.data(), tar.size(), &stream));
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(GARC_OK, garc_open(stream, nullptr, &archive));
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(GARC_OK, garc_next(archive, &member));
+    EXPECT_EQ(std::string(member->name, member->name_length), shape.name);
+    EXPECT_TRUE(member->sparse);
+    EXPECT_EQ(member->size, shape.size);
+    EXPECT_GE(member->stored_size, stored.size());
+    EXPECT_LE(member->stored_size, stored.size() + slack);
+    std::string got;
+    EXPECT_EQ(GARC_OK, read_all(archive, &got));
+    EXPECT_TRUE(got == content) << "content differs";
+    EXPECT_EQ(GARC_END, garc_next(archive, &member));
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
+}
+
+TEST(TarSparse, AWrongRunListIsRefusedBeforeAnythingIsWritten) {
+  std::string out;
+  const std::string bytes(10, 'x');
+  // Out of order, overlapping, past the end, and past the end by overflow.
+  EXPECT_EQ(GARC_ERR_INVALID,
+      write_sparse("f", 100, {{50, 5}, {10, 5}}, bytes, GARC_TAR_PAX, &out));
+  EXPECT_EQ(GARC_ERR_INVALID,
+      write_sparse("f", 100, {{10, 6}, {15, 4}}, bytes, GARC_TAR_PAX, &out));
+  EXPECT_EQ(GARC_ERR_INVALID,
+      write_sparse("f", 100, {{95, 10}}, bytes, GARC_TAR_PAX, &out));
+  EXPECT_EQ(GARC_ERR_INVALID,
+      write_sparse("f", 100, {{UINT64_MAX - 2, 10}}, bytes, GARC_TAR_PAX, &out));
+  // ustar has no way to say it, and neither has any format but tar.
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED,
+      write_sparse("f", 100, {{0, 10}}, bytes, GARC_TAR_USTAR, &out));
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_memory(&sink));
+  GARC_Writer * writer = nullptr;
+  ASSERT_EQ(GARC_OK, garc_writer_create(sink, GARC_FORMAT_ZIP, nullptr, &writer));
+  GARC_Member member;
+  std::memset(&member, 0, sizeof(member));
+  member.name = "f";
+  member.name_length = 1;
+  member.type = GARC_MEMBER_FILE;
+  member.size = 100;
+  const GARC_Sparse_Region run{0, 10};
+  member.sparse_regions = &run;
+  member.sparse_region_count = 1;
+  const uint64_t before = garc_sink_tell(sink);
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED, garc_writer_add(writer, &member));
+  EXPECT_EQ(before, garc_sink_tell(sink));
+  // And the writer goes on: a refusal before a byte is written is clean.
+  member.sparse_regions = nullptr;
+  member.sparse_region_count = 0;
+  member.size = 0;
+  EXPECT_EQ(GARC_OK, garc_writer_add(writer, &member));
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+}
+
+TEST(TarSparse, AMemberCopiedFromAReaderIsWrittenWhole) {
+  // A reader never sets sparse_regions, so handing its member to a writer
+  // writes the real content, as before - copy_member included.
+  const std::vector<uint8_t> fixture = read_fixture(
+      std::string(GARC_TEST_DATA) + "/tar/pax-sparse-1.0.tar");
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_memory(fixture.data(), fixture.size(), &stream));
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(GARC_OK, garc_open(stream, nullptr, &archive));
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(GARC_OK, garc_next(archive, &member));
+  EXPECT_TRUE(member->sparse);
+  EXPECT_EQ(member->sparse_regions, nullptr);
+  garc_close(archive);
+  garc_stream_destroy(stream);
+}
+
 TEST(TarSparse, TheRealSizeIsWhatTheMemberCapIsAgainst) {
   // A sparse member is a decompression bomb by construction: eight stored
   // bytes and an exabyte of hole. The cap is on what a reader would hand out.

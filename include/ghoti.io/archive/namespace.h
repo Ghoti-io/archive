@@ -57,6 +57,7 @@
 #define GARC_Result GHOTIIO_ARCHIVE(GARC_Result)
 #define GARC_Sink GHOTIIO_ARCHIVE(GARC_Sink)
 #define GARC_Sink_Callbacks GHOTIIO_ARCHIVE(GARC_Sink_Callbacks)
+#define GARC_Sparse_Region GHOTIIO_ARCHIVE(GARC_Sparse_Region)
 #define GARC_Stream GHOTIIO_ARCHIVE(GARC_Stream)
 #define GARC_Stream_Callbacks GHOTIIO_ARCHIVE(GARC_Stream_Callbacks)
 #define GARC_Tar_Variant GHOTIIO_ARCHIVE(GARC_Tar_Variant)

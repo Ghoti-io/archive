@@ -262,6 +262,17 @@ struct GARC_Writer {
    */
   GARC_Buffer records;
 
+  /**
+   * For a sparse tar member: what the stored data is, as a list of
+   * ::GARC_Tar_Sparse_Piece - so many of the caller's bytes, then so many
+   * zeros the writer adds itself. Empty for every other member.
+   */
+  GARC_Buffer sparse_plan;
+  /** Which piece of @ref sparse_plan the next caller byte belongs to. */
+  size_t sparse_piece;
+  /** How many of that piece's caller bytes are still owed. */
+  uint64_t sparse_left;
+
   /** What only the zip writer looks at. Meaningless for any other format. */
   GARC_Zip_Write_State zip;
 
@@ -289,6 +300,24 @@ struct GARC_Writer {
  */
 GARC_Result garc_tar_write_member(
     GARC_Writer * writer, const GARC_Member * member);
+
+/** One piece of a sparse member's stored data: caller bytes, then zeros. */
+typedef struct {
+  uint64_t caller; ///< Bytes the caller writes.
+  uint64_t zeros;  ///< Zeros the writer adds after them.
+} GARC_Tar_Sparse_Piece;
+
+/**
+ * A tar member's data: straight to the sink, or for a sparse member through
+ * its plan, adding the zeros the plan says come after each piece.
+ *
+ * @param writer The writer.
+ * @param data The caller's bytes.
+ * @param size How many; already checked against what is owed.
+ * @return GARC_OK, or the sink's failure.
+ */
+GARC_Result garc_tar_write_data(
+    GARC_Writer * writer, const void * data, size_t size);
 
 /**
  * Finish the current tar member: write whatever padding its size owes.

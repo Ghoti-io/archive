@@ -717,6 +717,80 @@ static int describe(void) {
   return 0;
 }
 
+/** A sparse member to write: a real size, and the runs that hold data. */
+typedef struct {
+  const char * name;
+  uint64_t size;
+  GARC_Sparse_Region runs[4];
+  size_t run_count;
+} Sparse_Spec;
+
+/**
+ * The shapes GNU tar's own fixtures have, and one with a run of one byte.
+ * Byte j of run i is 'a' + (i + j) % 26, which check_writer.py rebuilds from
+ * the run list this prints, so neither side needs the other's hash.
+ */
+static const Sparse_Spec sparse_specs[] = {
+    {"dir/many.bin", 300000, {{0, 10}, {4096, 4096}, {100000, 1}, {299990, 10}}, 4},
+    {"tail-hole.bin", 1048576, {{0, 512}}, 1},
+    {"lead-hole.bin", 204800, {{200000, 4800}}, 1},
+    {"all-hole.bin", 262144, {{0, 0}}, 0},
+    {"close.bin", 10000, {{0, 10}, {100, 10}, {700, 3}, {5000, 3}}, 4},
+};
+
+/** Write sparse.tar into @p directory and print one row per member. */
+static int write_sparse(const char * directory) {
+  char path[4096];
+  snprintf(path, sizeof(path), "%s/sparse.tar", directory);
+  FILE * out = fopen(path, "wb");
+  if (!out) {
+    perror(path);
+    return 1;
+  }
+  GARC_Sink * sink = NULL;
+  GARC_Writer * writer = NULL;
+  int failed = garc_sink_create_memory(&sink) != GARC_OK
+      || garc_writer_create(sink, GARC_FORMAT_TAR, NULL, &writer) != GARC_OK;
+  for (size_t i = 0; !failed && i < COUNT(sparse_specs); ++i) {
+    const Sparse_Spec * spec = &sparse_specs[i];
+    GARC_Member member;
+    memset(&member, 0, sizeof(member));
+    member.name = spec->name;
+    member.name_length = strlen(spec->name);
+    member.type = GARC_MEMBER_FILE;
+    member.size = spec->size;
+    member.mode = 0644;
+    member.mode_valid = 1;
+    member.mtime_seconds = 1000000000;
+    member.mtime_source = GARC_TIME_TAR_OCTAL;
+    member.sparse_regions = spec->runs;
+    member.sparse_region_count = spec->run_count;
+    failed = garc_writer_add(writer, &member) != GARC_OK;
+    printf("sparse.tar\t%s\t%" PRIu64 "\t", spec->name, spec->size);
+    for (size_t r = 0; !failed && r < spec->run_count; ++r) {
+      printf("%s%" PRIu64 ":%" PRIu64, r ? "," : "", spec->runs[r].offset,
+          spec->runs[r].length);
+      for (uint64_t j = 0; !failed && j < spec->runs[r].length; ++j) {
+        const char byte = (char)('a' + (r + j) % 26u);
+        failed = garc_writer_write(writer, &byte, 1) != GARC_OK;
+      }
+    }
+    printf("\n");
+  }
+  failed = failed || garc_writer_finish(writer) != GARC_OK;
+  const void * data = NULL;
+  size_t length = 0;
+  failed = failed || garc_sink_data(sink, &data, &length) != GARC_OK
+      || fwrite(data, 1, length, out) != length;
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  failed = fclose(out) != 0 || failed;
+  if (failed) {
+    fprintf(stderr, "writer_probe: could not write %s\n", path);
+  }
+  return failed;
+}
+
 int main(int argc, char ** argv) {
   if (argc == 3 && strcmp(argv[1], "write") == 0) {
     for (size_t i = 0; i < COUNT(archives); ++i) {
@@ -732,9 +806,13 @@ int main(int argc, char ** argv) {
   if (argc == 2 && strcmp(argv[1], "describe") == 0) {
     return describe();
   }
+  if (argc == 3 && strcmp(argv[1], "write-sparse") == 0) {
+    return write_sparse(argv[2]);
+  }
   fprintf(stderr,
       "usage: %s write <directory>\n"
       "       %s read <path.tar>\n"
-      "       %s describe\n", argv[0], argv[0], argv[0]);
+      "       %s describe\n"
+      "       %s write-sparse <directory>\n", argv[0], argv[0], argv[0], argv[0]);
   return 2;
 }

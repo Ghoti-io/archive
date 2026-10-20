@@ -34,7 +34,8 @@ and 1.0: the holes read back as zeros, `size` is the real size, and
 `GARC_Member.sparse` and `stored_size` say what the archive actually holds. The
 map is checked before a byte is handed out, and the real size is what
 `max_member_bytes` caps, because a sparse member is a decompression bomb by
-construction.
+construction. `garc_fs_extract()` leaves the holes as holes, seeking over each
+block of zeros instead of writing it.
 
 The fixtures are written by GNU tar 1.35 in a pinned container and the
 expectations come from Python 3.13.5's `tarfile` and libarchive 3.7.4's bsdtar,

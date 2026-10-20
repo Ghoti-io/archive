@@ -23,6 +23,11 @@
  *   call must return the same status. Or it may carry on, and then the finished
  *   archive must be byte for byte what an undisturbed run wrote. A format that
  *   keeps state between calls (zip, 7z, shar) may not carry on.
+ * - **A sparse member reads back as its real content.** One byte after the
+ *   members (0 when the input has run out, so a seed from before it reads as
+ *   it did) can make the first file a sparse one: its data is cut into runs
+ *   with holes the input chooses, tar writes it as pax sparse 1.0, and every
+ *   other format must refuse it before writing anything.
  * - **An allocation failure is reported, and frees what it took** - the second
  *   half is LeakSanitizer's, which every fuzz build links.
  *
@@ -153,6 +158,12 @@ struct Spec {
   std::string data;
   uint32_t mode = 0;
   int mode_valid = 0;
+  /** For a sparse member, its runs; @ref data is then the runs' bytes. */
+  std::vector<GARC_Sparse_Region> runs;
+  bool sparse = false;
+  uint64_t real_size = 0;
+  /** The file the runs make, holes as zeros, for the round trip. */
+  std::string content;
 };
 
 GARC_Member member_of(const Spec & spec) {
@@ -167,6 +178,12 @@ GARC_Member member_of(const Spec & spec) {
     member.link_target_length = spec.link.size();
   }
   member.size = spec.data.size();
+  if (spec.sparse) {
+    static const GARC_Sparse_Region none = {0, 0};
+    member.size = spec.real_size;
+    member.sparse_regions = spec.runs.empty() ? &none : spec.runs.data();
+    member.sparse_region_count = spec.runs.size();
+  }
   member.mode = spec.mode;
   member.mode_valid = spec.mode_valid;
   member.mtime_seconds = 1000000000;
@@ -380,6 +397,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     spec.mode = (static_cast<uint32_t>(shape) << 2) & 0777u;
     specs.push_back(spec);
   }
+  const uint8_t holes = carver.byte();
+  for (Spec & spec : specs) {
+    if (!(holes & 1u) || spec.type != GARC_MEMBER_FILE) {
+      continue;
+    }
+    // Cut the data into up to four runs, each after a hole the input sizes -
+    // up to 64 KiB, so the padding and merging of runs both happen.
+    const size_t pieces = ((holes >> 1) & 3u) + 1u;
+    uint64_t at = 0;
+    size_t used = 0;
+    for (size_t p = 0; p < pieces; ++p) {
+      at += static_cast<uint64_t>(carver.byte()) * 257u;
+      const size_t length = p + 1u == pieces
+          ? spec.data.size() - used : (spec.data.size() - used) / 2u;
+      spec.runs.push_back({at, static_cast<uint64_t>(length)});
+      at += length;
+      used += length;
+    }
+    spec.real_size = at + static_cast<uint64_t>(carver.byte()) * 131u;
+    spec.content.assign(static_cast<size_t>(spec.real_size), '\0');
+    used = 0;
+    for (const GARC_Sparse_Region & run : spec.runs) {
+      spec.content.replace(static_cast<size_t>(run.offset),
+          static_cast<size_t>(run.length), spec.data, used,
+          static_cast<size_t>(run.length));
+      used += static_cast<size_t>(run.length);
+    }
+    spec.sparse = true;
+    break;
+  }
 
   // The undisturbed run is the reference for everything below.
   const Run whole = write_all(format, options, specs, patchable,
@@ -425,7 +472,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         REQUIRE(name == spec.name, "a name changed in the round trip");
         REQUIRE(got.type == spec.type, "a type changed in the round trip");
         if (spec.type == GARC_MEMBER_FILE) {
-          REQUIRE(got.data == spec.data, "data changed in the round trip");
+          REQUIRE(got.data == (spec.sparse ? spec.content : spec.data),
+              "data changed in the round trip");
         }
         if (spec.type == GARC_MEMBER_SYMLINK) {
           REQUIRE(got.link == spec.link
