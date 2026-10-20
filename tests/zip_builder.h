@@ -469,6 +469,70 @@ private:
   size_t break_index_ = 0;
 };
 
+/**
+ * A single-disk zip turned into a split one, cut at @p cuts.
+ *
+ * What a split writer does: each disk's offsets count from that disk's start,
+ * so every central entry gets the disk its local header starts on and an
+ * offset within it, and the end record says which disk it is on, which disk
+ * the directory starts on and where, and how many entries are on its disk.
+ */
+inline std::vector<std::vector<uint8_t>> split_zip(
+    const std::vector<uint8_t> & whole, const std::vector<size_t> & cuts) {
+  const auto le16 = [&](size_t at) {
+    return static_cast<uint32_t>(whole[at] | (whole[at + 1] << 8));
+  };
+  const auto le32 = [&](size_t at) {
+    return le16(at) | (le16(at + 2) << 16);
+  };
+  std::vector<uint8_t> bytes = whole;
+  const auto put16 = [&](size_t at, uint32_t v) {
+    bytes[at] = static_cast<uint8_t>(v);
+    bytes[at + 1] = static_cast<uint8_t>(v >> 8);
+  };
+  const auto put32 = [&](size_t at, uint32_t v) {
+    put16(at, v & 0xffffu);
+    put16(at + 2, v >> 16);
+  };
+  const auto disk_of = [&](size_t offset) {
+    size_t disk = 0;
+    while (disk < cuts.size() && cuts[disk] <= offset) {
+      ++disk;
+    }
+    return disk;
+  };
+  const auto start_of = [&](size_t disk) {
+    return disk ? cuts[disk - 1] : size_t(0);
+  };
+  const size_t eocd = whole.size() - 22u;
+  const size_t count = le16(eocd + 10);
+  const size_t central = le32(eocd + 16);
+  const size_t last = cuts.size();
+  size_t at = central;
+  size_t on_last = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const size_t local = le32(at + 42);
+    const size_t disk = disk_of(local);
+    put16(at + 34, static_cast<uint32_t>(disk));
+    put32(at + 42, static_cast<uint32_t>(local - start_of(disk)));
+    on_last += disk_of(at) == last ? 1u : 0u;
+    at += 46u + le16(at + 28) + le16(at + 30) + le16(at + 32);
+  }
+  put16(eocd + 4, static_cast<uint32_t>(last));
+  put16(eocd + 6, static_cast<uint32_t>(disk_of(central)));
+  put16(eocd + 8, static_cast<uint32_t>(on_last));
+  put32(eocd + 16, static_cast<uint32_t>(central - start_of(disk_of(central))));
+  std::vector<std::vector<uint8_t>> parts;
+  size_t from = 0;
+  for (size_t cut : cuts) {
+    parts.emplace_back(bytes.begin() + (std::ptrdiff_t)from,
+        bytes.begin() + (std::ptrdiff_t)cut);
+    from = cut;
+  }
+  parts.emplace_back(bytes.begin() + (std::ptrdiff_t)from, bytes.end());
+  return parts;
+}
+
 } // namespace garctest
 
 #endif // GHOTI_IO_GARC_TEST_ZIP_BUILDER_H

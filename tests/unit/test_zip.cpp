@@ -44,6 +44,7 @@ using garctest::ZipManifestRow;
 using garctest::ZipNameRow;
 using garctest::ZipOpeningRow;
 using garctest::read_fixture;
+using garctest::split_zip;
 using garctest::zip_decrypted_load;
 using garctest::zip_manifest_load;
 using garctest::zip_names_load;
@@ -2024,6 +2025,88 @@ TEST(Zip, AnEmptyNameIsAnEmptyStringOnBothPaths) {
     garc_close(archive);
     garc_stream_destroy(stream);
   }
+}
+
+/** Walk @p parts through a concatenation; the names and data, or a status. */
+GARC_Result walk_parts(const std::vector<std::vector<uint8_t>> & parts,
+    std::vector<std::pair<std::string, std::string>> * out) {
+  std::vector<GARC_Stream *> streams;
+  for (const auto & part : parts) {
+    GARC_Stream * stream = nullptr;
+    EXPECT_EQ(GARC_OK, garc_stream_create_memory(part.data(), part.size(), &stream));
+    streams.push_back(stream);
+  }
+  GARC_Stream * whole = nullptr;
+  GARC_Result result
+      = garc_stream_create_concat(streams.data(), streams.size(), &whole);
+  GARC_Archive * archive = nullptr;
+  if (result == GARC_OK) {
+    result = garc_open(whole, nullptr, &archive);
+  }
+  const GARC_Member * member = nullptr;
+  while (result == GARC_OK && (result = garc_next(archive, &member)) == GARC_OK) {
+    GARC_Result status = GARC_OK;
+    const std::string data = read_checked(archive, &status);
+    if (status != GARC_OK) {
+      result = status;
+      break;
+    }
+    out->emplace_back(member_name(member), data);
+  }
+  garc_close(archive);
+  garc_stream_destroy(whole);
+  for (GARC_Stream * stream : streams) {
+    garc_stream_destroy(stream);
+  }
+  return result == GARC_END ? GARC_OK : result;
+}
+
+TEST(Zip, ASplitZipIsReadThroughTheConcatenationOfItsParts) {
+  // Cut through members, headers and the central directory alike: a split
+  // writer cuts at a size, not at a boundary, and the concatenation is what
+  // puts the bytes back in a row.
+  const std::vector<std::pair<std::string, std::string>> files = {
+      {"one.txt", patterned(5000, 3)}, {"two.txt", patterned(7000, 5)},
+      {"dir/three.txt", "three\n"}};
+  // Stored, so the archive is as long as the data and every cut has bytes to
+  // land in.
+  const std::vector<uint8_t> whole = descriptor_zip(GARC_ZIP_METHOD_STORED, files, true);
+  ASSERT_GT(whole.size(), 12000u);
+  std::vector<std::pair<std::string, std::string>> want;
+  {
+    const std::vector<std::vector<uint8_t>> one = {whole};
+    ASSERT_EQ(GARC_OK, walk_parts(one, &want));
+  }
+  ASSERT_EQ(want.size(), files.size());
+  const size_t central = std::string(whole.begin(), whole.end())
+                             .find(std::string("PK\x01\x02", 4));
+  ASSERT_NE(central, std::string::npos);
+  const std::vector<std::vector<size_t>> cut_sets = {
+      {1000}, {100, 2000, 4100}, {central + 10}, {whole.size() - 30},
+      {200, 400, 600, 800, 1000, 1200}};
+  for (const auto & cuts : cut_sets) {
+    SCOPED_TRACE(cuts.size());
+    const auto parts = split_zip(whole, cuts);
+    std::vector<std::pair<std::string, std::string>> got;
+    EXPECT_EQ(GARC_OK, walk_parts(parts, &got));
+    EXPECT_TRUE(got == want);
+  }
+}
+
+TEST(Zip, ASplitZipWithoutAllItsPartsIsRefusedByName) {
+  const std::vector<uint8_t> whole = descriptor_zip(GARC_ZIP_METHOD_STORED,
+      {{"one.txt", patterned(5000, 3)}, {"two.txt", "two\n"}}, true);
+  ASSERT_GT(whole.size(), 5000u);
+  const auto parts = split_zip(whole, {2000, 4000});
+  std::vector<std::pair<std::string, std::string>> got;
+  // The last disk alone, which is what opening only the .zip of a split set was.
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED, walk_parts({parts.back()}, &got));
+  // Two of the three: the end record says three disks.
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED, walk_parts({parts[1], parts[2]}, &got));
+  // All three, out of order: the end record is not on the last disk, or the
+  // offsets land on no header.
+  got.clear();
+  EXPECT_NE(GARC_OK, walk_parts({parts[2], parts[0], parts[1]}, &got));
 }
 
 TEST(Zip, AZipBehindAStubIsNotFoundOnAPipe) {

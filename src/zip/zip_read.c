@@ -198,6 +198,31 @@ GARC_Result garc_zip_locate_eocd(
 }
 
 /**
+ * Where disk @p disk starts in the stream.
+ *
+ * For a split zip read through a concatenation of its parts (see
+ * garc_stream_create_concat()), the start of that part; offsets in a split zip
+ * count from the start of the part they are in. For any other zip there is one
+ * disk, and it starts at @p origin, which is where a stub in front ends.
+ */
+static GARC_Result zip_disk_base(const GARC_Archive * archive, uint32_t disk,
+    uint64_t origin, uint64_t * out_base) {
+  const GARC_Zip_State * zip = &archive->zip;
+  if (!zip->multi_disk) {
+    if (disk != 0u) {
+      // A member on another disk, in an archive whose end record said one.
+      return GARC_ERR_UNSUPPORTED;
+    }
+    *out_base = origin;
+    return GARC_OK;
+  }
+  if (disk >= zip->disk_count) {
+    return GARC_ERR_CORRUPT;
+  }
+  return garc_stream_part_offset(archive->stream, disk, out_base);
+}
+
+/**
  * Read the zip64 end record behind the locator, and take the real counts.
  *
  * The locator says where the record is, in the archive's own offsets - which are
@@ -213,12 +238,14 @@ GARC_Result garc_zip_locate_eocd(
  * @param out_entries Receives the entry count.
  * @param out_size Receives the central directory's size.
  * @param out_central Receives the central directory's declared offset.
+ * @param out_central_disk Receives the disk the central directory starts on.
  * @return ::GARC_OK, ::GARC_ERR_CORRUPT, ::GARC_ERR_UNSUPPORTED for a
- *   multi-disk archive, or a stream failure.
+ *   multi-disk archive whose other parts this stream does not have, or a
+ *   stream failure.
  */
 static GARC_Result zip_read_zip64(GARC_Archive * archive,
     uint64_t locator_offset, uint64_t * out_offset, uint64_t * out_entries,
-    uint64_t * out_size, uint64_t * out_central) {
+    uint64_t * out_size, uint64_t * out_central, uint32_t * out_central_disk) {
   uint8_t locator[GARC_ZIP_ZIP64_LOCATOR_SIZE];
   GARC_Result result
       = zip_read_at(archive, locator_offset, locator, sizeof(locator));
@@ -229,14 +256,29 @@ static GARC_Result zip_read_zip64(GARC_Archive * archive,
   const uint32_t locator_disk = garc_zip_le32(locator + 4u);
   const uint64_t declared = garc_zip_le64(locator + 8u);
   const uint32_t total_disks = garc_zip_le32(locator + 16u);
-  if (locator_disk != 0u || total_disks > 1u) {
-    return GARC_ERR_UNSUPPORTED;
+  const GARC_Zip_State * zip = &archive->zip;
+  uint64_t locator_base = archive->start_offset;
+  if (!zip->multi_disk) {
+    if (locator_disk != 0u || total_disks > 1u) {
+      return GARC_ERR_UNSUPPORTED;
+    }
+  }
+  else {
+    // A split archive: the locator names the disk its record is on, and the
+    // number of disks, which must be the parts this stream was made of.
+    if (total_disks != zip->disk_count) {
+      return GARC_ERR_UNSUPPORTED;
+    }
+    result = zip_disk_base(archive, locator_disk, 0u, &locator_base);
+    if (result != GARC_OK) {
+      return result;
+    }
   }
 
   uint8_t record[GARC_ZIP_ZIP64_EOCD_SIZE];
   uint64_t candidates[2];
   size_t candidate_count = 0;
-  candidates[candidate_count++] = archive->start_offset + declared;
+  candidates[candidate_count++] = locator_base + declared;
   if (locator_offset >= archive->start_offset + GARC_ZIP_ZIP64_EOCD_SIZE) {
     candidates[candidate_count++]
         = locator_offset - GARC_ZIP_ZIP64_EOCD_SIZE;
@@ -267,9 +309,16 @@ static GARC_Result zip_read_zip64(GARC_Archive * archive,
     const uint32_t central_disk = garc_zip_le32(record + 20u);
     const uint64_t entries_here = garc_zip_le64(record + 24u);
     const uint64_t entries_total = garc_zip_le64(record + 32u);
-    if (disk != 0u || central_disk != 0u || entries_here != entries_total) {
+    if (!zip->multi_disk
+        && (disk != 0u || central_disk != 0u || entries_here != entries_total)) {
       return GARC_ERR_UNSUPPORTED;
     }
+    if (zip->multi_disk
+        && (disk + 1u != zip->disk_count || central_disk > disk
+            || entries_here > entries_total)) {
+      return GARC_ERR_CORRUPT;
+    }
+    *out_central_disk = central_disk;
     *out_offset = candidates[i];
     *out_entries = entries_total;
     *out_size = garc_zip_le64(record + 40u);
@@ -345,12 +394,34 @@ GARC_Result garc_zip_open(GARC_Archive * archive, uint64_t eocd_offset) {
   const uint16_t comment_length = garc_zip_le16(eocd + 20u);
   uint64_t entries = entries_total;
 
-  // **A multi-disk archive is refused by name.** Every field above is per-disk,
-  // the members are split across files this stream does not have, and a reader
-  // that ignored the disk numbers would report the last disk's members as the
-  // whole archive - a wrong answer rather than a failure.
+  // **A multi-disk archive needs every disk.** Every field above is per-disk,
+  // and a reader that ignored the disk numbers would report the last disk's
+  // members as the whole archive - a wrong answer rather than a failure. So a
+  // split zip is read only through a concatenation of all of its parts, in
+  // order (garc_stream_create_concat(), or garc_fs_open() on the last part),
+  // and refused by name on anything else.
+  uint32_t central_disk32 = central_disk;
+  zip->multi_disk = 0;
+  zip->disk_count = 1u;
   if (disk != 0u || central_disk != 0u || entries_here != entries_total) {
-    return GARC_ERR_UNSUPPORTED;
+    const size_t parts = garc_stream_part_count(archive->stream);
+    if (parts < 2u || parts > (size_t)UINT32_MAX
+        || (disk != ZIP_MARKER16 && (size_t)disk + 1u != parts)
+        || (central_disk != ZIP_MARKER16 && central_disk > disk)
+        || (entries_here != ZIP_MARKER16 && entries_total != ZIP_MARKER16
+            && entries_here > entries_total)) {
+      return GARC_ERR_UNSUPPORTED;
+    }
+    uint64_t last = 0;
+    result = garc_stream_part_offset(archive->stream, parts - 1u, &last);
+    if (result != GARC_OK) {
+      return result == GARC_ERR_NOT_SEEKABLE ? GARC_ERR_UNSUPPORTED : result;
+    }
+    if (eocd_offset < last) {
+      return GARC_ERR_CORRUPT; // the end record is on the last disk or nowhere
+    }
+    zip->multi_disk = 1;
+    zip->disk_count = (uint32_t)parts;
   }
 
   zip->eocd_offset = eocd_offset;
@@ -375,7 +446,7 @@ GARC_Result garc_zip_open(GARC_Archive * archive, uint64_t eocd_offset) {
     if (memcmp(maybe, ZIP_SIG_ZIP64_LOCATOR, 4) == 0) {
       uint64_t record_offset = 0;
       result = zip_read_zip64(archive, locator_offset, &record_offset, &entries,
-          &central_size, &central_declared);
+          &central_size, &central_declared, &central_disk32);
       if (result == GARC_OK) {
         zip->is_zip64 = 1;
         central_end = record_offset;
@@ -400,24 +471,45 @@ GARC_Result garc_zip_open(GARC_Archive * archive, uint64_t eocd_offset) {
     return GARC_ERR_CORRUPT;
   }
 
-  if (central_size > central_end - archive->start_offset) {
-    return GARC_ERR_CORRUPT;
+  if (zip->multi_disk) {
+    // Each disk's offsets count from that disk's start, so nothing is
+    // discovered: the directory is where its disk and offset say, and it must
+    // run exactly to the end records.
+    uint64_t base = 0;
+    if (central_disk32 == ZIP_MARKER16 && !zip->is_zip64) {
+      return GARC_ERR_CORRUPT;
+    }
+    result = zip_disk_base(archive, central_disk32, 0u, &base);
+    if (result != GARC_OK) {
+      return result;
+    }
+    if (central_declared > central_end || base > central_end - central_declared
+        || central_end - (base + central_declared) != central_size) {
+      return GARC_ERR_CORRUPT;
+    }
+    zip->origin = archive->start_offset;
+    zip->central_offset = base + central_declared;
   }
-  const uint64_t central_actual = central_end - central_size;
-  if (central_actual < archive->start_offset + central_declared) {
-    // The directory claims to start further into the archive than it can, which
-    // is what a truncated or spliced file looks like from here.
-    return GARC_ERR_CORRUPT;
-  }
+  else {
+    if (central_size > central_end - archive->start_offset) {
+      return GARC_ERR_CORRUPT;
+    }
+    const uint64_t central_actual = central_end - central_size;
+    if (central_actual < archive->start_offset + central_declared) {
+      // The directory claims to start further into the archive than it can,
+      // which is what a truncated or spliced file looks like from here.
+      return GARC_ERR_CORRUPT;
+    }
 
-  // **The base offset is discovered, not declared.** The directory says where it
-  // is; where it actually turned out to be is `central_actual`; the difference is
-  // how many bytes sit in front of the archive without being counted - a
-  // self-extracting stub, usually. Every offset in the file is then short by
-  // this much, which is why it is applied to the local header offsets rather than
-  // merely reported.
-  zip->origin = central_actual - central_declared;
-  zip->central_offset = central_actual;
+    // **The base offset is discovered, not declared.** The directory says where
+    // it is; where it actually turned out to be is `central_actual`; the
+    // difference is how many bytes sit in front of the archive without being
+    // counted - a self-extracting stub, usually. Every offset in the file is
+    // then short by this much, which is why it is applied to the local header
+    // offsets rather than merely reported.
+    zip->origin = central_actual - central_declared;
+    zip->central_offset = central_actual;
+  }
   zip->central_size = central_size;
   zip->declared_members = entries;
 
@@ -472,6 +564,13 @@ typedef struct {
   uint8_t aes_strength;
   int have_aes;               ///< Whether a vendor-AE 0x9901 field was present.
   int have_zip64;             ///< Whether a 0x0001 field was present at all.
+  /**
+   * The four bytes a zip64 field may carry after its offsets: the disk the
+   * member starts on, which a central entry whose 16-bit disk field holds the
+   * marker puts here. Meaningful when @ref have_zip64_disk is set.
+   */
+  uint32_t zip64_disk;
+  int have_zip64_disk;        ///< Whether those four bytes were there.
 } Zip_Extra;
 
 /**
@@ -537,6 +636,10 @@ static GARC_Result zip_parse_extra(const uint8_t * bytes, size_t length,
           *local_offset = garc_zip_le64(value + offset);
           offset += 8u;
           *used_zip64 = 1;
+        }
+        if (offset + 4u <= payload) {
+          out->zip64_disk = garc_zip_le32(value + offset);
+          out->have_zip64_disk = 1;
         }
         break;
       }
@@ -1285,7 +1388,7 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   zip->comment_offset = zip->cursor + GARC_ZIP_CENTRAL_ENTRY_SIZE + name_length
       + extra_length;
 
-  if (disk_start != 0u && disk_start != ZIP_MARKER16) {
+  if (!zip->multi_disk && disk_start != 0u && disk_start != ZIP_MARKER16) {
     // A member on another disk, in an archive whose end record said one disk.
     return GARC_ERR_UNSUPPORTED;
   }
@@ -1370,8 +1473,21 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   }
 
   // Where the member's data is. The offsets in the file count from the archive's
-  // origin, which is where a stub in front of it ends.
-  const uint64_t local_absolute = zip->origin + local_offset;
+  // origin, which is where a stub in front of it ends - or, in a split zip,
+  // from the start of the disk the member starts on.
+  uint32_t member_disk = disk_start;
+  if (disk_start == ZIP_MARKER16) {
+    member_disk = extra.have_zip64_disk ? extra.zip64_disk : 0u;
+  }
+  uint64_t disk_base = 0;
+  result = zip_disk_base(archive, member_disk, zip->origin, &disk_base);
+  if (result != GARC_OK) {
+    return result;
+  }
+  if (local_offset > UINT64_MAX - disk_base) {
+    return GARC_ERR_CORRUPT;
+  }
+  const uint64_t local_absolute = disk_base + local_offset;
   if (local_absolute < archive->start_offset
       || local_absolute >= zip->central_offset) {
     // A local header outside the archive, or inside the central directory. Both

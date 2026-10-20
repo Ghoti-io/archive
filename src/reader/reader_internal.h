@@ -244,6 +244,13 @@ typedef struct {
    * where it turned out to be. ::garc_zip_base_offset() reports the difference.
    */
   uint64_t origin;
+  /**
+   * Non-zero for a split zip read through a concatenation of its parts, where
+   * an offset counts from the start of the part (the "disk") it is on; see
+   * garc_stream_part_offset(). @ref disk_count is how many parts there are.
+   */
+  int multi_disk;
+  uint32_t disk_count; ///< See @ref multi_disk.
   /** Absolute stream offset of the first central directory entry. */
   uint64_t central_offset;
   /** How many bytes of central directory the end record declared. */

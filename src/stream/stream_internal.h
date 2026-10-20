@@ -63,7 +63,25 @@ struct GARC_Stream {
    * owns without knowing what kind of stream it is.
    */
   void (*owned_destroy)(GARC_Stream * stream);
+  /**
+   * The parts, when this is a concatenating stream, and NULL otherwise; what
+   * ::garc_stream_part_offset() reads. Owned through @ref owned_destroy.
+   */
+  struct GARC_Stream_Concat * concat;
 };
+
+/** A concatenating stream's state; see stream_concat.c. */
+typedef struct GARC_Stream_Concat GARC_Stream_Concat;
+
+/**
+ * Make a concatenating stream destroy its parts when it is destroyed.
+ *
+ * For the fs layer, which opened the parts itself and has nobody to hand them
+ * to. A stream that is not a concatenation is left alone.
+ *
+ * @param stream The concatenating stream.
+ */
+void garc_stream_concat_own_parts(GARC_Stream * stream);
 
 /**
  * Create a stream over the next @p length bytes of another stream.

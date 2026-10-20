@@ -35,6 +35,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "fs/fs_internal.h"
@@ -475,6 +476,178 @@ static const char * fs_sniff(
   return NULL;
 }
 
+////////////////////////////////////////////////////////////////////////
+// Split archives
+////////////////////////////////////////////////////////////////////////
+
+/** At most this many parts, which is what zip's 16-bit disk field allows. */
+#define FS_MAX_VOLUMES 65535u
+
+static void fs_free_paths(
+    const GARC_Allocator * allocator, char ** paths, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    gcu_allocator_free(allocator, paths[i]);
+  }
+  gcu_allocator_free(allocator, paths);
+}
+
+/** @p stem followed by @p suffix, in a new string. */
+static char * fs_with_suffix(
+    const GARC_Allocator * allocator, const char * stem, size_t stem_length,
+    const char * suffix) {
+  const size_t suffix_length = strlen(suffix);
+  char * out = (char *)gcu_allocator_malloc(
+      allocator, stem_length + suffix_length + 1u);
+  if (out) {
+    memcpy(out, stem, stem_length);
+    memcpy(out + stem_length, suffix, suffix_length + 1u);
+  }
+  return out;
+}
+
+/**
+ * The files of the split archive @p path belongs to, in order, or none.
+ *
+ * Two layouts, both named by convention rather than by anything inside them:
+ *
+ * - `name.001`, `name.002`, ... - what 7-Zip's `-v` and `split -d -a 3` write,
+ *   whatever the archive is. Given the first part, every consecutive part that
+ *   exists is taken.
+ * - `name.z01`, `name.z02`, ..., then `name.zip` - a split zip, as Info-ZIP's
+ *   `zip -s` and WinZip write it. Given the `.zip` (which holds the end record)
+ *   or the `.z01`, when `name.z01` exists.
+ *
+ * Sets `*out_count` to 0 when @p path is not part of either.
+ */
+static GARC_Result fs_volume_paths(const GARC_Allocator * allocator,
+    const char * path, char *** out_paths, size_t * out_count) {
+  *out_paths = NULL;
+  *out_count = 0;
+  const size_t length = strlen(path);
+  const bool numbered = fs_ends_with(path, ".001");
+  const bool zip = fs_ends_with(path, ".zip") || fs_ends_with(path, ".z01");
+  if (!numbered && !zip) {
+    return GARC_OK;
+  }
+  const size_t stem = length - 4u;
+  // The extension's case, so that NAME.ZIP looks for NAME.Z01.
+  const char z = path[stem + 1u];
+  char suffix[16];
+  if (zip) {
+    snprintf(suffix, sizeof(suffix), ".%c01", z);
+    char * first = fs_with_suffix(allocator, path, stem, suffix);
+    if (!first) {
+      return GARC_ERR_OOM;
+    }
+    const bool split = gcu_file_exists(first);
+    gcu_allocator_free(allocator, first);
+    if (!split) {
+      return GARC_OK;
+    }
+  }
+  char ** paths = NULL;
+  size_t count = 0;
+  size_t capacity = 0;
+  for (unsigned n = 1; n <= FS_MAX_VOLUMES; ++n) {
+    if (numbered) {
+      snprintf(suffix, sizeof(suffix), n < 1000u ? ".%03u" : ".%u", n);
+    }
+    else {
+      snprintf(suffix, sizeof(suffix), n < 100u ? ".%c%02u" : ".%c%u", z, n);
+    }
+    char * part = fs_with_suffix(allocator, path, stem, suffix);
+    if (!part) {
+      fs_free_paths(allocator, paths, count);
+      return GARC_ERR_OOM;
+    }
+    if (!gcu_file_exists(part)) {
+      gcu_allocator_free(allocator, part);
+      break;
+    }
+    if (count == capacity) {
+      const size_t grown = capacity ? capacity * 2u : 8u;
+      char ** bigger = (char **)gcu_allocator_realloc(
+          allocator, paths, grown * sizeof(*paths));
+      if (!bigger) {
+        gcu_allocator_free(allocator, part);
+        fs_free_paths(allocator, paths, count);
+        return GARC_ERR_OOM;
+      }
+      paths = bigger;
+      capacity = grown;
+    }
+    paths[count++] = part;
+  }
+  if (zip) {
+    // The .zip is the last disk, with the end record.
+    char * last = fs_with_suffix(allocator, path, stem, z == 'Z' ? ".ZIP" : ".zip");
+    if (!last) {
+      fs_free_paths(allocator, paths, count);
+      return GARC_ERR_OOM;
+    }
+    if (count == capacity) {
+      char ** bigger = (char **)gcu_allocator_realloc(
+          allocator, paths, (capacity + 1u) * sizeof(*paths));
+      if (!bigger) {
+        gcu_allocator_free(allocator, last);
+        fs_free_paths(allocator, paths, count);
+        return GARC_ERR_OOM;
+      }
+      paths = bigger;
+    }
+    paths[count++] = last;
+  }
+  *out_paths = paths;
+  *out_count = count;
+  return GARC_OK;
+}
+
+/**
+ * The stream an archive at @p path is read from: the file, or for a split
+ * archive every part in order, through a concatenation that owns them.
+ */
+static GARC_Result fs_open_source(const char * path,
+    const GARC_Allocator * allocator, GARC_Stream ** out_stream) {
+  char ** paths = NULL;
+  size_t count = 0;
+  GARC_Result result = fs_volume_paths(allocator, path, &paths, &count);
+  if (result != GARC_OK) {
+    return result;
+  }
+  if (count < 2u) {
+    fs_free_paths(allocator, paths, count);
+    return garc_fs_stream_open_with_allocator(path, allocator, out_stream);
+  }
+  GARC_Stream ** parts = (GARC_Stream **)gcu_allocator_calloc(
+      allocator, count, sizeof(*parts));
+  if (!parts) {
+    fs_free_paths(allocator, paths, count);
+    return GARC_ERR_OOM;
+  }
+  size_t opened = 0;
+  for (; opened < count && result == GARC_OK; ++opened) {
+    result = garc_fs_stream_open_with_allocator(
+        paths[opened], allocator, &parts[opened]);
+  }
+  GARC_Stream * whole = NULL;
+  if (result == GARC_OK) {
+    result = garc_stream_create_concat_with_allocator(
+        parts, count, allocator, &whole);
+  }
+  if (result == GARC_OK) {
+    garc_stream_concat_own_parts(whole);
+    *out_stream = whole;
+  }
+  else {
+    for (size_t i = 0; i < count; ++i) {
+      garc_stream_destroy(parts[i]);
+    }
+  }
+  gcu_allocator_free(allocator, parts);
+  fs_free_paths(allocator, paths, count);
+  return result;
+}
+
 GARC_Result garc_fs_open_detecting(const char * path,
     const GARC_Limits * limits, gcomp_options_t * options, uint32_t flags,
     const GARC_Allocator * allocator, GARC_Archive ** out_archive,
@@ -482,7 +655,7 @@ GARC_Result garc_fs_open_detecting(const char * path,
   *out_method = NULL;
 
   GARC_Stream * file = NULL;
-  GARC_Result result = garc_fs_stream_open_with_allocator(path, allocator, &file);
+  GARC_Result result = fs_open_source(path, allocator, &file);
   if (result != GARC_OK) {
     return result;
   }

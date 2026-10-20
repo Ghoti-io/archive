@@ -658,6 +658,16 @@ $(ARCPIO_WRITER_PROBE): tools/oracle/arcpio_writer_probe.c \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
 
+# The split-archive probe: it opens by path, through garc_fs_open(), because
+# finding a split set's other parts is the fs layer's job and is what is tested.
+VOLUME_PROBE := $(APP_DIR)/oracle/volume_probe$(EXE_EXTENSION)
+
+$(VOLUME_PROBE): tools/oracle/volume_probe.c \
+		$(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Probe: volume_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(ARCHIVELIBRARY) $(DEP_LIBS)
+
 ####################################################################
 # Commands
 ####################################################################
@@ -666,7 +676,7 @@ $(ARCPIO_WRITER_PROBE): tools/oracle/arcpio_writer_probe.c \
 .PHONY: clean cloc docs docs-pdf check-docs examples coverage check-symbols check-aliasing
 .PHONY: check-corpus-hashes check-corpus corpus oracle-build oracle-version
 .PHONY: zip-corpus check-zip-corpus check-zip-oracle sevenz-corpus check-sevenz-corpus arcpio-corpus check-arcpio-corpus
-.PHONY: check-oracle check-writer check-zip-writer check-sevenz-writer check-arcpio-writer
+.PHONY: check-oracle check-writer check-zip-writer check-sevenz-writer check-arcpio-writer check-volumes
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -1411,6 +1421,15 @@ check-sevenz-writer: ## Fail if the references disagree with the 7z the writer p
 check-sevenz-writer: $(SEVENZ_WRITER_PROBE)
 	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
 		python3 $(ORACLE)/check_sevenz_writer.py --probe $(SEVENZ_WRITER_PROBE)
+
+check-volumes: ## Fail if a split zip or a numbered split 7z from the references does not read
+# Info-ZIP's zip -s (and -fz -s, for zip64's disk fields) and 7-Zip's -v write
+# the split sets in the pinned image, and volume_probe opens each through
+# garc_fs_open() and compares every file with the one that went in. Links the
+# library under test, so it is not in TEST_GATES.
+check-volumes: $(VOLUME_PROBE)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+		python3 $(ORACLE)/check_volumes.py --probe $(VOLUME_PROBE)
 
 check-arcpio-writer: ## Fail if the references disagree with the ar, cpio and shar the writers produce
 check-arcpio-writer: $(ARCPIO_WRITER_PROBE)

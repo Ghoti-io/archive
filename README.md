@@ -185,6 +185,17 @@ its marker); stored members with a descriptor are refused there, because nothing
 marks where stored data ends, and so for now are bzip2 and xz, whose decoders in
 compress read on past the end of the first stream.
 
+**Split archives are read whole.** `garc_stream_create_concat()` makes one stream
+of several, and a split zip read through it has every disk field honoured,
+zip64's included, because its offsets count from the start of the part they are
+in. `garc_fs_open()` finds the parts by name: `name.001`, `name.002`, ... for
+7-Zip's `-v` or `split -d -a 3`, and `name.z01` ... `name.zip` for Info-ZIP's
+`zip -s`. A 7z behind a self-extracting stub - an executable with the archive
+appended, as `7z a -sfx` writes - is found by scanning the first 8 MiB of a file
+that starts like an executable, and `garc_base_offset()` says how long the stub
+was. `make check-volumes` reads split sets the pinned `zip` and `7z` wrote, and
+`check-sevenz-writer` reads an archive behind the image's real `7zCon.sfx`.
+
 The zip fixtures are 23 archives from four writers - Info-ZIP's `zip`,
 libarchive's `bsdtar`, 7-Zip and Python's `zipfile` - with what `zipfile` and
 `bsdtar` read out of them and what all four references *do* when handed one,

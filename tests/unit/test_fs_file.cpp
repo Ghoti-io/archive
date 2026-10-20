@@ -30,6 +30,7 @@
 #include <ghoti.io/cutil/file.h>
 
 #include "failing_allocator.h"
+#include "zip_builder.h"
 
 using garctest::FailingAllocator;
 
@@ -560,6 +561,89 @@ TEST_F(FsFile, ExtractAndPackNameAMissingRoot) {
 ////////////////////////////////////////////////////////////////////////
 // Allocation failure
 ////////////////////////////////////////////////////////////////////////
+
+/** The bytes of an archive of @p entries in @p format, in memory. */
+std::vector<uint8_t> archive_bytes(GARC_Format format, const std::vector<Entry> & entries) {
+  GARC_Sink * memory = nullptr;
+  EXPECT_EQ(GARC_OK, garc_sink_create_memory(&memory));
+  EXPECT_EQ(GARC_OK, write_archive(memory, format, entries));
+  const void * data = nullptr;
+  size_t length = 0;
+  EXPECT_EQ(GARC_OK, garc_sink_data(memory, &data, &length));
+  std::vector<uint8_t> out(static_cast<const uint8_t *>(data),
+      static_cast<const uint8_t *>(data) + length);
+  garc_sink_destroy(memory);
+  return out;
+}
+
+TEST_F(FsFile, ASplitZipOpensFromItsZipOrItsFirstPart) {
+  // As Info-ZIP's zip -s writes it: name.z01, name.z02, then name.zip, which
+  // holds the end record. Opened from either end, every part is read.
+  const std::vector<uint8_t> whole = archive_bytes(GARC_FORMAT_ZIP, sample());
+  ASSERT_GT(whole.size(), 30000u);
+  const auto parts = garctest::split_zip(whole, {10000, 20000});
+  const char * names[] = {"set.z01", "set.z02", "set.zip"};
+  for (size_t i = 0; i < 3; ++i) {
+    write_file(at(names[i]), std::string(parts[i].begin(), parts[i].end()));
+  }
+  for (const char * start : {"set.zip", "set.z01"}) {
+    SCOPED_TRACE(start);
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(GARC_OK, garc_fs_open(at(start).c_str(), nullptr, nullptr, 0, &archive));
+    EXPECT_EQ(read_all(archive), sample());
+    garc_close(archive);
+  }
+  // Every allocation on the way - the part names, the parts, the concatenation
+  // - can fail, and frees what it took; the sweep has to reach the success.
+  bool reached_ok = false;
+  for (size_t fail_at = 0; fail_at < 200 && !reached_ok; ++fail_at) {
+    FailingAllocator allocator(fail_at);
+    GARC_Archive * archive = nullptr;
+    const GARC_Result result = garc_fs_open_with_allocator(
+        at("set.zip").c_str(), nullptr, nullptr, 0, allocator.get(), &archive);
+    if (result == GARC_OK) {
+      reached_ok = true;
+      garc_close(archive);
+    }
+    else {
+      EXPECT_EQ(result, GARC_ERR_OOM) << fail_at;
+    }
+    allocator.stop_failing();
+    EXPECT_EQ(allocator.live(), 0u) << fail_at;
+  }
+  EXPECT_TRUE(reached_ok);
+  // A middle part missing: the end record says three disks, and two are here.
+  gcu_file_remove(at("set.z02").c_str());
+  GARC_Archive * archive = nullptr;
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED,
+      garc_fs_open(at("set.zip").c_str(), nullptr, nullptr, 0, &archive));
+}
+
+TEST_F(FsFile, ANumberedSplitOpensFromItsFirstPartWhateverItHolds) {
+  // 7-Zip's -v writes name.7z.001, .002, ...; split -d -a 3 writes the same
+  // for anything. The parts are the bytes in order, so any format reads.
+  for (GARC_Format format : {GARC_FORMAT_SEVENZ, GARC_FORMAT_TAR}) {
+    SCOPED_TRACE(garc_format_string(format));
+    const std::vector<uint8_t> whole = archive_bytes(format, sample());
+    const size_t third = whole.size() / 3u + 1u;
+    for (size_t i = 0; i * third < whole.size(); ++i) {
+      const size_t end = (i + 1) * third < whole.size() ? (i + 1) * third : whole.size();
+      char name[32];
+      std::snprintf(name, sizeof(name), "vol.bin.%03zu", i + 1);
+      write_file(at(name), std::string(whole.begin() + (std::ptrdiff_t)(i * third),
+                               whole.begin() + (std::ptrdiff_t)end));
+    }
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(GARC_OK,
+        garc_fs_open(at("vol.bin.001").c_str(), nullptr, nullptr, 0, &archive));
+    EXPECT_EQ(garc_format(archive), format);
+    EXPECT_EQ(read_all(archive), sample());
+    garc_close(archive);
+    for (const std::string & name : names()) {
+      gcu_file_remove(at(name).c_str());
+    }
+  }
+}
 
 TEST_F(FsFile, EveryAllocationFailureIsReportedAndFreesWhatItTook) {
   GARC_Sink * sink = nullptr;

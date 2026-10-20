@@ -69,6 +69,14 @@
  * otherwise is in the directory. On a seekable stream none of this applies:
  * the directory is read first, as above.
  *
+ * **A split zip is read through all of its parts.** Its offsets count from the
+ * start of the part ("disk") they are in, so it is read from a concatenation of
+ * every part in order - ::garc_stream_create_concat(), or ::garc_fs_open() on
+ * its `.zip` - and the disk fields of every entry and end record are honoured,
+ * zip64's included. Any other stream holding a part of one is
+ * ::GARC_ERR_UNSUPPORTED, as is a set whose end record names more disks than
+ * the stream has parts.
+ *
  * **A zip must end where the stream ends.** The scan for the end record starts
  * at the end and goes back at most 65,557 bytes, which is the largest a record
  * plus its comment can be. Bytes *before* the archive are fine and common - a

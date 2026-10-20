@@ -287,6 +287,65 @@ GARC_API int garc_stream_is_seekable(const GARC_Stream * stream);
 GARC_API GARC_Result garc_stream_seek(GARC_Stream * stream, uint64_t offset);
 
 /**
+ * @brief One stream made of several, end to end.
+ *
+ * For an archive split into files: a split 7z's `.001`, `.002`, ... in order,
+ * or a split zip's `.z01`, `.z02`, ..., `.zip`. The parts are **borrowed** and
+ * must outlive the stream. When every part can seek and knows its size, the
+ * whole can seek, knows its size, and starts at the first part's start
+ * wherever that part had been left; each part is sought to its start as the
+ * read reaches it, and a part that ends before its size is ::GARC_ERR_IO,
+ * because every offset after it would be wrong. Otherwise the parts are read
+ * in order from wherever each one is, once, and the whole cannot seek.
+ *
+ * @param parts The parts, in order. Not NULL, and none of them NULL.
+ * @param count How many; at least one.
+ * @param out_stream Receives the stream on ::GARC_OK.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID, ::GARC_ERR_OOM, or the first part's
+ *   seek failure.
+ */
+GARC_API GARC_Result garc_stream_create_concat(GARC_Stream * const * parts,
+    size_t count, GARC_Stream ** out_stream);
+
+/**
+ * @brief ::garc_stream_create_concat() with an explicit allocator.
+ *
+ * @param parts The parts, in order.
+ * @param count How many.
+ * @param allocator For the stream and its state. NULL uses the default.
+ * @param out_stream Receives the stream on ::GARC_OK.
+ * @return As ::garc_stream_create_concat().
+ */
+GARC_API GARC_Result garc_stream_create_concat_with_allocator(
+    GARC_Stream * const * parts, size_t count, const GARC_Allocator * allocator,
+    GARC_Stream ** out_stream);
+
+/**
+ * @brief How many parts a stream is made of: a concatenating stream's count,
+ * and 1 for any other stream.
+ *
+ * @param stream The stream. NULL returns 0.
+ * @return The count.
+ */
+GARC_API size_t garc_stream_part_count(const GARC_Stream * stream);
+
+/**
+ * @brief Where part @p index starts in the whole.
+ *
+ * What a split zip's reader needs: its offsets count from the start of the
+ * part they are in. Any stream that is not a concatenation is one part at 0.
+ *
+ * @param stream The stream.
+ * @param index Which part, from 0.
+ * @param out_offset Receives the offset on ::GARC_OK.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID for a NULL argument or an index past
+ *   the last part, or ::GARC_ERR_NOT_SEEKABLE for a concatenation whose parts
+ *   do not all know their size.
+ */
+GARC_API GARC_Result garc_stream_part_offset(
+    const GARC_Stream * stream, size_t index, uint64_t * out_offset);
+
+/**
  * @brief Destroy a stream. NULL is ignored.
  *
  * The borrowed buffer or callback context is not touched.

@@ -751,6 +751,172 @@ TEST(Slice, AZeroLengthViewIsImmediatelyOver) {
   garc_stream_destroy(inner);
 }
 
+//-----------------------------------------------------------------------------
+// Concatenation
+//-----------------------------------------------------------------------------
+
+namespace {
+
+/** Read a stream to its end. */
+std::string drain(GARC_Stream * stream, size_t chunk) {
+  std::string out;
+  std::vector<char> buffer(chunk);
+  for (;;) {
+    size_t got = 0;
+    if (garc_stream_read(stream, buffer.data(), buffer.size(), &got) != GARC_OK
+        || !got) {
+      return out;
+    }
+    out.append(buffer.data(), got);
+  }
+}
+
+} // namespace
+
+TEST(StreamConcat, SeekableSizedPartsMakeOneSeekableSizedWhole) {
+  // Including an empty part in the middle, which has no byte for a seek to
+  // land on and must not end the read.
+  const std::string a = "first part|", b, c = "third|", d = "last";
+  GARC_Stream * parts[4] = {};
+  const std::string * texts[4] = {&a, &b, &c, &d};
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_EQ(GARC_OK, garc_stream_create_memory(texts[i]->data(),
+                           texts[i]->size(), &parts[i]));
+  }
+  // A part left mid-way is read from its start: the whole begins there.
+  char skip[3];
+  size_t got = 0;
+  ASSERT_EQ(GARC_OK, garc_stream_read(parts[0], skip, 3, &got));
+  GARC_Stream * whole = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_concat(parts, 4, &whole));
+  const std::string all = a + b + c + d;
+  EXPECT_TRUE(garc_stream_is_seekable(whole));
+  uint64_t size = 0;
+  ASSERT_EQ(GARC_OK, garc_stream_size(whole, &size));
+  EXPECT_EQ(size, all.size());
+  for (size_t chunk : {1u, 3u, 7u, 64u}) {
+    SCOPED_TRACE(chunk);
+    ASSERT_EQ(GARC_OK, garc_stream_seek(whole, 0));
+    EXPECT_EQ(drain(whole, chunk), all);
+  }
+  // Every offset, read back to the end, is the suffix from there.
+  for (size_t at = 0; at <= all.size(); ++at) {
+    ASSERT_EQ(GARC_OK, garc_stream_seek(whole, at)) << at;
+    EXPECT_EQ(drain(whole, 5), all.substr(at)) << at;
+  }
+  EXPECT_EQ(GARC_ERR_IO, garc_stream_seek(whole, all.size() + 1));
+  EXPECT_EQ(garc_stream_part_count(whole), 4u);
+  const uint64_t starts[4] = {0, a.size(), a.size(), a.size() + c.size()};
+  for (size_t i = 0; i < 4; ++i) {
+    uint64_t start = 99;
+    ASSERT_EQ(GARC_OK, garc_stream_part_offset(whole, i, &start));
+    EXPECT_EQ(start, starts[i]) << i;
+  }
+  uint64_t start = 0;
+  EXPECT_EQ(GARC_ERR_INVALID, garc_stream_part_offset(whole, 4, &start));
+  garc_stream_destroy(whole);
+  for (GARC_Stream * part : parts) {
+    garc_stream_destroy(part); // borrowed: still the caller's to free
+  }
+}
+
+TEST(StreamConcat, PartsThatCannotSeekAreReadOnceInOrder) {
+  const std::string a = "pipe one ", b = "pipe two";
+  BufferSource one(a.data(), a.size(), false, false);
+  BufferSource two(b.data(), b.size(), false, false);
+  GARC_Stream * parts[2] = {};
+  ASSERT_EQ(GARC_OK, garc_stream_create_callback(one.callbacks(), &parts[0]));
+  ASSERT_EQ(GARC_OK, garc_stream_create_callback(two.callbacks(), &parts[1]));
+  GARC_Stream * whole = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_concat(parts, 2, &whole));
+  EXPECT_FALSE(garc_stream_is_seekable(whole));
+  uint64_t start = 0;
+  EXPECT_EQ(GARC_ERR_NOT_SEEKABLE, garc_stream_part_offset(whole, 1, &start));
+  EXPECT_EQ(drain(whole, 4), a + b);
+  garc_stream_destroy(whole);
+  garc_stream_destroy(parts[0]);
+  garc_stream_destroy(parts[1]);
+}
+
+TEST(StreamConcat, APartShorterThanItsSizeIsAnIoError) {
+  // Its size said 10 and it gives 4: every offset after it would be wrong.
+  struct Liar {
+    static GARC_Result read(void * ctx, void * buffer, size_t size, size_t * out) {
+      size_t * left = static_cast<size_t *>(ctx);
+      const size_t n = size < *left ? size : *left;
+      std::memset(buffer, 'x', n);
+      *left -= n;
+      *out = n;
+      return GARC_OK;
+    }
+    static GARC_Result seek(void * ctx, uint64_t offset) {
+      *static_cast<size_t *>(ctx) = offset ? 0 : 4;
+      return GARC_OK;
+    }
+    static GARC_Result size(void *, uint64_t * out) {
+      *out = 10;
+      return GARC_OK;
+    }
+  };
+  size_t left = 4;
+  GARC_Stream_Callbacks callbacks{};
+  callbacks.ctx = &left;
+  callbacks.read = Liar::read;
+  callbacks.seek = Liar::seek;
+  callbacks.size = Liar::size;
+  const std::string tail = "tail";
+  GARC_Stream * parts[2] = {};
+  ASSERT_EQ(GARC_OK, garc_stream_create_callback(&callbacks, &parts[0]));
+  ASSERT_EQ(GARC_OK, garc_stream_create_memory(tail.data(), tail.size(), &parts[1]));
+  GARC_Stream * whole = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_concat(parts, 2, &whole));
+  char buffer[32];
+  size_t got = 0;
+  ASSERT_EQ(GARC_OK, garc_stream_read(whole, buffer, sizeof(buffer), &got));
+  EXPECT_EQ(got, 4u);
+  EXPECT_EQ(GARC_ERR_IO, garc_stream_read(whole, buffer, sizeof(buffer), &got));
+  garc_stream_destroy(whole);
+  garc_stream_destroy(parts[0]);
+  garc_stream_destroy(parts[1]);
+}
+
+TEST(StreamConcat, TheArgumentsAreChecked) {
+  GARC_Stream * whole = nullptr;
+  GARC_Stream * none[1] = {nullptr};
+  EXPECT_EQ(GARC_ERR_INVALID, garc_stream_create_concat(nullptr, 1, &whole));
+  EXPECT_EQ(GARC_ERR_INVALID, garc_stream_create_concat(none, 1, &whole));
+  const char byte = 'x';
+  GARC_Stream * one = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_memory(&byte, 1, &one));
+  EXPECT_EQ(GARC_ERR_INVALID, garc_stream_create_concat(&one, 0, &whole));
+  EXPECT_EQ(GARC_ERR_INVALID, garc_stream_create_concat(&one, 1, nullptr));
+  // Any other stream is one part at offset 0.
+  EXPECT_EQ(garc_stream_part_count(one), 1u);
+  EXPECT_EQ(garc_stream_part_count(nullptr), 0u);
+  uint64_t start = 99;
+  EXPECT_EQ(GARC_OK, garc_stream_part_offset(one, 0, &start));
+  EXPECT_EQ(start, 0u);
+  // Out of memory at each allocation, and nothing leaked - up to the first
+  // count that fails nothing, which has to be reached.
+  bool reached_ok = false;
+  for (size_t fail_at = 0; fail_at < 8; ++fail_at) {
+    FailingAllocator allocator(fail_at);
+    const GARC_Result result = garc_stream_create_concat_with_allocator(
+        &one, 1, allocator.get(), &whole);
+    if (result == GARC_OK) {
+      reached_ok = true;
+      garc_stream_destroy(whole);
+    }
+    else {
+      EXPECT_EQ(result, GARC_ERR_OOM);
+    }
+    allocator.stop_failing();
+    EXPECT_EQ(allocator.live(), 0u) << fail_at;
+  }
+  EXPECT_TRUE(reached_ok);
+  garc_stream_destroy(one);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

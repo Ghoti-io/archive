@@ -390,8 +390,17 @@ GARC_API GARC_Result garc_fs_sink_create_with_allocator(const char * path,
  * zip.h describes for any stream that cannot seek; a 7z inside one cannot be
  * read at all.
  *
- * The archive owns the file and any decompressing stream, and ::garc_close()
- * closes both.
+ * **A split archive is opened whole.** Given `name.001`, the consecutive parts
+ * `name.002`, `name.003`, ... that exist are read after it, whatever the
+ * archive inside is - 7-Zip's `-v` and `split -d -a 3` both write this. Given
+ * `name.zip` or `name.z01` when `name.z01` exists, the split zip `name.z01`
+ * ... `name.zNN`, `name.zip` is read, as Info-ZIP's `zip -s` writes it. The
+ * parts go through ::garc_stream_create_concat(), and a set missing a part is
+ * ::GARC_ERR_UNSUPPORTED for a zip (its end record names the disks) and,
+ * for a numbered set, whatever the shorter archive reads as.
+ *
+ * The archive owns the file (or the parts) and any decompressing stream, and
+ * ::garc_close() closes them.
  *
  * @param path The file. UTF-8. Not NULL.
  * @param limits Caps on the archive, or NULL for the defaults.

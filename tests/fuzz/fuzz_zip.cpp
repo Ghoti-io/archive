@@ -163,18 +163,40 @@ struct Ended {
   GARC_Result last = GARC_ERR_INTERNAL; ///< What ended the walk.
 };
 
+/** How the bytes reach the reader. */
+enum class Shape { memory, pipe, two_parts };
+
 Ended walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     const GARC_Allocator * allocator, const char * password, bool read_data,
-    bool piped, std::vector<Seen> * out_seen) {
+    Shape shape, std::vector<Seen> * out_seen) {
   Ended ended;
+  const bool piped = shape == Shape::pipe;
   GARC_Stream * stream = nullptr;
+  GARC_Stream * halves[2] = {nullptr, nullptr};
   Pipe pipe{body, body_size};
   GARC_Stream_Callbacks callbacks{};
   callbacks.read = pipe_read;
   callbacks.ctx = &pipe;
-  if ((piped ? garc_stream_create_callback(&callbacks, &stream)
-             : garc_stream_create_memory(body, body_size, &stream))
-      != GARC_OK) {
+  GARC_Result made = GARC_OK;
+  if (shape == Shape::two_parts) {
+    // Cut where the body's first byte says, so a fuzzer can move the cut.
+    const size_t cut = body_size ? (size_t)body[0] * body_size / 256u : 0u;
+    made = garc_stream_create_memory(body, cut, &halves[0]);
+    if (made == GARC_OK) {
+      made = garc_stream_create_memory(body + cut, body_size - cut, &halves[1]);
+    }
+    if (made == GARC_OK) {
+      made = garc_stream_create_concat(halves, 2, &stream);
+    }
+  }
+  else {
+    made = piped ? garc_stream_create_callback(&callbacks, &stream)
+                 : garc_stream_create_memory(body, body_size, &stream);
+  }
+  if (made != GARC_OK) {
+    garc_stream_destroy(stream);
+    garc_stream_destroy(halves[0]);
+    garc_stream_destroy(halves[1]);
     return ended;
   }
 
@@ -185,6 +207,8 @@ Ended walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     REQUIRE(documented(opened), "open returned a status it does not document");
     REQUIRE(archive == nullptr, "a failed open handed back an archive");
     garc_stream_destroy(stream);
+    garc_stream_destroy(halves[0]);
+    garc_stream_destroy(halves[1]);
     return ended;
   }
   REQUIRE(archive != nullptr, "open succeeded without producing an archive");
@@ -194,6 +218,8 @@ Ended walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     // harness's business, and the tar harness's population is its own.
     garc_close(archive);
     garc_stream_destroy(stream);
+    garc_stream_destroy(halves[0]);
+    garc_stream_destroy(halves[1]);
     return ended;
   }
 
@@ -205,6 +231,8 @@ Ended walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     if (set == GARC_ERR_OOM) {
       garc_close(archive);
       garc_stream_destroy(stream);
+      garc_stream_destroy(halves[0]);
+      garc_stream_destroy(halves[1]);
       return ended;
     }
     REQUIRE(set == GARC_OK, "a zip archive refused a password");
@@ -306,6 +334,8 @@ Ended walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
 
   garc_close(archive);
   garc_stream_destroy(stream);
+  garc_stream_destroy(halves[0]);
+  garc_stream_destroy(halves[1]);
   ended.opened = true;
   ended.last = budget >= 0 ? result : GARC_ERR_INTERNAL;
   return ended;
@@ -354,7 +384,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         starve ? fail_at : static_cast<size_t>(-1));
     std::vector<Seen> seen;
     const bool opened = walk(body, body_size, limits, allocator.get(), password,
-        read_data, false, &seen).opened;
+        read_data, Shape::memory, &seen).opened;
     allocator.stop_failing();
     if (opened) {
       REQUIRE(allocator.live() == 0u, "the walk leaked");
@@ -366,7 +396,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         starve ? fail_at : static_cast<size_t>(-1));
     std::vector<Seen> seen;
     const bool opened = walk(body, body_size, limits, allocator.get(), password,
-        read_data, true, &seen).opened;
+        read_data, Shape::pipe, &seen).opened;
     allocator.stop_failing();
     if (opened) {
       REQUIRE(allocator.live() == 0u, "the piped walk leaked");
@@ -386,9 +416,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   std::vector<Seen> with;
   std::vector<Seen> without;
   const Ended a_end = walk(body, body_size, limits, nullptr, "ghoti-password",
-      read_data, false, &with);
+      read_data, Shape::memory, &with);
   const Ended b_end = walk(body, body_size, limits, nullptr, nullptr, read_data,
-      false, &without);
+      Shape::memory, &without);
   const bool a = a_end.opened;
   const bool b = b_end.opened;
   REQUIRE(a == b, "the same archive opened with a password and not without one");
@@ -402,7 +432,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   // **A streamed walk that the directory approved is the seekable walk.**
   std::vector<Seen> piped;
   const Ended p_end = walk(body, body_size, limits, nullptr, nullptr, read_data,
-      true, &piped);
+      Shape::pipe, &piped);
   if (p_end.opened && p_end.last == GARC_END) {
     REQUIRE(b && b_end.last == GARC_END,
         "a pipe read to the end an archive the seekable reader refuses");
@@ -411,6 +441,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     for (size_t i = 0; i < piped.size(); ++i) {
       REQUIRE(!(piped[i] != without[i]),
           "a pipe handed over a member the directory describes differently");
+    }
+  }
+  // **Cut in two, a single-disk zip is the same zip.** The concatenation puts
+  // the bytes back in a row and a one-disk archive does not ask about parts,
+  // so wherever the cut falls the walk must be the memory walk. (An archive
+  // that declares disks is refused from memory, and may read here: that is
+  // the split path being fuzzed, with only the general invariants.)
+  std::vector<Seen> split;
+  const Ended s_end = walk(body, body_size, limits, nullptr, nullptr, read_data,
+      Shape::two_parts, &split);
+  if (b && b_end.last == GARC_END) {
+    REQUIRE(s_end.opened && s_end.last == GARC_END,
+        "a zip read from memory was refused when cut in two");
+    REQUIRE(split.size() == without.size(),
+        "cutting a zip in two changed how many members it has");
+    for (size_t i = 0; i < split.size(); ++i) {
+      REQUIRE(!(split[i] != without[i]),
+          "cutting a zip in two changed a member");
     }
   }
   return 0;

@@ -142,6 +142,11 @@
 #define garc_stream_create_memory GHOTIIO_ARCHIVE(garc_stream_create_memory)
 #define garc_stream_create_memory_with_allocator                               \
   GHOTIIO_ARCHIVE(garc_stream_create_memory_with_allocator)
+#define garc_stream_create_concat GHOTIIO_ARCHIVE(garc_stream_create_concat)
+#define garc_stream_create_concat_with_allocator                               \
+  GHOTIIO_ARCHIVE(garc_stream_create_concat_with_allocator)
+#define garc_stream_part_count GHOTIIO_ARCHIVE(garc_stream_part_count)
+#define garc_stream_part_offset GHOTIIO_ARCHIVE(garc_stream_part_offset)
 #define garc_stream_destroy GHOTIIO_ARCHIVE(garc_stream_destroy)
 #define garc_stream_is_seekable GHOTIIO_ARCHIVE(garc_stream_is_seekable)
 #define garc_stream_read GHOTIIO_ARCHIVE(garc_stream_read)
