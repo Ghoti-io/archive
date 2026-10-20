@@ -391,8 +391,10 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # The compile half of the same answer. Without it a test object found gtest's
 # headers only where the host compiler looks by default, which is true of a
 # distribution's libgtest-dev and of no cross compiler: suite/tools/xarch's
-# first run of archive compiled no test at all.
-TEST_COMPILE_FLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags gtest`
+# first run of archive compiled no test at all. As -isystem, which is how the
+# host compiler treats a distribution's /usr/include copy: gtest's own templates
+# warn under this library's flags, and a plain -I made those warnings errors.
+TEST_COMPILE_FLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags gtest | sed 's/\(^\| \)-I/\1-isystem /g'`
 
 # The checks `make test` runs besides the tests themselves. Named in a
 # variable so that a build which cannot satisfy them can clear it: the

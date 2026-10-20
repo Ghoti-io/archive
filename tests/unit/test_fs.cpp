@@ -224,9 +224,12 @@ TEST_F(ExtractRoot, OrdinaryTreeKeepsBytesAndClearsSpecialModeBits) {
   ASSERT_EQ(GCU_FILE_OK,
       gcu_file_identity(join_path(root, "sub").c_str(), &dir_id));
   EXPECT_EQ(0u, file_id.mode & 07000u);
-  EXPECT_EQ(0755u, file_id.mode & 0777u);
   EXPECT_EQ(0u, dir_id.mode & 07000u);
+#ifndef _WIN32
+  // Windows has no Unix mode to apply; fs.h says so.
+  EXPECT_EQ(0755u, file_id.mode & 0777u);
   EXPECT_EQ(0755u, dir_id.mode & 0777u);
+#endif
   expect_parent_unchanged();
 }
 
@@ -290,6 +293,14 @@ TEST_F(ExtractRoot, ContainedSymlinkIsCreatedWhenLinksAreAllowed) {
                          .marker();
   Opened opened(built.bytes());
   opened.open();
+#ifdef _WIN32
+  // cutil does not create a symlink on Windows, so the member is refused there
+  // with the flag set, and nothing is made in its place.
+  EXPECT_EQ(GARC_ERR_REFUSED,
+      garc_fs_extract(opened.archive, root.c_str(), GARC_FS_ALLOW_LINKS));
+  EXPECT_FALSE(gcu_file_exists(join_path(root, "link").c_str()));
+  return;
+#endif
   ASSERT_EQ(GARC_OK,
       garc_fs_extract(opened.archive, root.c_str(), GARC_FS_ALLOW_LINKS));
   GCU_File_Info info;
@@ -395,7 +406,13 @@ TEST_F(ExtractRoot, ReservedNameNeedsThePortabilityFlag) {
   EXPECT_EQ(GARC_ERR_REFUSED,
       garc_fs_extract(
           allowed.archive, root.c_str(), GARC_FS_ALLOW_PORTABLE_NAMES));
+#ifdef _WIN32
+  // On Windows the flag does not allow it: "CON" there is the console, and
+  // opening it would write the member to the screen and report success.
+  EXPECT_FALSE(gcu_file_exists(join_path(root, "CON").c_str()));
+#else
   EXPECT_TRUE(gcu_file_exists(join_path(root, "CON").c_str()));
+#endif
   expect_parent_unchanged();
 }
 
@@ -479,6 +496,9 @@ TEST_F(ExtractRoot, AParentComponentThatLeavesIsStillRefused) {
 }
 
 TEST_F(ExtractRoot, PackAndExtractRoundTripMatchesBytesAndMasksModes) {
+#ifdef _WIN32
+  GTEST_SKIP() << "the setup sets Unix modes, which Windows has none of";
+#endif
   ASSERT_EQ(GCU_FILE_OK, gcu_dir_create(join_path(root, "sub").c_str()));
   write_file(join_path(root, "sub/note.txt"), "hello");
   ASSERT_EQ(GCU_FILE_OK,
@@ -541,7 +561,9 @@ TEST_F(ExtractRoot, ASevenZipArchiveExtractsWithItsBytesAndMasksItsModes) {
   GCU_File_Identity id;
   ASSERT_EQ(GCU_FILE_OK,
       gcu_file_identity(join_path(root, "program.bin").c_str(), &id));
+#ifndef _WIN32
   EXPECT_EQ(0755u, id.mode & 0777u);
+#endif
   expect_parent_unchanged();
 }
 
@@ -594,6 +616,9 @@ TEST_F(ExtractRoot, PackedAsSevenZipAndExtractedAgainMatches) {
 }
 
 TEST_F(ExtractRoot, PackStoresASymlinkAndNotTheOutsideBytes) {
+#ifdef _WIN32
+  GTEST_SKIP() << "the setup makes a symlink, which cutil does not create on Windows";
+#endif
   write_file(join_path(parent, "secret-outside"), "SECRET-BYTES");
   ASSERT_EQ(GCU_FILE_OK,
       gcu_file_symlink(join_path(parent, "secret-outside").c_str(),
@@ -723,6 +748,9 @@ TEST_F(ExtractRoot, AnExistingDirectoryIsNotEntered) {
 }
 
 TEST_F(ExtractRoot, APreexistingSymlinkIsNotFollowed) {
+#ifdef _WIN32
+  GTEST_SKIP() << "the setup makes a symlink, which cutil does not create on Windows";
+#endif
   ASSERT_EQ(GCU_FILE_OK, gcu_dir_create(join_path(root, "real").c_str()));
   ASSERT_EQ(GCU_FILE_OK,
       gcu_file_symlink("real", join_path(root, "sneak").c_str()));
@@ -815,6 +843,9 @@ TEST_F(ExtractRoot, FifoMemberIsNotCreated) {
 }
 
 TEST_F(ExtractRoot, DotSlashTargetIsStored) {
+#ifdef _WIN32
+  GTEST_SKIP() << "extracting a symlink is refused on Windows, which ContainedSymlinkIsCreatedWhenLinksAreAllowed asserts";
+#endif
   garctest::TarHeader symlink;
   symlink.field(0, 100, "link");
   symlink.octal(100, 8, 0777);

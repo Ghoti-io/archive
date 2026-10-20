@@ -49,6 +49,15 @@
  * the archive mode with setuid, setgid and sticky cleared; there is no flag
  * that keeps those bits. On Windows the mode is not applied.
  *
+ * **On Windows, some portability findings are not portability questions**, and
+ * ::GARC_FS_ALLOW_PORTABLE_NAMES does not allow them: a reserved device name
+ * (`CON` would write the member to the console), a component ending in a dot
+ * or a space (stripped, so two names reach one file), a backslash traversal, a
+ * control byte, and any of `:*?"<>|` in a member name - a `:` would open an
+ * alternate data stream. A symbolic link member is ::GARC_ERR_REFUSED there
+ * even with ::GARC_FS_ALLOW_LINKS, because cutil does not create one on
+ * Windows.
+ *
  * Packing stores a symlink as a symlink and does not follow it. A hard link
  * whose other name is inside the tree is a hard link member; one whose other
  * name is outside is a refusal. If the writer cannot store a hard link, that

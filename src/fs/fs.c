@@ -242,6 +242,26 @@ static int fs_name_refused(const char * name, size_t length, uint32_t flags,
   if (portability && (flags & GARC_FS_ALLOW_PORTABLE_NAMES) == 0) {
     blocked |= GARC_NAME_PORTABILITY;
   }
+#ifdef _WIN32
+  // **On Windows these are not portability questions; they are what the name
+  // does here,** so the flag does not allow them. A device name opens the device:
+  // "CON" is the console, and a member's bytes would be written to it with the
+  // extract reporting success. A trailing dot or space is stripped, so two
+  // members land on one file. A backslash separates, so its traversal escapes.
+  // A control byte or one of `:*?"<>|` is not a legal character - and a `:` is
+  // worse than illegal, because "file:stream" opens an alternate data stream
+  // that a caller listing the directory never sees. Found when the extraction
+  // tests first ran under wine.
+  blocked |= GARC_NAME_WINDOWS_RESERVED | GARC_NAME_TRAILING_DOT_OR_SPACE
+      | GARC_NAME_WINDOWS_TRAVERSAL | GARC_NAME_CONTROL_BYTE;
+  if (portability) {
+    for (size_t i = 0; i < length; ++i) {
+      if (strchr(":*?\"<>|", name[i]) && name[i] != '\0') {
+        return 1;
+      }
+    }
+  }
+#endif
   return (findings & blocked) != 0;
 }
 
