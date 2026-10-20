@@ -307,7 +307,10 @@ refuse. Writing a file is `garc_fs_sink_create()`, which `examples/tar_write.c`,
 Depends on [Ghoti.io CUtil](https://github.com/Ghoti-io/cutil),
 [Ghoti.io Security](https://github.com/Ghoti-io/security) (WinZip AES) and
 [Ghoti.io Compress](https://github.com/Ghoti-io/compress), all found through
-pkg-config. Nothing else.
+pkg-config. Nothing else. Nothing is versioned before the suite's first release,
+so the dependency is on commits: cutil `eaa1806` (`gcu_file_next_data()`,
+`gcu_file_allow_holes()`) and compress `77246ec` (`gcomp_decoder_unconsumed()`)
+or later.
 
 ```bash
 make            # the shared and static libraries
@@ -491,6 +494,36 @@ a side.
 **A clean answer is not permission to extract.** No function taking one name can
 see a symlink an earlier member created, or a collision between two names, and this
 one does not pretend to. Resolve as you create.
+
+**On disk: `fs.h`, opt-in.** Everything above takes a stream or a sink and never
+sees a path; `fs.h` is the half that does, and `archive.h` does not include it.
+
+- `garc_fs_open()` opens an archive by path: the containers are tried on the file,
+  then the codec its first bytes name (gzip, bzip2, xz, zstd, lz4; brotli and
+  `.lzma` only by name, with `GARC_FS_NAME_HINT`), and a split set is opened whole
+  from its first part. The archive owns the file and closes it.
+- `garc_fs_stream_open()` and `garc_fs_sink_create()` are a file as a stream and a
+  file as a sink. The sink writes a temporary beside the destination and renames
+  it at `garc_sink_finish()`, synced unless `GARC_FS_NO_SYNC`, so a writer that
+  fails leaves the old file; it can patch, so a zip gets complete local headers.
+  `garc_fs_sink_create_volumes()` writes a split zip's volumes the same way.
+- `garc_fs_extract()` writes the members under a root and checks containment on
+  each parent's canonical path after the links it has made, so `..`, an absolute
+  name and a symlink an earlier member planted are refused alike. A path that
+  already exists, or a second member whose path canonicalises to the first's, is
+  refused too; links are created only when `GARC_FS_ALLOW_LINKS` asks, and on
+  Windows a device name, a trailing dot or space and the characters that open
+  alternate streams are refused whatever the flags. Each member's data is
+  read to the reader's end, so a zip member whose CRC-32 or AES tag fails is an
+  error and not a file, and a sparse member's holes are left as holes.
+- `garc_fs_pack()` writes a directory tree into a writer, streaming each file,
+  with a file that has holes written as a sparse tar member where the writer can.
+- `garc_fs_update_begin()` changes an archive file: a reader over the archive as
+  it is and a writer for what it will be, with `garc_fs_update_keep()` copying a
+  member across (raw, for zip), so deleting, replacing, renaming and adding are
+  all one walk and an atomic rename. `GARC_FS_IN_PLACE` appends instead, to an
+  uncompressed tar or a zip where it lies, and an abandoned append puts the file
+  back byte for byte.
 
 **Allocation.** Everything goes through a `GARC_Allocator`, which is cutil's
 vtable under a local name. `NULL` means `garc_allocator_default()`. The
