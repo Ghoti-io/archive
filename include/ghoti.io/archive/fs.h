@@ -279,6 +279,7 @@ GARC_API GARC_Result garc_fs_open_with_allocator(const char * path,
  * @param flags Zero, or a combination of ::GARC_FS_ALLOW_LINKS and
  *   ::GARC_FS_ALLOW_PORTABLE_NAMES. Any other bit is ::GARC_ERR_INVALID.
  * @return ::GARC_OK, ::GARC_ERR_REFUSED, ::GARC_ERR_INVALID, ::GARC_ERR_OOM,
+ *   ::GARC_ERR_NOT_FOUND when @p root does not exist, ::GARC_ERR_ACCESS,
  *   ::GARC_ERR_IO, or whatever failure ::garc_next() or ::garc_read_member()
  *   stopped on.
  */
@@ -301,7 +302,9 @@ GARC_API GARC_Result garc_fs_extract(GARC_Archive * archive, const char * root,
  *   change what a pack stores: a symlink is always a symlink. Unknown bits
  *   are still ::GARC_ERR_INVALID.
  * @return ::GARC_OK, ::GARC_ERR_REFUSED, ::GARC_ERR_INVALID, ::GARC_ERR_OOM,
- *   ::GARC_ERR_IO, or the writer's own status when it cannot store a member.
+ *   ::GARC_ERR_NOT_FOUND when @p root does not exist, ::GARC_ERR_ACCESS for a
+ *   file or directory that cannot be read, ::GARC_ERR_IO, or the writer's own
+ *   status when it cannot store a member.
  */
 GARC_API GARC_Result garc_fs_pack(GARC_Writer * writer, const char * root,
     uint32_t flags);

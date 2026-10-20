@@ -538,6 +538,25 @@ TEST_F(FsFile, FsFlagsDoNotLeakBetweenCalls) {
   garc_close(archive);
 }
 
+TEST_F(FsFile, ExtractAndPackNameAMissingRoot) {
+  // They said GARC_ERR_IO before the filesystem layer had a status for it.
+  write_file(at("t.tar"), tar_bytes(sample()));
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(GARC_OK,
+      garc_fs_open(at("t.tar").c_str(), nullptr, nullptr, 0, &archive));
+  EXPECT_EQ(GARC_ERR_NOT_FOUND,
+      garc_fs_extract(archive, at("absent").c_str(), 0));
+  garc_close(archive);
+
+  GARC_Sink * sink = nullptr;
+  GARC_Writer * writer = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_memory(&sink));
+  ASSERT_EQ(GARC_OK, garc_writer_create(sink, GARC_FORMAT_TAR, nullptr, &writer));
+  EXPECT_EQ(GARC_ERR_NOT_FOUND, garc_fs_pack(writer, at("absent").c_str(), 0));
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+}
+
 ////////////////////////////////////////////////////////////////////////
 // Allocation failure
 ////////////////////////////////////////////////////////////////////////
