@@ -225,8 +225,32 @@ typedef struct GARC_Member {
    * would produce the truncated name the format put there.
    */
   uint64_t header_offset;
-  /** Offset at which this member's data begins. */
+  /**
+   * Offset at which this member's data begins.
+   *
+   * For a sparse member, where its stored regions begin. Those bytes are not
+   * the file in order: the holes between them are not stored.
+   */
   uint64_t data_offset;
+
+  /**
+   * Non-zero when the member is a GNU sparse file.
+   *
+   * Read through ::garc_read_member() exactly like any other file: the holes
+   * come back as zeros and @ref size is the real size. What differs is only
+   * what is in the archive, which is @ref stored_size bytes of regions, so a
+   * caller copying raw bytes or estimating work should look here. tar only;
+   * GNU's old `S` header and pax sparse 0.0, 0.1 and 1.0 are read.
+   */
+  int sparse;
+  /**
+   * How many of the member's bytes the archive holds.
+   *
+   * Equal to @ref size for every member but a sparse one, where it is the sum of
+   * the stored regions. It is about holes, not compression: a deflated zip
+   * member's compressed length is a question for zip.h.
+   */
+  uint64_t stored_size;
 } GARC_Member;
 
 /**

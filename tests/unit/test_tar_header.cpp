@@ -1701,12 +1701,13 @@ TEST(TarPaxRecords, AnUnknownKeyIsIgnoredRatherThanRefused) {
   EXPECT_EQ(name_of(member), "still-applied");
 }
 
-TEST(TarPaxRecords, SparseMembersAreRefusedByName) {
-  // Both spellings. **Refused rather than ignored**, because the member's data is
-  // a map of holes and extents: a reader that dropped the records would hand a
-  // caller the map as the file's contents, at a size that is neither what is
-  // stored nor what the file really is. GARC_ERR_UNSUPPORTED says the construct is
-  // not read yet; silence would say the file is that.
+TEST(TarPaxRecords, ASparseMemberWithoutAWorkingMapIsCorrupt) {
+  // Both spellings, as this file has always built them: sparse is read now (see
+  // test_tar_sparse.cpp), and these two were never valid sparse members - the
+  // pax one has no map in its data, and the 'S' one's map covers none of its
+  // 512 stored bytes. **Not ignored**: a reader that dropped the records would
+  // hand a caller the map as the file's contents, at a size that is neither what
+  // is stored nor what the file really is.
   {
     // pax's spelling, which is what GNU tar writes with --sparse --format=pax.
     const std::string records = pax_record("GNU.sparse.major", "1")
@@ -1716,12 +1717,12 @@ TEST(TarPaxRecords, SparseMembersAreRefusedByName) {
     Opened opened;
     ASSERT_EQ(open_bytes(opened, pax_archive('x', records)), GARC_OK);
     const GARC_Member * member = nullptr;
-    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_UNSUPPORTED);
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
   }
   {
     // GNU's older spelling: typeflag 'S', with the sparse map in the header's
-    // spare bytes. Without a refusal this falls through to GARC_MEMBER_OTHER,
-    // which *carries data* - so the map would be reported as the file.
+    // spare bytes, here all empty. Read as GARC_MEMBER_OTHER it would carry data,
+    // and the stored bytes would be reported as the file.
     TarArchive archive;
     archive.header(file_header("sparse.bin", 512, 0644u, 'S'))
         .data(std::string(512, 'm'))
@@ -1729,13 +1730,13 @@ TEST(TarPaxRecords, SparseMembersAreRefusedByName) {
     Opened opened;
     ASSERT_EQ(open_bytes(opened, archive.bytes()), GARC_OK);
     const GARC_Member * member = nullptr;
-    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_UNSUPPORTED);
+    EXPECT_EQ(garc_next(opened.archive, &member), GARC_ERR_CORRUPT);
   }
 }
 
 TEST(TarPaxRecords, AnUnknownKeyStartingLikeSparseIsStillIgnored) {
-  // The control for the refusal above: the check is a prefix, so it has to be the
-  // prefix and not a resemblance. `GNU.sparse` without the dot is a different key,
+  // The control for the sparse records above: the check is a prefix, so it has to
+  // be the prefix and not a resemblance. `GNU.sparse` without the dot is a different key,
   // and refusing it would refuse a key nobody has defined for a reason nobody
   // stated.
   const std::string records = pax_record("GNU.sparsely", "no")

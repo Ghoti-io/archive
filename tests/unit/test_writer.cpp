@@ -2227,8 +2227,10 @@ TEST(WriterCorpus, EveryFixtureSurvivesBeingReadAndWrittenAndReadAgain) {
     }
   }
   // The whole corpus, so a fixture that stopped being read would show up as a
-  // smaller number rather than as nothing at all.
-  EXPECT_EQ(compared, 91u);
+  // smaller number rather than as nothing at all. 91, and the sixteen members of
+  // the four sparse fixtures, which are written back as ordinary files of their
+  // real content.
+  EXPECT_EQ(compared, 107u);
 }
 
 int main(int argc, char ** argv) {

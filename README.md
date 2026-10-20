@@ -28,10 +28,13 @@ through a compress decoder. This library is the container, not the compression.
 ## Status
 
 **Reads tar - all four of them.** v7, ustar, GNU's `L`/`K` members and pax's
-`x`/`g` records, from a file or a pipe. What is refused, by name and with
-`GARC_ERR_UNSUPPORTED`, is a *sparse* member: there the data is a map of holes and
-extents rather than the file's contents, so reading it as contents would be a
-wrong answer rather than a missing feature.
+`x`/`g` records, from a file or a pipe. **GNU sparse files too**, in every form
+GNU tar writes - the old `S` header with its extension blocks, and pax 0.0, 0.1
+and 1.0: the holes read back as zeros, `size` is the real size, and
+`GARC_Member.sparse` and `stored_size` say what the archive actually holds. The
+map is checked before a byte is handed out, and the real size is what
+`max_member_bytes` caps, because a sparse member is a decompression bomb by
+construction.
 
 The fixtures are written by GNU tar 1.35 in a pinned container and the
 expectations come from Python 3.13.5's `tarfile` and libarchive 3.7.4's bsdtar,

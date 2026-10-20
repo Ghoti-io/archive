@@ -571,13 +571,9 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
       continue;
     }
 
-    // GNU's old sparse typeflag, which pax spells with `GNU.sparse.*` records.
-    // Refused for the same reason those are: the member's data is a map of holes
-    // and extents, and this typeflag would otherwise fall through to
-    // GARC_MEMBER_OTHER and be reported as a file whose contents are the map.
-    if (typeflag == 'S') {
-      return GARC_ERR_UNSUPPORTED;
-    }
+    // GNU's old sparse typeflag. The header parses as an unknown type that
+    // carries data, which it is until garc_tar_sparse_begin() reads its map.
+    const int old_sparse = (typeflag == 'S');
 
     result = tar_read_header(archive, block);
     if (result != GARC_OK) {
@@ -611,7 +607,6 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
     }
 
     archive->member.header_offset = in_group ? group_offset : header_offset;
-    archive->member.data_offset = garc_tar_offset(archive);
 
     archive->data_remaining = archive->member.size;
     // Data is padded to a whole block. The modulo is on the declared size, so a
@@ -619,6 +614,16 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
     // than here.
     const uint64_t remainder = archive->member.size % GARC_TAR_BLOCK;
     archive->data_padding = remainder ? (GARC_TAR_BLOCK - remainder) : 0u;
+
+    // A sparse file's size so far is what is stored. This reads its map - from
+    // extension blocks behind an `S` header, or from the front of a pax 1.0
+    // member's data - and makes the size the real one, so it comes before the
+    // data offset is taken and before the caps see the size.
+    result = garc_tar_sparse_begin(archive, block, old_sparse);
+    if (result != GARC_OK) {
+      return result;
+    }
+    archive->member.data_offset = garc_tar_offset(archive);
 
     // A header after the end marker means the marker was data, not an end. GNU
     // tar warns and continues, and so does this: the marker ends the archive

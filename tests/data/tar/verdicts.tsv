@@ -14,6 +14,7 @@
 # gnu-longlink.tar: libarchive created: link-to-deep link-to-hello
 # gnu-longname-blocks.tar: libarchive created: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee/leaf.txt
 # gnu-longname.tar: libarchive created: dddddddddddddddddddddddd dddddddddddddddddddddddd/dddddddddddddddddddddddd dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/leaf.txt
+# gnu-sparse.tar: libarchive created: all-hole.bin lead-hole.bin many.bin tail-hole.bin
 # mal-collisions.tar: libarchive created: A.txt a.txt caf\xC3\xA9 cafe\xCC\x81
 # mal-links.tar: libarchive created: abs-target dot-target hard sibling up-target
 # mal-paths.tar: libarchive also said: Removing leading '/' from member names
@@ -22,6 +23,9 @@
 # pax-global.tar: libarchive created: link-to-deep na\xC3\xAFve.txt
 # pax-longlink.tar: libarchive created: link-to-deep link-to-hello
 # pax-longname.tar: libarchive created: dddddddddddddddddddddddd dddddddddddddddddddddddd/dddddddddddddddddddddddd dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/leaf.txt
+# pax-sparse-0.0.tar: libarchive created: all-hole.bin lead-hole.bin many.bin tail-hole.bin
+# pax-sparse-0.1.tar: libarchive created: all-hole.bin lead-hole.bin many.bin tail-hole.bin
+# pax-sparse-1.0.tar: libarchive created: all-hole.bin lead-hole.bin many.bin tail-hole.bin
 # pax-times.tar: libarchive created: hello.txt sizes sizes/block sizes/block+1 sizes/block-1 sizes/empty sizes/one
 # ustar-basic.tar: libarchive created: emptydir hardlink hello.txt link-to-hello
 # ustar-modes.tar: libarchive created: modes modes/executable modes/private modes/setuid
@@ -41,6 +45,10 @@ gnu-longname.tar	1	dddddddddddddddddddddddd/dddddddddddddddddddddddd	same	same	e
 gnu-longname.tar	2	dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd	same	same	extracted
 gnu-longname.tar	3	dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd	same	same	extracted
 gnu-longname.tar	4	dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/leaf.txt	same	same	extracted
+gnu-sparse.tar	0	many.bin	same	same	extracted
+gnu-sparse.tar	1	tail-hole.bin	same	same	extracted
+gnu-sparse.tar	2	all-hole.bin	same	same	extracted
+gnu-sparse.tar	3	lead-hole.bin	same	same	extracted
 mal-collisions.tar	0	A.txt	same	same	extracted
 mal-collisions.tar	1	a.txt	same	same	extracted
 mal-collisions.tar	2	cafe\xCC\x81	same	same	extracted
@@ -86,6 +94,18 @@ pax-longname.tar	1	dddddddddddddddddddddddd/dddddddddddddddddddddddd	same	same	e
 pax-longname.tar	2	dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd	same	same	extracted
 pax-longname.tar	3	dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd	same	same	extracted
 pax-longname.tar	4	dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/dddddddddddddddddddddddd/leaf.txt	same	same	extracted
+pax-sparse-0.0.tar	0	many.bin	same	same	extracted
+pax-sparse-0.0.tar	1	tail-hole.bin	same	same	extracted
+pax-sparse-0.0.tar	2	all-hole.bin	same	same	extracted
+pax-sparse-0.0.tar	3	lead-hole.bin	same	same	extracted
+pax-sparse-0.1.tar	0	many.bin	same	same	extracted
+pax-sparse-0.1.tar	1	tail-hole.bin	same	same	extracted
+pax-sparse-0.1.tar	2	all-hole.bin	same	same	extracted
+pax-sparse-0.1.tar	3	lead-hole.bin	same	same	extracted
+pax-sparse-1.0.tar	0	many.bin	same	same	extracted
+pax-sparse-1.0.tar	1	tail-hole.bin	same	same	extracted
+pax-sparse-1.0.tar	2	all-hole.bin	same	same	extracted
+pax-sparse-1.0.tar	3	lead-hole.bin	same	same	extracted
 pax-times.tar	0	hello.txt	same	same	extracted
 pax-times.tar	1	sizes	same	same	extracted
 pax-times.tar	2	sizes/block	same	same	extracted

@@ -243,12 +243,19 @@ without ever erroring:
 | GNU | an `L` member carrying the next member's name | base-256 when the high bit is set | `magic` is `ustar  \0` |
 | pax (POSIX.1-2001) | an `x`/`g` member of `len key=value\n` records | a `size=` record, decimal | an `x` member before the one it describes |
 
-**All four are read.** What is refused, by name and with
-`GARC_ERR_UNSUPPORTED`, is a *sparse* member - GNU's `S` typeflag and pax's
-`GNU.sparse.*` records - because there the member's data is a map of holes and
-extents rather than its contents, and a reader that ignored that would hand a
-caller the map as the file. The members around a refused one are read normally, so
-it is a refusal of one construct rather than of the archive.
+**All four are read, and so are GNU's sparse files** - the old `S` typeflag with
+its extension blocks, and pax's `GNU.sparse.*` records in versions 0.0, 0.1 and
+1.0 (the GNU tar manual's "Sparse Formats" appendix defines all four). There the
+member's data is a map's regions back to back, and a reader that ignored the map
+would hand a caller the regions as the file. `src/tar/tar_sparse.c` reads the map,
+checks it - regions in order, not overlapping, inside the real size, and adding up
+to exactly the stored bytes - and `garc_read_member()` hands out the file, zeros
+for the holes. `size` becomes the real size, and that is what `max_member_bytes`
+caps: eight stored bytes can declare an exabyte. The map is held within
+`max_extra_bytes`, sixteen bytes a region. A sparse record in a global header, a
+version after 1.0, or a `GNU.sparse.*` key this reader does not know is
+`GARC_ERR_UNSUPPORTED`, because each says something about the data that ignoring
+would get wrong.
 
 Note that a pax archive whose names all fit the ustar fields contains no extended
 records at all - pax's magic *is* ustar's - so `tar --format=pax` output is
@@ -345,9 +352,9 @@ Four rules, each of which has a wrong reading that still round-trips:
   asked it to forget.
 - **An unknown key is ignored, not refused.** pax is an open vocabulary and real
   writers use it - `SCHILY.*`, `LIBARCHIVE.*`, `GNU.*` - so refusing would refuse
-  most of what `bsdtar --format=pax` writes. `GNU.sparse.*` is the one exception,
-  and it is an exception because ignoring it changes what the member's *data* is
-  rather than what its metadata says.
+  most of what `bsdtar --format=pax` writes. A `GNU.sparse.*` key the reader does
+  not know is the one exception, and it is an exception because ignoring it would
+  change what the member's *data* is rather than what its metadata says.
 
 Three consequences worth knowing:
 
@@ -1473,9 +1480,15 @@ the same shape - a fixture that looked hostile and was not:
   its table entry says.
 - **A global pax header's own mtime is a wall-clock reading**, because `--mtime`
   sets the *members'* times and a global header is not a member.
-- **GNU tar's sparse members embed its pid** in the member name
-  (`./GNUSparseFile.6/...`), which cannot be pinned at all - so the sparse refusal
-  is tested hand-built and there is no sparse fixture.
+- **GNU tar's pax sparse members embed its pid** in the placeholder name
+  (`./GNUSparseFile.25/...`). It is pinned after all: each generation runs in a
+  fresh container, so the pid is fixed by how many processes the generator has
+  started before it, and `make check-corpus` reproduces the fixtures byte for
+  byte. Change the generator's order and the fixtures change with it, which the
+  hash list then says. The map is pinned by `--hole-detection=raw`, which scans
+  for zero blocks instead of asking the filesystem, so the same map comes out on
+  any host. `sparse.tsv` has each member's real content as tarfile and as bsdtar
+  read it.
 
 The complement is hand-built, as everywhere else in this library: an empty name and
 a NUL inside one cannot be produced by any writer, because no filesystem can hold

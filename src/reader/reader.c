@@ -387,6 +387,11 @@ GARC_Result garc_next(GARC_Archive * archive, const GARC_Member ** out_member) {
     return result;
   }
 
+  // Set here once, rather than by every format: only tar's sparse reader makes
+  // the stored length differ from the size, and it has set it already.
+  if (!archive->member.sparse) {
+    archive->member.stored_size = archive->member.size;
+  }
   *out_member = &archive->member;
   return GARC_OK;
 }
@@ -549,6 +554,9 @@ GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,
   }
   if (archive->format == GARC_FORMAT_CPIO) {
     return garc_cpio_read(archive, buffer, capacity, out_read);
+  }
+  if (archive->format == GARC_FORMAT_TAR && archive->tar.sparse) {
+    return garc_tar_sparse_read(archive, buffer, capacity, out_read);
   }
   if (archive->data_refusal != GARC_OK) {
     // A member whose metadata was readable and whose bytes are not: a zip member

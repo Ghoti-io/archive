@@ -239,6 +239,58 @@ GARC_Result garc_tar_apply_pax(GARC_Archive * archive);
 void garc_tar_pax_reset(GARC_Tar_Pax * pax);
 
 /**
+ * Take one `GNU.sparse.offset=` or `GNU.sparse.numbytes=` record of pax 0.0.
+ *
+ * They alternate, offset first, one pair per region. A numbytes with no offset
+ * in front of it, or an offset followed by another offset, is
+ * ::GARC_ERR_CORRUPT. The pairs count against `max_extra_bytes`, sixteen bytes
+ * each, which is what they cost to hold.
+ *
+ * @param archive The archive, for the allocator and the caps.
+ * @param pax The `x` record set being parsed.
+ * @param value The record's value.
+ * @param length Its length.
+ * @param is_numbytes Zero for an offset, non-zero for a numbytes.
+ * @return GARC_OK, GARC_ERR_CORRUPT, GARC_ERR_LIMIT_EXTRA_BYTES or
+ *   GARC_ERR_OOM.
+ */
+GARC_Result garc_tar_sparse_pax_pair(GARC_Archive * archive, GARC_Tar_Pax * pax,
+    const char * value, size_t length, int is_numbytes);
+
+/**
+ * Turn the member just read into a sparse one, if it is one.
+ *
+ * Called with the header parsed, the records applied, and
+ * `archive->data_remaining` and `data_padding` set from the stored size. For
+ * the old GNU header it reads the extension blocks behind it; for pax 1.0 it
+ * reads the map at the front of the data. Either way the map is checked - sorted,
+ * not overlapping, inside the real size, and adding up to exactly the stored
+ * bytes - and the member's size becomes the real size.
+ *
+ * @param archive The archive.
+ * @param block The header block, for the old GNU form's map and real size.
+ * @param old_gnu Non-zero when the typeflag was `S`.
+ * @return GARC_OK, GARC_ERR_UNSUPPORTED for a sparse version this reader does
+ *   not know, GARC_ERR_CORRUPT, GARC_ERR_LIMIT_EXTRA_BYTES, GARC_ERR_OOM, or a
+ *   stream failure.
+ */
+GARC_Result garc_tar_sparse_begin(
+    GARC_Archive * archive, const uint8_t * block, int old_gnu);
+
+/**
+ * Read the current sparse member: zeros for its holes, its stored bytes for its
+ * regions.
+ *
+ * @param archive The archive.
+ * @param buffer Destination.
+ * @param capacity Size of @p buffer.
+ * @param out_read Receives how many bytes were produced; 0 at the end.
+ * @return GARC_OK, GARC_ERR_CORRUPT on a short archive, or a stream failure.
+ */
+GARC_Result garc_tar_sparse_read(GARC_Archive * archive, void * buffer,
+    size_t capacity, size_t * out_read);
+
+/**
  * Release whatever the tar reader allocated.
  *
  * Called from garc_close() for every archive, not only a tar one: the buffers

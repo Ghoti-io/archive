@@ -81,6 +81,13 @@ typedef enum {
   GARC_PAX_UID,        ///< `uid=`, decimal.
   GARC_PAX_GID,        ///< `gid=`, decimal.
   GARC_PAX_HDRCHARSET, ///< `hdrcharset=`, saying what the records' bytes are.
+  GARC_PAX_SPARSE_SIZE,      ///< `GNU.sparse.size=`, the real size (0.0, 0.1).
+  GARC_PAX_SPARSE_NUMBLOCKS, ///< `GNU.sparse.numblocks=`, the map's length (0.x).
+  GARC_PAX_SPARSE_MAP,       ///< `GNU.sparse.map=`, comma-separated pairs (0.1).
+  GARC_PAX_SPARSE_MAJOR,     ///< `GNU.sparse.major=` (1.0).
+  GARC_PAX_SPARSE_MINOR,     ///< `GNU.sparse.minor=` (1.0).
+  GARC_PAX_SPARSE_NAME,      ///< `GNU.sparse.name=`, the real name (0.1, 1.0).
+  GARC_PAX_SPARSE_REALSIZE,  ///< `GNU.sparse.realsize=`, the real size (1.0).
   GARC_PAX_KEY_COUNT
 } GARC_Pax_Key;
 
@@ -106,6 +113,19 @@ typedef struct {
   size_t length[GARC_PAX_KEY_COUNT];
   /** Whether the key appeared at all. */
   int have[GARC_PAX_KEY_COUNT];
+  /**
+   * pax sparse 0.0's map: `GNU.sparse.offset=` and `GNU.sparse.numbytes=`
+   * records, one pair per region, repeated in order.
+   *
+   * The table above keeps the last value of a key, which is pax's rule and the
+   * wrong one here, so these are collected as they are parsed: two uint64_t per
+   * pair, offset then length.
+   */
+  GARC_Buffer sparse_pairs;
+  /** How many pairs @ref sparse_pairs holds. */
+  size_t sparse_pair_count;
+  /** Non-zero after an offset record whose numbytes has not arrived yet. */
+  int sparse_offset_pending;
 } GARC_Tar_Pax;
 
 /**
@@ -183,6 +203,22 @@ typedef struct {
    * clear a first one's `path`.
    */
   GARC_Tar_Pax pax_global;
+
+  /**
+   * @name The current member's sparse map, when it is a GNU sparse file
+   *
+   * The data in the archive is the map's regions, back to back. A read hands
+   * out the file instead: zeros up to each region, the region's stored bytes,
+   * and zeros after the last up to the real size. Kept across members like the
+   * long-name buffer, and claimed by @ref sparse.
+   * @{
+   */
+  GARC_Buffer sparse_map;   ///< Pairs of uint64_t: offset, then length.
+  size_t sparse_count;      ///< How many pairs.
+  int sparse;               ///< Non-zero when the current member is sparse.
+  uint64_t sparse_pos;      ///< Bytes of the real file handed out so far.
+  size_t sparse_index;      ///< The first region not wholly behind sparse_pos.
+  /** @} */
 } GARC_Tar_State;
 
 /**

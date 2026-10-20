@@ -83,13 +83,16 @@ static GARC_Result tar_buffer_reserve(
 }
 
 void garc_tar_release(GARC_Archive * archive) {
-  GARC_Buffer * const buffers[4] = {
+  GARC_Buffer * const buffers[7] = {
     &archive->tar.long_name,
     &archive->tar.long_link,
     &archive->tar.pax_next.records,
     &archive->tar.pax_global.records,
+    &archive->tar.pax_next.sparse_pairs,
+    &archive->tar.pax_global.sparse_pairs,
+    &archive->tar.sparse_map,
   };
-  for (size_t i = 0; i < 4u; ++i) {
+  for (size_t i = 0; i < 7u; ++i) {
     garc_buffer_free(archive->allocator, buffers[i]);
   }
 }
@@ -196,6 +199,9 @@ GARC_Result garc_tar_read_long_field(
 
 void garc_tar_pax_reset(GARC_Tar_Pax * pax) {
   pax->records.length = 0;
+  pax->sparse_pairs.length = 0;
+  pax->sparse_pair_count = 0;
+  pax->sparse_offset_pending = 0;
   for (size_t i = 0; i < (size_t)GARC_PAX_KEY_COUNT; ++i) {
     pax->have[i] = 0;
     pax->offset[i] = 0;
@@ -225,6 +231,13 @@ static const struct {
   {"uid", GARC_PAX_UID},
   {"gid", GARC_PAX_GID},
   {"hdrcharset", GARC_PAX_HDRCHARSET},
+  {"GNU.sparse.size", GARC_PAX_SPARSE_SIZE},
+  {"GNU.sparse.numblocks", GARC_PAX_SPARSE_NUMBLOCKS},
+  {"GNU.sparse.map", GARC_PAX_SPARSE_MAP},
+  {"GNU.sparse.major", GARC_PAX_SPARSE_MAJOR},
+  {"GNU.sparse.minor", GARC_PAX_SPARSE_MINOR},
+  {"GNU.sparse.name", GARC_PAX_SPARSE_NAME},
+  {"GNU.sparse.realsize", GARC_PAX_SPARSE_REALSIZE},
 };
 
 const char * garc_tar_pax_key_name(GARC_Pax_Key key) {
@@ -256,14 +269,17 @@ static const char tar_pax_sparse_prefix[] = "GNU.sparse.";
  * difference is that pax *defines* the override and GNU defines no order between
  * two carriers of the same kind.
  *
+ * @param archive The archive, for the allocator and the caps.
  * @param pax The set to add to.
  * @param from Where the new bytes start.
  * @param to Where they end.
- * @return GARC_OK, GARC_ERR_UNSUPPORTED for a sparse member, or
- *   GARC_ERR_CORRUPT.
+ * @param global Whether these are a `g` header's records.
+ * @return GARC_OK, GARC_ERR_UNSUPPORTED for a sparse record in a global header
+ *   or one this reader does not know, GARC_ERR_LIMIT_EXTRA_BYTES, GARC_ERR_OOM,
+ *   or GARC_ERR_CORRUPT.
  */
-static GARC_Result tar_pax_parse(
-    GARC_Tar_Pax * pax, size_t from, size_t to) {
+static GARC_Result tar_pax_parse(GARC_Archive * archive, GARC_Tar_Pax * pax,
+    size_t from, size_t to, int global) {
   const char * bytes = pax->records.bytes;
   size_t pos = from;
 
@@ -309,18 +325,42 @@ static GARC_Result tar_pax_parse(
     }
 
     const size_t key_length = equals - key;
-    if (key_length >= sizeof(tar_pax_sparse_prefix) - 1u
+    const int is_sparse = key_length >= sizeof(tar_pax_sparse_prefix) - 1u
         && memcmp(bytes + key, tar_pax_sparse_prefix,
                sizeof(tar_pax_sparse_prefix) - 1u)
-            == 0) {
-      // **Sparse is refused rather than ignored.** These records say the member's
-      // data is a map of holes and extents, so a reader that skipped them would
-      // hand a caller the map as the file's contents and report a size that is
-      // neither the stored length nor the real one. GARC_ERR_UNSUPPORTED names a
-      // feature that is not read yet; silence would name nothing.
+            == 0;
+    if (is_sparse && global) {
+      // A sparse map describes one file's data. In a global header it would
+      // describe every member's, which no writer means and nothing defines.
       return GARC_ERR_UNSUPPORTED;
     }
+    if (is_sparse) {
+      // pax 0.0 repeats these two keys once per region, in order, which the
+      // last-wins table cannot hold. tar_sparse.c checks the pairs.
+      const char * value = bytes + equals + 1u;
+      const size_t value_length = (end - 1u) - (equals + 1u);
+      if (key_length == 17u && memcmp(bytes + key, "GNU.sparse.offset", 17u) == 0) {
+        GARC_Result result = garc_tar_sparse_pax_pair(
+            archive, pax, value, value_length, 0);
+        if (result != GARC_OK) {
+          return result;
+        }
+        pos = end;
+        continue;
+      }
+      if (key_length == 19u
+          && memcmp(bytes + key, "GNU.sparse.numbytes", 19u) == 0) {
+        GARC_Result result = garc_tar_sparse_pax_pair(
+            archive, pax, value, value_length, 1);
+        if (result != GARC_OK) {
+          return result;
+        }
+        pos = end;
+        continue;
+      }
+    }
 
+    int known = 0;
     for (size_t i = 0; i < sizeof(tar_pax_keys) / sizeof(tar_pax_keys[0]); ++i) {
       if (key_length == strlen(tar_pax_keys[i].name)
           && memcmp(bytes + key, tar_pax_keys[i].name, key_length) == 0) {
@@ -328,8 +368,15 @@ static GARC_Result tar_pax_parse(
         pax->have[which] = 1;
         pax->offset[which] = equals + 1u;
         pax->length[which] = (end - 1u) - (equals + 1u);
+        known = 1;
         break;
       }
+    }
+    if (is_sparse && !known) {
+      // A sparse record this reader does not know is refused rather than
+      // ignored: it may say something about what the data is, and a reader
+      // that skipped it would hand out the wrong file.
+      return GARC_ERR_UNSUPPORTED;
     }
 
     pos = end;
@@ -398,7 +445,7 @@ GARC_Result garc_tar_read_pax_records(
     }
   }
 
-  return tar_pax_parse(pax, from, wanted);
+  return tar_pax_parse(archive, pax, from, wanted, global);
 }
 
 /**
@@ -625,6 +672,17 @@ GARC_Result garc_tar_apply_pax(GARC_Archive * archive) {
     // The one place a name carries a declaration rather than none. It applies
     // only to a name that came from a *record*: the header's own field is bytes
     // with no statement about them, whatever the records say about themselves.
+    member->name_encoding = tar_pax_encoding(archive);
+  }
+  // The real name of a sparse file, which pax 0.1 and 1.0 put here because the
+  // header and `path` name a placeholder (`./GNUSparseFile.<pid>/<name>`) that a
+  // reader knowing nothing of sparse files extracts somewhere harmless. Only
+  // the `x` set: tar_pax_parse() refuses sparse records in a global header.
+  if (archive->tar.pax_next.have[GARC_PAX_SPARSE_NAME]
+      && archive->tar.pax_next.length[GARC_PAX_SPARSE_NAME]) {
+    member->name = archive->tar.pax_next.records.bytes
+        + archive->tar.pax_next.offset[GARC_PAX_SPARSE_NAME];
+    member->name_length = archive->tar.pax_next.length[GARC_PAX_SPARSE_NAME];
     member->name_encoding = tar_pax_encoding(archive);
   }
   if (tar_pax_value(archive, GARC_PAX_LINKPATH, &bytes, &length)) {
