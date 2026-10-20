@@ -1486,8 +1486,12 @@ static size_t zip_extra_without_zip64(
     at += field;
   }
   // A truncated last field: the reader accepted the entry, and the copy keeps
-  // the bytes as they were rather than deciding what they meant.
-  memcpy(to + out, from + at, length - at);
+  // the bytes as they were rather than deciding what they meant. Nothing left
+  // is also how an entry with no extra field gets here, with @p from NULL,
+  // which memcpy may not be given even for no bytes (UBSan, the final gate).
+  if (length > at) {
+    memcpy(to + out, from + at, length - at);
+  }
   return out + (length - at);
 }
 

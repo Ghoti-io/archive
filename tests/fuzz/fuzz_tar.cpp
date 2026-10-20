@@ -244,7 +244,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
         produced += got;
         // The one that catches a reader leaking the next header's bytes into the
         // caller's buffer as file contents.
-        REQUIRE(produced <= member->size,
+        // A zip read off a pipe - which this harness reaches when the input
+        // is one - declares nothing for a member whose sizes follow its data,
+        // and the cap is then what bounds it.
+        REQUIRE(produced <= (member->size_unknown ? limits.max_member_bytes
+                                                  : member->size),
             "read_member produced more than the member declared");
       }
     }

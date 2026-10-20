@@ -472,7 +472,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
           break;
         }
         produced += got;
-        REQUIRE(produced <= found->size,
+        REQUIRE(produced <= (found->size_unknown ? limits.max_member_bytes
+                                                 : found->size),
             "read_member produced more than the found member declared");
       }
     }
