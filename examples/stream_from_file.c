@@ -23,10 +23,15 @@
  *
  * Read a file through this library without this library opening it.
  *
- * This is the whole of what a caller has to write to use the archive reader on
- * a file on disk, and it is the reason there is no `garc_stream_create_file()`:
- * the `fopen` is here, in the caller, where the caller's own permissions,
- * sandbox and error handling apply. The library sees three function pointers.
+ * For an ordinary file, ::garc_fs_stream_open() in fs.h does this, with 64-bit
+ * offsets on every platform. This is what to write when the bytes come from
+ * somewhere of your own instead: a descriptor handed in by a sandbox, a network
+ * object, a region of a larger file. The library sees three function pointers,
+ * and the open, the permissions and the error handling stay the caller's.
+ *
+ * Plain C's `fseek` takes a `long`, which is 32 bits on 64-bit Windows, so this
+ * version stops at 2 GB there. That limit belongs to the example's stdio, not
+ * to the library.
  *
  * Usage: `stream_from_file <path>`
  */

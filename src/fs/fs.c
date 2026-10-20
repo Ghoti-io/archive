@@ -37,6 +37,8 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "fs/fs_internal.h"
+
 /** Setuid, setgid and sticky. Cleared before any mode is applied. */
 #define GARC_FS_MODE_CLEAR ((uint32_t)(04000u | 02000u | 01000u))
 
@@ -79,7 +81,7 @@ static char * fs_dup(const char * text) {
   return text ? fs_dup_n(text, strlen(text)) : NULL;
 }
 
-static GARC_Result fs_from_file(GCU_File_Result result) {
+GARC_Result garc_fs_from_file(GCU_File_Result result) {
   switch (result) {
     case GCU_FILE_OK:
       return GARC_OK;
@@ -87,6 +89,10 @@ static GARC_Result fs_from_file(GCU_File_Result result) {
       return GARC_ERR_OOM;
     case GCU_FILE_ERR_INVALID:
       return GARC_ERR_INVALID;
+    case GCU_FILE_ERR_NOT_FOUND:
+      return GARC_ERR_NOT_FOUND;
+    case GCU_FILE_ERR_ACCESS:
+      return GARC_ERR_ACCESS;
     default:
       return GARC_ERR_IO;
   }
@@ -322,7 +328,7 @@ static GARC_Result fs_enter(FsExtract * state, char ** current,
     looked = gcu_dir_create(joined);
     if (looked != GCU_FILE_OK) {
       fs_free(joined);
-      return fs_from_file(looked);
+      return garc_fs_from_file(looked);
     }
     result = fs_canon(joined, &canon);
     fs_free(joined);
@@ -343,7 +349,7 @@ static GARC_Result fs_enter(FsExtract * state, char ** current,
   }
   if (looked != GCU_FILE_OK) {
     fs_free(joined);
-    return fs_from_file(looked);
+    return garc_fs_from_file(looked);
   }
 
   result = fs_canon(joined, &canon);
@@ -461,7 +467,7 @@ static GARC_Result fs_target_inside(const char * root, const char * parent,
     }
     if (looked != GCU_FILE_OK) {
       fs_free(joined);
-      result = fs_from_file(looked);
+      result = garc_fs_from_file(looked);
       break;
     }
     result = fs_canon(joined, &canon);
@@ -520,7 +526,7 @@ static GARC_Result fs_resolve_claimed(FsExtract * state, const char * target,
     if (looked != GCU_FILE_OK) {
       fs_free(joined);
       result = looked == GCU_FILE_ERR_NOT_FOUND
-          ? GARC_ERR_REFUSED : fs_from_file(looked);
+          ? GARC_ERR_REFUSED : garc_fs_from_file(looked);
       break;
     }
     result = fs_canon(joined, &canon);
@@ -571,7 +577,7 @@ static GARC_Result fs_apply_mode(const char * path, const GARC_Member * member) 
     return GARC_OK;
   }
 #endif
-  return fs_from_file(result);
+  return garc_fs_from_file(result);
 }
 
 static GARC_Result fs_write_file(GARC_Archive * archive,
@@ -581,7 +587,7 @@ static GARC_Result fs_write_file(GARC_Archive * archive,
   uint8_t buffer[8192];
   GARC_Result result = GARC_OK;
   memset(&handle, 0, sizeof(handle));
-  result = fs_from_file(gcu_file_open(&handle, path, GCU_FILE_OPEN_WRITE,
+  result = garc_fs_from_file(gcu_file_open(&handle, path, GCU_FILE_OPEN_WRITE,
       GCU_FILE_PERMS_PRIVATE, NULL));
   if (result != GARC_OK) {
     return result;
@@ -597,14 +603,14 @@ static GARC_Result fs_write_file(GARC_Archive * archive,
       result = GARC_ERR_CORRUPT;
       break;
     }
-    result = fs_from_file(gcu_file_write_bytes(&handle, buffer, got));
+    result = garc_fs_from_file(gcu_file_write_bytes(&handle, buffer, got));
     if (result != GARC_OK) {
       break;
     }
     left -= got;
   }
   if (result == GARC_OK) {
-    result = fs_from_file(gcu_file_close(&handle));
+    result = garc_fs_from_file(gcu_file_close(&handle));
   }
   else {
     gcu_file_close(&handle);
@@ -666,7 +672,7 @@ static GARC_Result fs_create_final(GARC_Archive * archive,
     }
     else if (looked != GCU_FILE_ERR_NOT_FOUND) {
       fs_free(dest);
-      return fs_from_file(looked);
+      return garc_fs_from_file(looked);
     }
   }
 
@@ -713,7 +719,7 @@ static GARC_Result fs_create_final(GARC_Archive * archive,
         return GARC_ERR_REFUSED;
       }
 #endif
-      return fs_from_file(looked);
+      return garc_fs_from_file(looked);
     }
     result = fs_paths_add(&state->claimed, dest);
     fs_free(dest);
@@ -730,7 +736,7 @@ static GARC_Result fs_create_final(GARC_Archive * archive,
     fs_free(claimed_target);
     if (looked != GCU_FILE_OK) {
       fs_free(dest);
-      return fs_from_file(looked);
+      return garc_fs_from_file(looked);
     }
     result = fs_canon(dest, &canon);
     if (result != GARC_OK) {
@@ -752,7 +758,7 @@ static GARC_Result fs_create_final(GARC_Archive * archive,
     looked = gcu_dir_create(dest);
     if (looked != GCU_FILE_OK) {
       fs_free(dest);
-      return fs_from_file(looked);
+      return garc_fs_from_file(looked);
     }
   }
   else {
@@ -890,7 +896,7 @@ GARC_Result garc_fs_extract(GARC_Archive * archive, const char * root,
   state.flags = flags;
   looked = gcu_file_stat(root, &info);
   if (looked != GCU_FILE_OK) {
-    return fs_from_file(looked);
+    return garc_fs_from_file(looked);
   }
   if (info.type != GCU_FILE_TYPE_DIRECTORY) {
     return GARC_ERR_INVALID;
@@ -1017,7 +1023,7 @@ static GARC_Result fs_pack_dir(const char * dir, const char * rel, FsList * list
   GCU_Dir handle;
   GARC_Result result = GARC_OK;
   memset(&handle, 0, sizeof(handle));
-  result = fs_from_file(gcu_dir_open(&handle, dir, NULL));
+  result = garc_fs_from_file(gcu_dir_open(&handle, dir, NULL));
   if (result != GARC_OK) {
     return result;
   }
@@ -1032,7 +1038,7 @@ static GARC_Result fs_pack_dir(const char * dir, const char * rel, FsList * list
     GCU_File_Result looked;
     looked = gcu_dir_read(&handle, &name, NULL, &done);
     if (looked != GCU_FILE_OK) {
-      result = fs_from_file(looked);
+      result = garc_fs_from_file(looked);
       break;
     }
     if (done) {
@@ -1052,7 +1058,7 @@ static GARC_Result fs_pack_dir(const char * dir, const char * rel, FsList * list
     if (looked != GCU_FILE_OK) {
       fs_free(full);
       fs_free(child_rel);
-      result = fs_from_file(looked);
+      result = garc_fs_from_file(looked);
       break;
     }
     entry.full = full;
@@ -1064,7 +1070,7 @@ static GARC_Result fs_pack_dir(const char * dir, const char * rel, FsList * list
       looked = gcu_file_identity(full, &id);
       if (looked != GCU_FILE_OK) {
         fs_entry_clear(&entry);
-        result = fs_from_file(looked);
+        result = garc_fs_from_file(looked);
         break;
       }
       entry.mode = id.mode;
@@ -1101,7 +1107,7 @@ static GARC_Result fs_pack_dir(const char * dir, const char * rel, FsList * list
       looked = gcu_file_read_link(full, NULL, &text, &length);
       if (looked != GCU_FILE_OK) {
         fs_entry_clear(&entry);
-        result = fs_from_file(looked);
+        result = garc_fs_from_file(looked);
         break;
       }
       entry.link = text;
@@ -1122,7 +1128,7 @@ static GARC_Result fs_pack_dir(const char * dir, const char * rel, FsList * list
     looked = gcu_file_identity(full, &id);
     if (looked != GCU_FILE_OK) {
       fs_entry_clear(&entry);
-      result = fs_from_file(looked);
+      result = garc_fs_from_file(looked);
       break;
     }
     entry.type = GARC_MEMBER_FILE;
@@ -1212,7 +1218,7 @@ static GARC_Result fs_emit(GARC_Writer * writer, const FsList * list) {
       GCU_File_Info again;
       GCU_File_Result looked = gcu_file_stat_link(entry->full, &again);
       if (looked != GCU_FILE_OK) {
-        return fs_from_file(looked);
+        return garc_fs_from_file(looked);
       }
       if (again.type != GCU_FILE_TYPE_REGULAR) {
         return GARC_ERR_REFUSED;
@@ -1220,7 +1226,7 @@ static GARC_Result fs_emit(GARC_Writer * writer, const FsList * list) {
       looked = gcu_file_read(entry->full, GCU_FILE_UNLIMITED,
           NULL, &data, &length);
       if (looked != GCU_FILE_OK) {
-        return fs_from_file(looked);
+        return garc_fs_from_file(looked);
       }
       member.size = length;
     }
@@ -1256,7 +1262,7 @@ GARC_Result garc_fs_pack(GARC_Writer * writer, const char * root,
   }
   looked = gcu_file_stat(root, &info);
   if (looked != GCU_FILE_OK) {
-    return fs_from_file(looked);
+    return garc_fs_from_file(looked);
   }
   if (info.type != GCU_FILE_TYPE_DIRECTORY) {
     return GARC_ERR_INVALID;
@@ -1273,7 +1279,7 @@ GARC_Result garc_fs_pack(GARC_Writer * writer, const char * root,
     looked = gcu_file_identity(canon, &root_id);
     if (looked != GCU_FILE_OK) {
       fs_free(canon);
-      return fs_from_file(looked);
+      return garc_fs_from_file(looked);
     }
     root_seen.device = root_id.device;
     root_seen.inode = root_id.inode;

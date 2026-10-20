@@ -27,11 +27,10 @@
  * second copy of `tar_list.c`: what this shows is the handful of questions a zip
  * can be asked and a tar cannot.
  *
- * **A seek is required, and this program says so.** The `size` and `seek`
- * callbacks are not optional here the way they are for a tar: the answer to
- * "what is in this archive" is at the far end of the file. A stream that cannot
- * seek gets ::GARC_ERR_NOT_SEEKABLE from ::garc_open(), which this prints as
- * itself rather than as "not an archive".
+ * **A seek is required.** The answer to "what is in this archive" is at the far
+ * end of the file, so the stream must seek. ::garc_fs_open() gives it one. A
+ * stream that cannot seek - a pipe - gets ::GARC_ERR_NOT_SEEKABLE from
+ * ::garc_open(), which is a different answer from "not an archive".
  *
  * **A member this library cannot decompress is still a member.** Its name, size,
  * time and method are all readable; only ::garc_read_member() refuses, and it
@@ -61,45 +60,12 @@
  */
 
 #include <inttypes.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <ghoti.io/archive/archive.h>
-
-static GARC_Result file_read(
-    void * ctx, void * buffer, size_t size, size_t * out_read) {
-  FILE * file = (FILE *)ctx;
-  size_t got = fread(buffer, 1, size, file);
-  if (got < size && ferror(file)) {
-    return GARC_ERR_IO;
-  }
-  *out_read = got;
-  return GARC_OK;
-}
-
-static GARC_Result file_seek(void * ctx, uint64_t offset) {
-  FILE * file = (FILE *)ctx;
-  if (offset > (uint64_t)LONG_MAX) {
-    return GARC_ERR_IO;
-  }
-  return fseek(file, (long)offset, SEEK_SET) == 0 ? GARC_OK : GARC_ERR_IO;
-}
-
-static GARC_Result file_size(void * ctx, uint64_t * out_size) {
-  FILE * file = (FILE *)ctx;
-  long here = ftell(file);
-  if (here < 0 || fseek(file, 0, SEEK_END) != 0) {
-    return GARC_ERR_IO;
-  }
-  long end = ftell(file);
-  if (end < 0 || fseek(file, here, SEEK_SET) != 0) {
-    return GARC_ERR_IO;
-  }
-  *out_size = (uint64_t)end;
-  return GARC_OK;
-}
+#include <ghoti.io/archive/fs.h>
 
 /** Print bytes with everything but printable ASCII escaped. */
 static void print_escaped(const char * bytes, size_t length) {
@@ -129,33 +95,12 @@ int main(int argc, char ** argv) {
     return 2;
   }
 
-  FILE * file = fopen(argv[1], "rb");
-  if (!file) {
-    fprintf(stderr, "cannot open %s\n", argv[1]);
-    return 1;
-  }
-
-  GARC_Stream_Callbacks callbacks = {
-    .read = file_read,
-    .seek = file_seek,
-    .size = file_size,
-    .ctx = file,
-  };
-
-  GARC_Stream * stream = NULL;
-  GARC_Result result = garc_stream_create_callback(&callbacks, &stream);
-  if (result != GARC_OK) {
-    fprintf(stderr, "stream: %s\n", garc_result_string(result));
-    fclose(file);
-    return 1;
-  }
-
+  // fs.h opens the file seekably, with 64-bit offsets on every platform. The
+  // reader itself never opens a file; this is the opt-in layer that does.
   GARC_Archive * archive = NULL;
-  result = garc_open(stream, NULL, &archive);
+  GARC_Result result = garc_fs_open(argv[1], NULL, NULL, 0, &archive);
   if (result != GARC_OK) {
     fprintf(stderr, "%s: %s\n", argv[1], garc_result_string(result));
-    garc_stream_destroy(stream);
-    fclose(file);
     return 1;
   }
 
@@ -165,8 +110,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "%s is a %s, not a zip\n", argv[1],
         garc_format_string(garc_format(archive)));
     garc_close(archive);
-    garc_stream_destroy(stream);
-    fclose(file);
     return 1;
   }
 
@@ -178,8 +121,6 @@ int main(int argc, char ** argv) {
     if (result != GARC_OK) {
       fprintf(stderr, "password: %s\n", garc_result_string(result));
       garc_close(archive);
-      garc_stream_destroy(stream);
-      fclose(file);
       return 1;
     }
   }
@@ -266,8 +207,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "%s: %s after %" PRIu64 " members\n", argv[1],
         garc_result_string(result), garc_member_count(archive));
     garc_close(archive);
-    garc_stream_destroy(stream);
-    fclose(file);
     return 1;
   }
 
@@ -283,7 +222,5 @@ int main(int argc, char ** argv) {
   putchar('\n');
 
   garc_close(archive);
-  garc_stream_destroy(stream);
-  fclose(file);
   return 0;
 }

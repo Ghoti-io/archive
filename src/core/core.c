@@ -82,6 +82,10 @@ const char * garc_result_string(GARC_Result result) {
              "apart";
     case GARC_ERR_REFUSED:
       return "Refused by the filesystem layer";
+    case GARC_ERR_NOT_FOUND:
+      return "No such file or directory";
+    case GARC_ERR_ACCESS:
+      return "Access denied";
     case GARC_RESULT_COUNT:
     default:
       return "Unknown error";

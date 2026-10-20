@@ -31,10 +31,12 @@ time, a type, permissions, and possibly its own codec. Two things follow:
 
 ## 2. The filesystem is not this library's
 
-**Nothing in the reader or the writer opens, creates, or writes a file.** A
-caller reading an archive from disk does the `fopen` and supplies a
-`GARC_Stream_Callbacks`, which is the three functions `examples/stream_from_file.c`
-shows.
+**Nothing in the reader or the writer opens, creates, or writes a file.** They
+read a `GARC_Stream` and write a `GARC_Sink`, and a caller with bytes from
+anywhere supplies one as callbacks, which is the three functions
+`examples/stream_from_file.c` shows. For an ordinary file, the opt-in `fs.h`
+has `garc_fs_stream_open()`, `garc_fs_sink_create()` and `garc_fs_open()`;
+see below.
 
 The security property is the reason. Every well-known archive vulnerability is
 a path vulnerability:
@@ -56,6 +58,25 @@ Extraction to a directory, and creation from one, are `garc_fs_extract()` and
 `garc_fs_pack()` in `fs.h`. That header is not included by `archive.h`. The
 reader and the writer still do not open a file. The layer has one job, done
 once, in one place: the canonical path stays inside the root.
+
+The same header opens files, because every caller was writing the same glue
+and getting the same two things wrong: `fseek` takes a `long`, which stops at
+2 GB on 64-bit Windows, and a zip or 7z writer needs a `patch` callback that
+saves and restores the position. `garc_fs_stream_open()` and
+`garc_fs_sink_create()` go through cutil's file handle, which is 64-bit and
+UTF-8 everywhere. The sink writes a temporary file beside the destination and
+renames it on `garc_sink_finish()`, so a writer that fails leaves nothing at the
+path. Given a codec name, it compresses on the way and the finish writes the
+codec's trailer before the rename.
+
+`garc_fs_open()` is where detection lives, which `codec.h` deferred to this
+layer. It tries the containers on the raw bytes first, so a tar whose first
+member happens to be named `BZh9` is a tar. Then it asks `gcomp_detect()`, and
+acts only on codecs with a real magic number: gzip, bzip2, xz, zstd and lz4.
+zlib's two header bytes match about one random pair in 992, so they are not
+trusted. brotli and `.lzma` have no magic number, and the file name decides for
+them only when the caller sets `GARC_FS_NAME_HINT`. One layer is removed, never
+two.
 
 ### Naming the danger without deciding about it
 

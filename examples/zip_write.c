@@ -28,13 +28,14 @@
  * CRC-32 and compressed size are not known when its local header is written, so
  * the archive either carries a *data descriptor* after each member or the header
  * is filled in afterwards. Which one happens depends on whether the sink can go
- * back, and a `FILE *` can - so this program supplies a `patch` callback and
- * reports which form it produced.
+ * back. The file sink from fs.h can: it writes to a temporary file beside the
+ * destination, patches the headers, and renames the file into place when the
+ * sink is finished, so a failed run never leaves a half-written zip at the path.
  *
- * **`patch` is nine lines and it is the whole difference.** Without it the same
- * program writes a valid archive that is 16 bytes per member longer and has flag
- * bit 3 set on every member. Run with `--stream` to see that, which is what a
- * caller writing to a socket gets whether they ask for it or not.
+ * **`--stream` is what a pipe or a socket gets.** It writes through a callback
+ * sink with no `patch`, and the same program produces a valid archive that is 16
+ * bytes per member longer and has flag bit 3 set on every member, whether the
+ * caller asked for it or not.
  *
  * **A symlink's target is written for you.** In zip a symlink has no link field:
  * its target *is* its data. So this sets ::GARC_Member.link_target and writes no
@@ -54,12 +55,12 @@
  */
 
 #include <inttypes.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <ghoti.io/archive/archive.h>
+#include <ghoti.io/archive/fs.h>
 
 static const char USAGE[]
     = "usage: %s <path.zip> [--stream] "
@@ -68,35 +69,6 @@ static const char USAGE[]
 static GARC_Result file_write(void * ctx, const void * buffer, size_t size) {
   FILE * file = (FILE *)ctx;
   return fwrite(buffer, 1, size, file) == size ? GARC_OK : GARC_ERR_IO;
-}
-
-/**
- * Overwrite bytes already written, and leave the position where it was.
- *
- * **Restoring the position is this callback's contract**, which is why the sink
- * takes a `patch` rather than a `seek`: three lines here, once, instead of a
- * pairing rule the library would have to trust every caller to keep.
- *
- * @param ctx The `FILE *`.
- * @param offset Where to write, from the first byte written.
- * @param buffer The replacement bytes.
- * @param size How many.
- * @return ::GARC_OK, or ::GARC_ERR_IO.
- */
-static GARC_Result file_patch(
-    void * ctx, uint64_t offset, const void * buffer, size_t size) {
-  FILE * file = (FILE *)ctx;
-  const long here = ftell(file);
-  if (here < 0 || offset > (uint64_t)LONG_MAX) {
-    return GARC_ERR_IO;
-  }
-  if (fseek(file, (long)offset, SEEK_SET) != 0) {
-    return GARC_ERR_IO;
-  }
-  if (fwrite(buffer, 1, size, file) != size) {
-    return GARC_ERR_IO;
-  }
-  return fseek(file, here, SEEK_SET) == 0 ? GARC_OK : GARC_ERR_IO;
 }
 
 /** One member to write: what a caller's own loop would be filling in. */
@@ -186,27 +158,32 @@ int main(int argc, char ** argv) {
     return 2;
   }
 
-  FILE * file = fopen(argv[1], "wb");
-  if (!file) {
-    fprintf(stderr, "cannot write %s\n", argv[1]);
-    return 1;
-  }
-
-  GARC_Sink_Callbacks callbacks;
-  memset(&callbacks, 0, sizeof(callbacks));
-  callbacks.write = file_write;
-  callbacks.ctx = file;
-  if (!stream) {
-    // Offered, not required. Leaving it NULL is how a caller writing to a pipe
-    // says so, and the archive is still valid - see the report at the end.
-    callbacks.patch = file_patch;
-  }
-
   GARC_Sink * sink = NULL;
-  GARC_Result result = garc_sink_create_callback(&callbacks, &sink);
+  FILE * file = NULL;
+  GARC_Result result = GARC_OK;
+  if (!stream) {
+    // A file sink can patch, so the writer fills in each local header.
+    result = garc_fs_sink_create(argv[1], NULL, NULL, 0, &sink);
+  }
+  else {
+    // A sink with only `write`, which is how a caller writing to a pipe says
+    // so. The archive is still valid - see the report at the end.
+    file = fopen(argv[1], "wb");
+    if (!file) {
+      fprintf(stderr, "cannot write %s\n", argv[1]);
+      return 1;
+    }
+    GARC_Sink_Callbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.write = file_write;
+    callbacks.ctx = file;
+    result = garc_sink_create_callback(&callbacks, &sink);
+  }
   if (result != GARC_OK) {
-    fprintf(stderr, "sink: %s\n", garc_result_string(result));
-    fclose(file);
+    fprintf(stderr, "%s: %s\n", argv[1], garc_result_string(result));
+    if (file) {
+      fclose(file);
+    }
     return 1;
   }
 
@@ -222,7 +199,9 @@ int main(int argc, char ** argv) {
   if (result != GARC_OK) {
     fprintf(stderr, "writer: %s\n", garc_result_string(result));
     garc_sink_destroy(sink);
-    fclose(file);
+    if (file) {
+      fclose(file);
+    }
     return 1;
   }
 
@@ -270,12 +249,20 @@ int main(int argc, char ** argv) {
       fprintf(stderr, "finish: %s\n", garc_result_string(result));
     }
   }
+  if (result == GARC_OK) {
+    // For the file sink this is the rename into place. Destroying a sink that
+    // was never finished removes the temporary file instead.
+    result = garc_sink_finish(sink);
+    if (result != GARC_OK) {
+      fprintf(stderr, "%s: %s\n", argv[1], garc_result_string(result));
+    }
+  }
 
   const uint64_t written = garc_sink_tell(sink);
   const uint64_t members = garc_writer_member_count(writer);
   garc_writer_destroy(writer);
   garc_sink_destroy(sink);
-  if (fclose(file) != 0) {
+  if (file && fclose(file) != 0) {
     fprintf(stderr, "%s: could not be closed\n", argv[1]);
     return 1;
   }

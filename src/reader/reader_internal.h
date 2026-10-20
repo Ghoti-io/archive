@@ -367,6 +367,16 @@ typedef struct {
 struct GARC_Archive {
   /** The stream, borrowed. The caller destroys it; garc_close() does not. */
   GARC_Stream * stream;
+  /**
+   * Streams this archive owns, outermost first, or NULL.
+   *
+   * Only ::garc_fs_open() sets them: it opened the file and perhaps a
+   * decompressing stream over it, so nobody else holds them. garc_close()
+   * destroys both after the format reader is released, the outer one first,
+   * because it reads from the inner one.
+   */
+  GARC_Stream * owned_stream;
+  GARC_Stream * owned_inner; ///< See @ref owned_stream.
   /** Allocator for this object. */
   const GARC_Allocator * allocator;
   /** The caps, resolved at open so that NULL means the defaults exactly once. */

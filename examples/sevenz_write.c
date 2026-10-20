@@ -25,11 +25,11 @@
  *
  * A 7z puts its header at the *end* and the pointer to that header at the
  * *front*: the 32-byte signature header says where the real header is, and
- * that is not known until every file has been written. So this program's sink
- * supplies a `patch` callback - nine lines that overwrite bytes already
- * written - and the library refuses a sink without one with
- * ::GARC_ERR_NOT_SEEKABLE rather than producing an archive that points
- * nowhere. Run it against a pipe-shaped sink and that refusal is the result.
+ * that is not known until every file has been written. So the sink must be
+ * able to `patch` - overwrite bytes already written - and the library refuses
+ * a sink that cannot with ::GARC_ERR_NOT_SEEKABLE rather than producing an
+ * archive that points nowhere. The file sink from fs.h can, and it renames the
+ * finished file into place, so a failed run leaves nothing at the path.
  *
  * **Solid is the default.** All the files go through one compressor, so each
  * sees the ones before it, which is why a solid archive is smaller and why
@@ -45,29 +45,12 @@
  */
 
 #include <inttypes.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <ghoti.io/archive/archive.h>
-
-static GARC_Result file_write(void * ctx, const void * buffer, size_t size) {
-  return fwrite(buffer, 1, size, (FILE *)ctx) == size ? GARC_OK : GARC_ERR_IO;
-}
-
-/** Overwrite bytes already written, and leave the position where it was. */
-static GARC_Result file_patch(
-    void * ctx, uint64_t offset, const void * buffer, size_t size) {
-  FILE * file = (FILE *)ctx;
-  const long here = ftell(file);
-  if (here < 0 || offset > (uint64_t)LONG_MAX
-      || fseek(file, (long)offset, SEEK_SET) != 0
-      || fwrite(buffer, 1, size, file) != size) {
-    return GARC_ERR_IO;
-  }
-  return fseek(file, here, SEEK_SET) == 0 ? GARC_OK : GARC_ERR_IO;
-}
+#include <ghoti.io/archive/fs.h>
 
 typedef struct {
   const char * name;
@@ -133,21 +116,10 @@ int main(int argc, char ** argv) {
     }
   }
 
-  FILE * file = fopen(argv[1], "wb");
-  if (!file) {
-    fprintf(stderr, "cannot write %s\n", argv[1]);
-    return 1;
-  }
-  GARC_Sink_Callbacks callbacks;
-  memset(&callbacks, 0, sizeof(callbacks));
-  callbacks.write = file_write;
-  callbacks.patch = file_patch;
-  callbacks.ctx = file;
   GARC_Sink * sink = NULL;
-  GARC_Result result = garc_sink_create_callback(&callbacks, &sink);
+  GARC_Result result = garc_fs_sink_create(argv[1], NULL, NULL, 0, &sink);
   if (result != GARC_OK) {
-    fprintf(stderr, "sink: %s\n", garc_result_string(result));
-    fclose(file);
+    fprintf(stderr, "%s: %s\n", argv[1], garc_result_string(result));
     return 1;
   }
 
@@ -160,7 +132,6 @@ int main(int argc, char ** argv) {
   if (result != GARC_OK) {
     fprintf(stderr, "writer: %s\n", garc_result_string(result));
     garc_sink_destroy(sink);
-    fclose(file);
     return 1;
   }
 
@@ -197,11 +168,19 @@ int main(int argc, char ** argv) {
       fprintf(stderr, "finish: %s\n", garc_result_string(result));
     }
   }
+  if (result == GARC_OK) {
+    // The rename into place. A sink destroyed unfinished removes its
+    // temporary file instead.
+    result = garc_sink_finish(sink);
+    if (result != GARC_OK) {
+      fprintf(stderr, "%s: %s\n", argv[1], garc_result_string(result));
+    }
+  }
   const uint64_t written = garc_sink_tell(sink);
   const uint64_t members = garc_writer_member_count(writer);
   garc_writer_destroy(writer);
   garc_sink_destroy(sink);
-  if (fclose(file) != 0 || result != GARC_OK) {
+  if (result != GARC_OK) {
     return 1;
   }
   printf("%s: %" PRIu64 " members, %" PRIu64 " bytes, %s\n", argv[1], members,

@@ -23,60 +23,35 @@
  *
  * List an archive's members, and total the bytes of the ones that are files.
  *
- * `tar -tvf` without the parts that need a filesystem. Two things it shows that
- * a shorter example would not:
+ * `tar -tvf` without the parts that need a filesystem. Three things it shows
+ * that a shorter example would not:
  *
- * **The library never opens the file.** The `fopen` is here; the library gets
- * three function pointers. That is not ceremony - it is the property that makes
- * a zip-slip impossible in anything this library does.
+ * **One call opens a file, compressed or not.** ::garc_fs_open() is in fs.h,
+ * which is opt-in: the reader itself never opens a file. It tries the
+ * containers, then asks `compress` what wrote the first bytes, so the same
+ * program lists a `.tar`, a `.tar.gz`, a `.tar.xz`, a `.zip` or a `.7z`.
+ * `--name-hint` lets the file name decide for brotli and `.lzma`, which have no
+ * magic number.
  *
  * **A member name is printed escaped.** A name is attacker-controlled bytes, so
  * a listing tool that writes them straight to a terminal can be made to say
  * whatever the archive wants. This is what the escaping in `garc_member_dump()`
  * is for, and an example that skipped it would be teaching the wrong lesson.
  *
- * Usage: tar_list <path.tar>
+ * **Limits are on by default.** NULL limits are bounded on every field, and
+ * NULL codec options cap a decompressed stream at 512 MiB, so a hostile archive
+ * cannot make this program ask for a petabyte.
+ *
+ * Usage: `tar_list [--name-hint] <path>`
  */
 
 #include <inttypes.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <ghoti.io/archive/archive.h>
-
-static GARC_Result file_read(
-    void * ctx, void * buffer, size_t size, size_t * out_read) {
-  FILE * file = (FILE *)ctx;
-  size_t got = fread(buffer, 1, size, file);
-  if (got < size && ferror(file)) {
-    return GARC_ERR_IO;
-  }
-  *out_read = got;
-  return GARC_OK;
-}
-
-static GARC_Result file_seek(void * ctx, uint64_t offset) {
-  FILE * file = (FILE *)ctx;
-  if (offset > (uint64_t)LONG_MAX) {
-    return GARC_ERR_IO;
-  }
-  return fseek(file, (long)offset, SEEK_SET) == 0 ? GARC_OK : GARC_ERR_IO;
-}
-
-static GARC_Result file_size(void * ctx, uint64_t * out_size) {
-  FILE * file = (FILE *)ctx;
-  long here = ftell(file);
-  if (here < 0 || fseek(file, 0, SEEK_END) != 0) {
-    return GARC_ERR_IO;
-  }
-  long end = ftell(file);
-  if (end < 0 || fseek(file, here, SEEK_SET) != 0) {
-    return GARC_ERR_IO;
-  }
-  *out_size = (uint64_t)end;
-  return GARC_OK;
-}
+#include <ghoti.io/archive/fs.h>
 
 /** Print bytes with everything but printable ASCII escaped. */
 static void print_escaped(const char * bytes, size_t length) {
@@ -96,48 +71,30 @@ static void print_escaped(const char * bytes, size_t length) {
  * List one archive's members.
  *
  * @param argc Argument count.
- * @param argv `argv[1]` is the archive to read.
+ * @param argv `tar_list [--name-hint] <path>`.
  * @return 0 on success, 1 on any failure, 2 on a usage error.
  */
 int main(int argc, char ** argv) {
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s <path.tar>\n", argv[0]);
+  uint32_t flags = 0;
+  int at = 1;
+  if (argc == 3 && strcmp(argv[1], "--name-hint") == 0) {
+    flags = GARC_FS_NAME_HINT;
+    at = 2;
+  }
+  if (argc != at + 1) {
+    fprintf(stderr, "usage: %s [--name-hint] <path>\n", argv[0]);
     return 2;
   }
+  const char * path = argv[at];
 
-  FILE * file = fopen(argv[1], "rb");
-  if (!file) {
-    fprintf(stderr, "cannot open %s\n", argv[1]);
-    return 1;
-  }
-
-  GARC_Stream_Callbacks callbacks = {
-    .read = file_read,
-    .seek = file_seek,
-    .size = file_size,
-    .ctx = file,
-  };
-
-  GARC_Stream * stream = NULL;
-  GARC_Result result = garc_stream_create_callback(&callbacks, &stream);
-  if (result != GARC_OK) {
-    fprintf(stderr, "stream: %s\n", garc_result_string(result));
-    fclose(file);
-    return 1;
-  }
-
-  // NULL limits means garc_limits_default(), which is bounded on every field -
-  // so this program cannot be made to ask for a petabyte by a hostile archive.
   GARC_Archive * archive = NULL;
-  result = garc_open(stream, NULL, &archive);
+  GARC_Result result = garc_fs_open(path, NULL, NULL, flags, &archive);
   if (result != GARC_OK) {
-    fprintf(stderr, "%s: %s\n", argv[1], garc_result_string(result));
-    garc_stream_destroy(stream);
-    fclose(file);
+    fprintf(stderr, "%s: %s\n", path, garc_result_string(result));
     return 1;
   }
 
-  printf("%s: %s\n", argv[1], garc_format_string(garc_format(archive)));
+  printf("%s: %s\n", path, garc_format_string(garc_format(archive)));
 
   uint64_t file_bytes = 0;
   const GARC_Member * member = NULL;
@@ -174,11 +131,9 @@ int main(int argc, char ** argv) {
   // GARC_END is the end of a well-formed archive and is not a failure, which is
   // why this asks the predicate rather than comparing against GARC_OK.
   if (garc_result_is_error(result)) {
-    fprintf(stderr, "%s: %s after %" PRIu64 " members\n", argv[1],
+    fprintf(stderr, "%s: %s after %" PRIu64 " members\n", path,
         garc_result_string(result), garc_member_count(archive));
     garc_close(archive);
-    garc_stream_destroy(stream);
-    fclose(file);
     return 1;
   }
 
@@ -186,8 +141,7 @@ int main(int argc, char ** argv) {
       garc_member_count(archive), garc_total_declared_bytes(archive),
       file_bytes);
 
+  // Closes the file and any decompressing stream with it.
   garc_close(archive);
-  garc_stream_destroy(stream);
-  fclose(file);
   return 0;
 }

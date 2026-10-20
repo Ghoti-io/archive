@@ -720,6 +720,9 @@ void garc_close(GARC_Archive * archive) {
   reader_release(archive);
   // The stream is the caller's. This library never frees what it did not
   // allocate, and a close that destroyed it would make the borrowing in
-  // garc_open() a lie a caller finds out about as a double free.
+  // garc_open() a lie a caller finds out about as a double free. The two owned
+  // streams are the exception that proves it: garc_fs_open() allocated them.
+  garc_stream_destroy(archive->owned_stream);
+  garc_stream_destroy(archive->owned_inner);
   gcu_allocator_free(archive->allocator, archive);
 }

@@ -53,11 +53,50 @@
  * whose other name is inside the tree is a hard link member; one whose other
  * name is outside is a refusal. If the writer cannot store a hard link, that
  * status is the result of the pack.
+ *
+ * **Files as streams and sinks.** ::garc_fs_stream_open() reads a file,
+ * seekably and with its size known, so every format can be read from it.
+ * ::garc_fs_sink_create() writes one, and it can patch, so a zip or 7z writer
+ * needs no glue. A sink never writes the destination in place. It writes a
+ * temporary file in the destination's directory, and ::garc_sink_finish()
+ * renames that over the destination. A sink destroyed without being finished
+ * removes the temporary file and leaves the destination as it was. Paths are
+ * UTF-8 on every platform, and offsets are 64-bit on every platform.
+ *
+ * **Opening by path detects compression.** ::garc_fs_open() tries the
+ * containers first. If none matches, it asks `compress` which codec wrote the
+ * first bytes. gzip, bzip2, xz, zstd and lz4 have magic numbers and are
+ * accepted. zlib's two header bytes are a guess, about one random pair in
+ * 992, so they are not trusted. brotli and `.lzma` have no magic, and the file
+ * name decides for them only when ::GARC_FS_NAME_HINT is set. The core
+ * ::garc_open() still detects nothing; detection is this layer's policy.
+ *
+ * @code
+ * GARC_Archive * archive = NULL;
+ * if (garc_fs_open("backup.tar.xz", NULL, NULL, 0, &archive) == GARC_OK) {
+ *   const GARC_Member * member;
+ *   while (garc_next(archive, &member) == GARC_OK) {
+ *     // ...
+ *   }
+ *   garc_close(archive); // closes the file too
+ * }
+ *
+ * GARC_Sink * sink = NULL;
+ * GARC_Writer * writer = NULL;
+ * garc_fs_sink_create("out.tar.gz", "gzip", NULL, 0, &sink);
+ * garc_writer_create(sink, GARC_FORMAT_TAR, NULL, &writer);
+ * // ... garc_writer_add() and garc_writer_write() ...
+ * garc_writer_finish(writer);
+ * garc_sink_finish(sink); // the codec's trailer, then the rename
+ * garc_writer_destroy(writer);
+ * garc_sink_destroy(sink);
+ * @endcode
  */
 
 #ifndef GHOTI_IO_GARC_FS_H
 #define GHOTI_IO_GARC_FS_H
 
+#include <ghoti.io/archive/codec.h>
 #include <ghoti.io/archive/core.h>
 #include <ghoti.io/archive/macros.h>
 #include <ghoti.io/archive/name.h>
@@ -87,6 +126,145 @@ extern "C" {
  * legal.
  */
 #define GARC_FS_ALLOW_PORTABLE_NAMES ((uint32_t)1u << 1)
+
+/**
+ * @brief Rename into place without asking the disk to commit first.
+ *
+ * For ::garc_fs_sink_create(). By default a finished sink asks the operating
+ * system to commit the file before the rename, so a power loss leaves either
+ * the old file or the whole new one. With this flag, a crash soon after
+ * finishing can leave the new name pointing at an incomplete file on some
+ * filesystems. Faster, and right for scratch output.
+ */
+#define GARC_FS_NO_SYNC ((uint32_t)1u << 2)
+
+/**
+ * @brief Let the file name decide a codec the bytes cannot.
+ *
+ * For ::garc_fs_open(). brotli and `.lzma` have no magic number. With this
+ * flag, a name ending in `.br` or `.tbr` is read as brotli and one ending in
+ * `.lzma` or `.tlzma` as `.lzma`, compared without case. It is consulted
+ * only after the bytes have failed to say, so it never overrides a magic
+ * number. `.tlz` is not on the list, because lzip uses it too.
+ */
+#define GARC_FS_NAME_HINT ((uint32_t)1u << 3)
+
+/**
+ * @brief Open a file as a stream.
+ *
+ * The stream can seek and knows its size, which are what zip and 7z need. It
+ * owns the file, and ::garc_stream_destroy() closes it.
+ *
+ * @param path The file. UTF-8. Not NULL.
+ * @param out_stream Receives the stream on success.
+ * @return ::GARC_OK, ::GARC_ERR_NOT_FOUND, ::GARC_ERR_ACCESS,
+ *   ::GARC_ERR_INVALID for a NULL argument or a directory, ::GARC_ERR_OOM, or
+ *   ::GARC_ERR_IO.
+ */
+GARC_API GARC_Result garc_fs_stream_open(
+    const char * path, GARC_Stream ** out_stream);
+
+/**
+ * @brief Open a file as a stream, using a given allocator.
+ *
+ * @param path The file. UTF-8. Not NULL.
+ * @param allocator Allocator for the stream. NULL uses the default.
+ * @param out_stream Receives the stream on success.
+ * @return As ::garc_fs_stream_open().
+ */
+GARC_API GARC_Result garc_fs_stream_open_with_allocator(const char * path,
+    const GARC_Allocator * allocator, GARC_Stream ** out_stream);
+
+/**
+ * @brief Create a sink that writes a file, compressed or not.
+ *
+ * The bytes go to a temporary file in @p path's directory, which must exist.
+ * ::garc_sink_finish() writes the codec's trailer if there is a codec, then
+ * renames the temporary file over @p path. An existing file at @p path is
+ * replaced, and keeps its permissions. A new one gets what the platform gives
+ * a new file. ::garc_sink_destroy() without a finish removes the temporary
+ * file and leaves @p path untouched.
+ *
+ * With @p method NULL the sink can patch, so any writer can use it. With a
+ * method the sink is a compressing one, and it cannot patch: a tar writer
+ * works through it, and a zip writer uses data descriptors.
+ *
+ * @param path The file to create or replace. UTF-8. Not NULL.
+ * @param method A `compress` method name such as `"gzip"`, or NULL for none.
+ * @param options `compress` options for the encoder, or NULL. Ignored when
+ *   @p method is NULL.
+ * @param flags Zero or ::GARC_FS_NO_SYNC. Any other bit is
+ *   ::GARC_ERR_INVALID.
+ * @param out_sink Receives the sink on success.
+ * @return ::GARC_OK, ::GARC_ERR_NOT_FOUND when the directory does not exist,
+ *   ::GARC_ERR_ACCESS, ::GARC_ERR_INVALID, ::GARC_ERR_UNSUPPORTED for a method
+ *   `compress` does not have, ::GARC_ERR_OOM, or ::GARC_ERR_IO. A commit
+ *   that fails is ::GARC_ERR_ACCESS or ::GARC_ERR_IO from ::garc_sink_finish(),
+ *   and a second finish is ::GARC_ERR_INVALID.
+ */
+GARC_API GARC_Result garc_fs_sink_create(const char * path,
+    const char * method, gcomp_options_t * options, uint32_t flags,
+    GARC_Sink ** out_sink);
+
+/**
+ * @brief Create a file sink, using a given allocator.
+ *
+ * @param path The file to create or replace. UTF-8. Not NULL.
+ * @param method A `compress` method name, or NULL for none.
+ * @param options `compress` options for the encoder, or NULL.
+ * @param flags Zero or ::GARC_FS_NO_SYNC.
+ * @param allocator Allocator for the sink and its state. NULL uses the
+ *   default.
+ * @param out_sink Receives the sink on success.
+ * @return As ::garc_fs_sink_create().
+ */
+GARC_API GARC_Result garc_fs_sink_create_with_allocator(const char * path,
+    const char * method, gcomp_options_t * options, uint32_t flags,
+    const GARC_Allocator * allocator, GARC_Sink ** out_sink);
+
+/**
+ * @brief Open an archive file, detecting compression around it.
+ *
+ * The containers are tried first, on the file itself. If none matches, the
+ * codec is detected as the file comment says, and the containers are tried
+ * again on the decompressed bytes. Only one layer is removed, so a `.tar.gz.gz`
+ * is not opened. A compressed archive cannot seek, so ::garc_find() on it is
+ * ::GARC_ERR_NOT_SEEKABLE, and a zip or 7z inside a codec cannot be read at
+ * all.
+ *
+ * The archive owns the file and any decompressing stream, and ::garc_close()
+ * closes both.
+ *
+ * @param path The file. UTF-8. Not NULL.
+ * @param limits Caps on the archive, or NULL for the defaults.
+ * @param options `compress` options for a decoder, or NULL. Its defaults cap the
+ *   decompressed bytes at 512 MiB, and a larger compressed archive needs a
+ *   higher cap here; reaching it is ::GARC_ERR_LIMIT_CODEC_BYTES.
+ * @param flags Zero or ::GARC_FS_NAME_HINT. Any other bit is
+ *   ::GARC_ERR_INVALID.
+ * @param out_archive Receives the archive on success.
+ * @return ::GARC_OK; ::GARC_ERR_FORMAT when neither the file nor its
+ *   decompressed bytes are an archive this library reads; otherwise as
+ *   ::garc_fs_stream_open() and ::garc_open().
+ */
+GARC_API GARC_Result garc_fs_open(const char * path, const GARC_Limits * limits,
+    gcomp_options_t * options, uint32_t flags, GARC_Archive ** out_archive);
+
+/**
+ * @brief Open an archive file, using a given allocator.
+ *
+ * @param path The file. UTF-8. Not NULL.
+ * @param limits Caps on the archive, or NULL for the defaults.
+ * @param options `compress` options for a decoder, or NULL.
+ * @param flags Zero or ::GARC_FS_NAME_HINT.
+ * @param allocator Allocator for the archive and its streams. NULL uses the
+ *   default.
+ * @param out_archive Receives the archive on success.
+ * @return As ::garc_fs_open().
+ */
+GARC_API GARC_Result garc_fs_open_with_allocator(const char * path,
+    const GARC_Limits * limits, gcomp_options_t * options, uint32_t flags,
+    const GARC_Allocator * allocator, GARC_Archive ** out_archive);
 
 /**
  * @brief Extract the archive's remaining members into @p root.

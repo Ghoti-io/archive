@@ -52,12 +52,12 @@
  * `gcomp_detect()` also answers in these strings, so a caller that sniffs its
  * input has the name already.
  *
- * **Nothing is detected.** A caller says which codec, and a stream whose bytes
- * are gzip handed to ::garc_open() directly is still ::GARC_ERR_FORMAT rather
- * than being quietly unwrapped. Sniffing is a policy decision - which magic
- * numbers count, what to do when two match - and it belongs where a *name*
- * exists to corroborate it, which is the filesystem layer. `gcomp_detect()` is
- * public, so a caller who wants it today has it in two lines.
+ * **Nothing is detected here.** A caller says which codec, and a stream whose
+ * bytes are gzip handed to ::garc_open() directly is still ::GARC_ERR_FORMAT
+ * rather than being quietly unwrapped. Sniffing is a policy decision - which
+ * magic numbers count, what to do when two match - and it belongs where a
+ * *name* exists to corroborate it, which is the filesystem layer:
+ * ::garc_fs_open() in fs.h makes that decision, and fs.h says how.
  *
  * **Trailing bytes after a complete codec stream are ::GARC_ERR_CORRUPT.**
  * RFC 1952 allows gzip members to be concatenated, and `cat a.gz b.gz` and

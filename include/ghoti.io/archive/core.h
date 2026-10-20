@@ -161,6 +161,20 @@ typedef enum {
    */
   GARC_ERR_REFUSED,
 
+  /**
+   * The filesystem layer was given a path that does not exist.
+   *
+   * Only fs.h opens a path. Kept apart from ::GARC_ERR_IO because the caller's
+   * next move differs: a missing file is a wrong name, not a failing disk.
+   */
+  GARC_ERR_NOT_FOUND,
+  /**
+   * The operating system refused the filesystem layer access to a path.
+   *
+   * Permissions, or on Windows a file another process holds open. See fs.h.
+   */
+  GARC_ERR_ACCESS,
+
   GARC_RESULT_COUNT
 } GARC_Result;
 

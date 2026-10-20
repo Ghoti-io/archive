@@ -70,7 +70,16 @@
 #define garc_format GHOTIIO_ARCHIVE(garc_format)
 #define garc_find GHOTIIO_ARCHIVE(garc_find)
 #define garc_fs_extract GHOTIIO_ARCHIVE(garc_fs_extract)
+#define garc_fs_open GHOTIIO_ARCHIVE(garc_fs_open)
+#define garc_fs_open_with_allocator                                            \
+  GHOTIIO_ARCHIVE(garc_fs_open_with_allocator)
 #define garc_fs_pack GHOTIIO_ARCHIVE(garc_fs_pack)
+#define garc_fs_sink_create GHOTIIO_ARCHIVE(garc_fs_sink_create)
+#define garc_fs_sink_create_with_allocator                                     \
+  GHOTIIO_ARCHIVE(garc_fs_sink_create_with_allocator)
+#define garc_fs_stream_open GHOTIIO_ARCHIVE(garc_fs_stream_open)
+#define garc_fs_stream_open_with_allocator                                     \
+  GHOTIIO_ARCHIVE(garc_fs_stream_open_with_allocator)
 #define garc_format_string GHOTIIO_ARCHIVE(garc_format_string)
 #define garc_limits_default GHOTIIO_ARCHIVE(garc_limits_default)
 #define garc_member_count GHOTIIO_ARCHIVE(garc_member_count)

@@ -25,7 +25,7 @@
  *
  * A 7z cannot be read from a pipe: its header is at the end, so the stream has
  * to seek, and one that cannot is reported as ::GARC_ERR_NOT_SEEKABLE rather
- * than as a bad archive. The callbacks below are the whole of what that takes.
+ * than as a bad archive. ::garc_fs_open() opens the file seekably.
  *
  * **Listing is cheap and reading is not, in a solid archive.** The files of a
  * solid archive are cut from one decompressed stream, so the listing needs no
@@ -41,45 +41,12 @@
  */
 
 #include <inttypes.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <ghoti.io/archive/archive.h>
-
-static GARC_Result read_cb(
-    void * ctx, void * buffer, size_t size, size_t * out_read) {
-  FILE * file = (FILE *)ctx;
-  const size_t got = fread(buffer, 1, size, file);
-  if (got < size && ferror(file)) {
-    return GARC_ERR_IO;
-  }
-  *out_read = got;
-  return GARC_OK;
-}
-
-static GARC_Result seek_cb(void * ctx, uint64_t offset) {
-  if (offset > (uint64_t)LONG_MAX) {
-    return GARC_ERR_IO;
-  }
-  return fseek((FILE *)ctx, (long)offset, SEEK_SET) == 0 ? GARC_OK
-                                                           : GARC_ERR_IO;
-}
-
-static GARC_Result size_cb(void * ctx, uint64_t * out_size) {
-  FILE * file = (FILE *)ctx;
-  const long here = ftell(file);
-  if (here < 0 || fseek(file, 0, SEEK_END) != 0) {
-    return GARC_ERR_IO;
-  }
-  const long end = ftell(file);
-  if (end < 0 || fseek(file, here, SEEK_SET) != 0) {
-    return GARC_ERR_IO;
-  }
-  *out_size = (uint64_t)end;
-  return GARC_OK;
-}
+#include <ghoti.io/archive/fs.h>
 
 /**
  * List a 7z, reading each file to its end and printing the status of the last
@@ -94,27 +61,12 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "usage: %s <path.7z>\n", argv[0]);
     return 2;
   }
-  FILE * file = fopen(argv[1], "rb");
-  if (!file) {
-    fprintf(stderr, "cannot read %s\n", argv[1]);
-    return 1;
-  }
-  GARC_Stream_Callbacks callbacks;
-  memset(&callbacks, 0, sizeof(callbacks));
-  callbacks.ctx = file;
-  callbacks.read = read_cb;
-  callbacks.seek = seek_cb;
-  callbacks.size = size_cb;
-  GARC_Stream * stream = NULL;
-  GARC_Result result = garc_stream_create_callback(&callbacks, &stream);
+  // fs.h opens the file seekably, with 64-bit offsets on every platform. The
+  // reader itself never opens a file; this is the opt-in layer that does.
   GARC_Archive * archive = NULL;
-  if (result == GARC_OK) {
-    result = garc_open(stream, NULL, &archive);
-  }
+  GARC_Result result = garc_fs_open(argv[1], NULL, NULL, 0, &archive);
   if (result != GARC_OK) {
     fprintf(stderr, "%s: %s\n", argv[1], garc_result_string(result));
-    garc_stream_destroy(stream);
-    fclose(file);
     return 1;
   }
 
@@ -146,8 +98,6 @@ int main(int argc, char ** argv) {
     putchar('\n');
   }
   garc_close(archive);
-  garc_stream_destroy(stream);
-  fclose(file);
   if (result != GARC_END) {
     fprintf(stderr, "%s: %s\n", argv[1], garc_result_string(result));
     return 1;

@@ -21,33 +21,34 @@
 /**
  * @file
  *
- * Build a small tar and write it to a file, then to standard output.
+ * Build a small tar in memory, then write it to a file or to standard output.
  *
  * Three things it shows that a shorter example would not:
  *
- * **The library never opens the file.** The `fopen` is here; the library gets one
- * function pointer. Writing is the direction where that matters most - a library
- * that created files would be a library that could be made to create them
- * somewhere else.
+ * **Three sinks, from the same code.** The members are written through a
+ * `GARC_Writer` that is pointed at a growable buffer, then at a file or at a
+ * `FILE *` callback. That is the whole of what the sink abstraction buys.
  *
- * **Both sinks, from the same code.** The members are written once through a
- * `GARC_Writer`, which is pointed at a growable buffer in one call and at a
- * `FILE *` in the other. That is the whole of what the sink abstraction buys, and
- * an example that used only the memory one would not show it.
+ * **A file is written whole or not at all.** The file sink from fs.h writes a
+ * temporary file beside the destination and renames it on ::garc_sink_finish().
+ * With `--gzip`, `--bzip2`, `--xz` or `--zstd` it compresses on the way, and
+ * the finish writes the codec's trailer before the rename. Standard output gets
+ * a callback sink, because a pipe cannot be renamed.
  *
  * **A declared size is a promise.** `member.size` is set before the bytes are
  * written and the writer refuses a different number of them, because the header
  * carrying that size has already gone out. Getting it wrong is a caller bug and
  * the example checks for it like any other.
  *
- * Usage: tar_write [path.tar]
- *        With no path, the archive goes to standard output.
+ * Usage: tar_write [--gzip | --bzip2 | --xz | --zstd] [path.tar]
+ *        With no path, the archive goes to standard output, uncompressed.
  */
 
 #include <stdio.h>
 #include <string.h>
 
 #include <ghoti.io/archive/archive.h>
+#include <ghoti.io/archive/fs.h>
 
 /** Write through a FILE *, which is the whole of a sink for a file on disk. */
 static GARC_Result file_write(void * ctx, const void * buffer, size_t size) {
@@ -142,14 +143,35 @@ static int write_to(GARC_Sink * sink) {
 }
 
 /**
- * Build the archive twice: once into memory, once through a `FILE *`.
+ * Build the archive in memory, then once more into a file or standard output.
  *
  * @param argc Argument count.
- * @param argv `argv[1]`, if given, is where the archive is written; standard
- *   output otherwise.
- * @return 0 on success.
+ * @param argv `tar_write [--gzip | --bzip2 | --xz | --zstd] [path.tar]`.
+ * @return 0 on success, 1 on a failure, 2 on a usage error.
  */
 int main(int argc, char ** argv) {
+  const char * method = NULL;
+  const char * path = NULL;
+  for (int i = 1; i < argc; ++i) {
+    if (strncmp(argv[i], "--", 2) == 0 && !method
+        && (strcmp(argv[i], "--gzip") == 0 || strcmp(argv[i], "--bzip2") == 0
+            || strcmp(argv[i], "--xz") == 0 || strcmp(argv[i], "--zstd") == 0)) {
+      method = argv[i] + 2; // the compress method name
+    }
+    else if (argv[i][0] != '-' && !path) {
+      path = argv[i];
+    }
+    else {
+      fprintf(stderr, "usage: %s [--gzip | --bzip2 | --xz | --zstd] [path.tar]\n",
+          argv[0]);
+      return 2;
+    }
+  }
+  if (method && !path) {
+    fprintf(stderr, "tar_write: compression needs a path\n");
+    return 2;
+  }
+
   // First into memory, so the size can be reported before anything is committed
   // to disk. A caller streaming to a socket would skip this half.
   GARC_Sink * memory = NULL;
@@ -169,40 +191,44 @@ int main(int argc, char ** argv) {
   }
   fprintf(stderr, "tar_write: %zu bytes, %zu members\n", length,
       sizeof(entries) / sizeof(entries[0]));
+  garc_sink_destroy(memory);
 
-  FILE * out = stdout;
-  if (argc > 1) {
-    out = fopen(argv[1], "wb");
-    if (!out) {
-      perror(argv[1]);
-      garc_sink_destroy(memory);
+  int status = 1;
+  if (path) {
+    // The same writer over a file. Nothing appears at the path until the
+    // finish, and a run that fails leaves whatever was there.
+    GARC_Sink * sink = NULL;
+    GARC_Result result = garc_fs_sink_create(path, method, NULL, 0, &sink);
+    if (result != GARC_OK) {
+      fprintf(stderr, "%s: %s\n", path, garc_result_string(result));
       return 1;
     }
+    status = write_to(sink);
+    if (status == 0) {
+      result = garc_sink_finish(sink);
+      if (result != GARC_OK) {
+        fprintf(stderr, "%s: %s\n", path, garc_result_string(result));
+        status = 1;
+      }
+    }
+    garc_sink_destroy(sink);
+    return status;
   }
 
-  // And again through a callback, which is the same writer over a different
-  // sink. The bytes are identical, which is what the fuzz harness asserts too.
+  // And to standard output through a callback, which cannot be renamed or
+  // patched, and needs neither for a tar.
   GARC_Sink_Callbacks callbacks;
   memset(&callbacks, 0, sizeof(callbacks));
-  callbacks.ctx = out;
+  callbacks.ctx = stdout;
   callbacks.write = file_write;
-
   GARC_Sink * sink = NULL;
-  int status = 1;
   if (garc_sink_create_callback(&callbacks, &sink) == GARC_OK) {
     status = write_to(sink);
     garc_sink_destroy(sink);
   }
-
-  if (out != stdout) {
-    if (fclose(out) != 0) {
-      perror(argv[1]);
-      status = 1;
-    }
-  } else if (fflush(out) != 0) {
+  if (fflush(stdout) != 0) {
     perror("stdout");
     status = 1;
   }
-  garc_sink_destroy(memory);
   return status;
 }

@@ -4,7 +4,8 @@ Archive containers — tar, zip, 7z, ar, cpio and shar — read and written **wi
 filesystem**. This library walks the members of an archive and hands you each
 one's name, size, time and bytes. The reader and the writer never open,
 create or write a file. The part that does is opt-in and lives in `fs.h`, which
-`archive.h` does not include.
+`archive.h` does not include. It extracts and packs directory trees, and it
+opens an archive by path, detecting gzip, bzip2, xz, zstd or lz4 around it.
 
 That is not squeamishness. Every well-known archive vulnerability is a *path*
 vulnerability — a member named `../../etc/cron.d/x`, a symlink whose target
@@ -224,43 +225,21 @@ run that nothing inside this process could have seen.
 ```c
 #include <stdio.h>
 #include <ghoti.io/archive/archive.h>
-
-static GARC_Result read_cb(
-    void * ctx, void * buffer, size_t size, size_t * out_read) {
-  FILE * file = (FILE *)ctx;
-  size_t got = fread(buffer, 1, size, file);
-  if (got < size && ferror(file)) {
-    return GARC_ERR_IO;
-  }
-  *out_read = got;   // A short read is the end of the stream, not a failure.
-  return GARC_OK;
-}
+#include <ghoti.io/archive/fs.h>
 
 int main(void) {
-  FILE * file = fopen("archive.tar", "rb");
-  if (!file) {
-    return 1;
-  }
-
-  // The fopen is yours. The library sees one function pointer; seek and size are
-  // optional, and tar does not need them.
-  GARC_Stream_Callbacks callbacks = {.read = read_cb, .ctx = file};
-  GARC_Stream * stream = NULL;
-  if (garc_stream_create_callback(&callbacks, &stream) != GARC_OK) {
-    fclose(file);
-    return 1;
-  }
-
   GARC_Archive * archive = NULL;
-  // NULL limits means garc_limits_default(), which is bounded on every field.
-  if (garc_open(stream, NULL, &archive) != GARC_OK) {
-    garc_stream_destroy(stream);
-    fclose(file);
+  // Opens archive.tar, or archive.tar.gz, .xz, .zst, .bz2, .lz4, .zip or .7z:
+  // the containers are tried first, then the codec is read from the bytes.
+  // NULL limits are bounded on every field, and NULL codec options cap a
+  // decompressed stream at 512 MiB.
+  GARC_Result result = garc_fs_open("archive.tar.gz", NULL, NULL, 0, &archive);
+  if (result != GARC_OK) {
+    fprintf(stderr, "%s\n", garc_result_string(result));
     return 1;
   }
 
   const GARC_Member * member = NULL;
-  GARC_Result result;
   while ((result = garc_next(archive, &member)) == GARC_OK) {
     // A name is bytes and a length, not a string: a hostile archive puts a NUL
     // in the middle of one so that a C caller sees a shorter name than this did.
@@ -274,26 +253,29 @@ int main(void) {
     fprintf(stderr, "%s\n", garc_result_string(result));
   }
 
-  garc_close(archive);
-  garc_stream_destroy(stream);
-  fclose(file);
+  garc_close(archive); // and the file with it
   return 0;
 }
 ```
 
-`examples/tar_list.c` is that with the member data read as well, and the names
-escaped - which a listing tool has to do, because a name is attacker-controlled
-bytes and an ANSI escape in one makes the output say whatever the archive wants.
-`examples/stream_from_file.c` is the stream on its own, with `seek` and `size`
-filled in as a zip reader will need. `examples/name_findings.c` judges an archive
+`fs.h` is opt-in. Without it, the reader takes a `GARC_Stream`, which is a
+memory buffer or three callbacks you write, and it never sees a path:
+`examples/stream_from_file.c` shows the callbacks.
+`examples/tar_list.c` is the program above with the member data read as well,
+and the names escaped - which a listing tool has to do, because a name is
+attacker-controlled bytes and an ANSI escape in one makes the output say
+whatever the archive wants. `examples/name_findings.c` judges an archive
 without reading a byte of member data: it classifies every name and every link
 target, prints what is wrong with each, and exits non-zero if anything names a
 place outside a root — which works on a pipe, since that is when you most want to
-refuse.
+refuse. Writing a file is `garc_fs_sink_create()`, which `examples/tar_write.c`,
+`zip_write.c` and `sevenz_write.c` use.
 
 ## Building
 
-Depends on [Ghoti.io CUtil](https://github.com/Ghoti-io/cutil), found through
+Depends on [Ghoti.io CUtil](https://github.com/Ghoti-io/cutil),
+[Ghoti.io Security](https://github.com/Ghoti-io/security) (WinZip AES) and
+[Ghoti.io Compress](https://github.com/Ghoti-io/compress), all found through
 pkg-config. Nothing else.
 
 ```bash
