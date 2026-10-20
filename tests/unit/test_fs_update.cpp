@@ -330,6 +330,84 @@ TEST_F(FsUpdate, AppendingInPlaceToAnEmptyTarStartsAtTheBeginning) {
   EXPECT_EQ(read_all(at("empty.tar")), (std::vector<Entry>{{"first.txt", "one\n"}}));
 }
 
+TEST_F(FsUpdate, AppendingInPlaceToAZipWritesAfterItsMembersAndANewDirectory) {
+  // The new members go where the old directory began; the directory written
+  // after them is the old one's entries and the new ones', with new end
+  // records. Every member before the directory is the same bytes.
+  make("log.zip", GARC_FORMAT_ZIP, kThree);
+  const std::string before = read_file(at("log.zip"));
+  const size_t directory = before.find(std::string("PK\x01\x02", 4));
+  ASSERT_NE(directory, std::string::npos);
+  GARC_Fs_Update * update = nullptr;
+  ASSERT_EQ(garc_fs_update_begin(at("log.zip").c_str(), nullptr, nullptr,
+                GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+      GARC_OK);
+  EXPECT_EQ(garc_fs_update_archive(update), nullptr);
+  ASSERT_EQ(add(garc_fs_update_writer(update), {"d.txt", "delta\n"}), GARC_OK);
+  ASSERT_EQ(add(garc_fs_update_writer(update), {"e.txt", std::string(9000, 'e')}),
+      GARC_OK);
+  ASSERT_EQ(garc_fs_update_commit(update), GARC_OK);
+  garc_fs_update_destroy(update);
+  const std::string after = read_file(at("log.zip"));
+  EXPECT_EQ(after.substr(0, directory), before.substr(0, directory));
+  EXPECT_EQ(read_all(at("log.zip")),
+      (std::vector<Entry>{{"a.txt", "alpha\n"}, {"b.txt", "bravo\n"},
+          {"c.txt", "charlie\n"}, {"d.txt", "delta\n"},
+          {"e.txt", std::string(9000, 'e')}}));
+  EXPECT_EQ(names(), (std::set<std::string>{"log.zip"}));
+
+  // And a second append, onto the first one's directory.
+  ASSERT_EQ(garc_fs_update_begin(at("log.zip").c_str(), nullptr, nullptr,
+                GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+      GARC_OK);
+  ASSERT_EQ(add(garc_fs_update_writer(update), {"f.txt", "foxtrot\n"}), GARC_OK);
+  ASSERT_EQ(garc_fs_update_commit(update), GARC_OK);
+  garc_fs_update_destroy(update);
+  EXPECT_EQ(read_all(at("log.zip")).size(), 6u);
+}
+
+TEST_F(FsUpdate, AnAbandonedInPlaceZipAppendPutsTheFileBackAsItWas) {
+  make("log.zip", GARC_FORMAT_ZIP, kThree);
+  const std::string before = read_file(at("log.zip"));
+  GARC_Fs_Update * update = nullptr;
+  ASSERT_EQ(garc_fs_update_begin(at("log.zip").c_str(), nullptr, nullptr,
+                GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+      GARC_OK);
+  ASSERT_EQ(add(garc_fs_update_writer(update), {"half.txt", std::string(50000, 'h')}),
+      GARC_OK);
+  garc_fs_update_destroy(update);
+  EXPECT_EQ(read_file(at("log.zip")), before);
+  EXPECT_EQ(read_all(at("log.zip")), kThree);
+  EXPECT_EQ(names(), (std::set<std::string>{"log.zip"}));
+}
+
+TEST_F(FsUpdate, AppendingInPlaceToAZipBehindAStubKeepsItsOffsets) {
+  // A self-extractor's stub in front: the archive's offsets count from where
+  // the stub ends, and the new members' must too.
+  make("plain.zip", GARC_FORMAT_ZIP, kThree);
+  const std::string stub(3000, 'S');
+  {
+    GARC_Sink * sink = nullptr;
+    ASSERT_EQ(garc_fs_sink_create(at("sfx.exe").c_str(), nullptr, nullptr,
+                  GARC_FS_NO_SYNC, &sink), GARC_OK);
+    const std::string body = stub + read_file(at("plain.zip"));
+    ASSERT_EQ(garc_sink_write(sink, body.data(), body.size()), GARC_OK);
+    ASSERT_EQ(garc_sink_finish(sink), GARC_OK);
+    garc_sink_destroy(sink);
+  }
+  // Built as the stub plus a zip whose offsets were written from 0, so the
+  // reader discovers the stub's length.
+  GARC_Fs_Update * update = nullptr;
+  ASSERT_EQ(garc_fs_update_begin(at("sfx.exe").c_str(), nullptr, nullptr,
+                GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+      GARC_OK);
+  ASSERT_EQ(add(garc_fs_update_writer(update), {"d.txt", "delta\n"}), GARC_OK);
+  ASSERT_EQ(garc_fs_update_commit(update), GARC_OK);
+  garc_fs_update_destroy(update);
+  EXPECT_EQ(read_file(at("sfx.exe")).substr(0, stub.size()), stub);
+  EXPECT_EQ(read_all(at("sfx.exe")).size(), 4u);
+}
+
 TEST_F(FsUpdate, InPlaceIsRefusedWhereItCannotBeHonest) {
   make("x.zip", GARC_FORMAT_ZIP, kThree);
   make("x.tar.gz", GARC_FORMAT_TAR, kThree, "gzip");
@@ -372,7 +450,7 @@ TEST_F(FsUpdate, InPlaceIsRefusedWhereItCannotBeHonest) {
     garc_writer_destroy(writer);
     garc_sink_destroy(sink);
   }
-  for (const char * name : {"x.zip", "x.tar.gz", "g.tar"}) {
+  for (const char * name : {"x.tar.gz", "g.tar"}) {
     SCOPED_TRACE(name);
     const std::string before = read_file(at(name));
     GARC_Fs_Update * update = nullptr;
@@ -386,6 +464,15 @@ TEST_F(FsUpdate, InPlaceIsRefusedWhereItCannotBeHonest) {
   EXPECT_EQ(garc_fs_update_begin(at("x.zip").c_str(), nullptr, nullptr, 1u << 9,
                 &update),
       GARC_ERR_INVALID);
+  // A zip asked to be split, appended to where it lies.
+  GARC_Writer_Options split;
+  garc_writer_options_default(&split);
+  split.zip_volume_size = 65536;
+  const std::string zip_before = read_file(at("x.zip"));
+  EXPECT_EQ(garc_fs_update_begin(at("x.zip").c_str(), nullptr, &split,
+                GARC_FS_IN_PLACE, &update),
+      GARC_ERR_INVALID);
+  EXPECT_EQ(read_file(at("x.zip")), zip_before);
   EXPECT_EQ(garc_fs_update_begin(at("absent.tar").c_str(), nullptr, nullptr, 0,
                 &update),
       GARC_ERR_NOT_FOUND);

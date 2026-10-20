@@ -75,6 +75,7 @@
 #include <string.h>
 
 #include <ghoti.io/archive/archive.h>
+#include <ghoti.io/archive/fs.h>
 #include <ghoti.io/compress/crc32.h>
 
 /** A member to write, and therefore also a row of expectations. */
@@ -591,6 +592,80 @@ static int read_one(const char * path) {
  * @param argv `write <directory>` or `read <path.zip>`.
  * @return 0 on success, 1 on failure, 2 on a usage error.
  */
+/** One member, written to @p writer; its intent row printed for @p archive. */
+static int update_add(GARC_Writer * writer, const char * archive,
+    const char * name, const char * data, size_t size) {
+  GARC_Member member;
+  memset(&member, 0, sizeof(member));
+  member.name = name;
+  member.name_length = strlen(name);
+  member.type = GARC_MEMBER_FILE;
+  member.size = size;
+  member.mode = 0644;
+  member.mode_valid = 1;
+  member.mtime_seconds = 1000000000;
+  member.mtime_source = GARC_TIME_ZIP_DOS;
+  if (garc_writer_add(writer, &member) != GARC_OK
+      || garc_writer_write(writer, data, size) != GARC_OK) {
+    fprintf(stderr, "update: could not write %s\n", name);
+    return 1;
+  }
+  printf("%s\t%s\t%zu\t%08x\n", archive, name, size,
+      (unsigned)gcomp_crc32_finalize(
+          gcomp_crc32_update(GCOMP_CRC32_INIT, (const uint8_t *)data, size)));
+  return 0;
+}
+
+/**
+ * The archives an update produces: `appended.zip`, two members appended in
+ * place to three, and `rawcopy.zip`, a rewrite that keeps every member as its
+ * stored bytes and adds one. Prints one intent row per member: archive, name,
+ * size, CRC-32.
+ */
+static int update_archives(const char * directory) {
+  char base[4096];
+  int failed = 0;
+  for (int which = 0; which < 2 && !failed; ++which) {
+    const char * archive = which ? "rawcopy.zip" : "appended.zip";
+    snprintf(base, sizeof(base), "%s/%s", directory, archive);
+    GARC_Sink * sink = NULL;
+    GARC_Writer * writer = NULL;
+    GARC_Writer_Options options;
+    garc_writer_options_default(&options);
+    options.zip_method = GARC_ZIP_METHOD_DEFLATE;
+    failed = garc_fs_sink_create(base, NULL, NULL, GARC_FS_NO_SYNC, &sink) != GARC_OK
+        || garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer) != GARC_OK;
+    failed = failed || update_add(writer, archive, "one.txt", "one\n", 4);
+    failed = failed || update_add(writer, archive, "big.txt", BIG, sizeof(BIG));
+    failed = failed || update_add(writer, archive, "noise.bin", NOISE, sizeof(NOISE));
+    failed = failed || garc_writer_finish(writer) != GARC_OK
+        || garc_sink_finish(sink) != GARC_OK;
+    garc_writer_destroy(writer);
+    garc_sink_destroy(sink);
+
+    GARC_Fs_Update * update = NULL;
+    failed = failed || garc_fs_update_begin(base, NULL, &options,
+                           (which ? 0u : GARC_FS_IN_PLACE) | GARC_FS_NO_SYNC,
+                           &update) != GARC_OK;
+    if (!failed && which) {
+      failed = garc_fs_update_keep_rest(update) != GARC_OK;
+    }
+    if (!failed) {
+      writer = garc_fs_update_writer(update);
+      failed = update_add(writer, archive, "added.txt", "added\n", 6);
+      if (!which && !failed) {
+        failed = update_add(writer, archive, "far.bin", FAR_BIN, sizeof(FAR_BIN));
+      }
+    }
+    failed = failed || garc_fs_update_commit(update) != GARC_OK;
+    garc_fs_update_destroy(update);
+  }
+  if (failed) {
+    fprintf(stderr, "update: an archive could not be written\n");
+  }
+  return failed;
+}
+
 int main(int argc, char ** argv) {
   // Not a constant expression, so it is filled in here rather than spelled in the
   // table. The pattern repeats, so deflate would shrink it - which matters when
@@ -622,6 +697,9 @@ int main(int argc, char ** argv) {
   }
   if (argc == 3 && strcmp(argv[1], "read") == 0) {
     return read_one(argv[2]);
+  }
+  if (argc == 3 && strcmp(argv[1], "update") == 0) {
+    return update_archives(argv[2]);
   }
   if (argc != 3 || strcmp(argv[1], "write") != 0) {
     fprintf(stderr,

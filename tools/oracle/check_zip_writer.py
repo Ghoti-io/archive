@@ -583,6 +583,44 @@ def main(argv):
             print("check-zip-writer: left the archives in %s" % work)
 
 
+def check_updates(binary, work, failures):
+    """unzip -t, 7z t and zipfile's listing of the archives an update writes."""
+    import oracle_env
+    directory = os.path.join(work, "updates")
+    os.makedirs(directory, exist_ok=True)
+    intent = {}
+    for line in probe(binary, ["update", directory]).splitlines():
+        archive, name, size, crc = line.split("\t")
+        intent.setdefault(archive, []).append("%s\t%s\t%s" % (name, size, crc))
+    if sorted(intent) != ["appended.zip", "rawcopy.zip"]:
+        failures.append("update: the probe wrote %s" % sorted(intent))
+        return 0
+    listing = ("import sys, zipfile\n"
+        "for i in zipfile.ZipFile(sys.argv[1]).infolist():\n"
+        "    print('%s\\t%d\\t%08x' % (i.filename, i.file_size, i.CRC))\n")
+    checked = 0
+    for archive, want in sorted(intent.items()):
+        path = os.path.join(directory, archive)
+        for tool, argv in (("unzip", ["unzip", "-tq", path]),
+                ("sevenzip", ["7z", "t", "-bso0", "-bsp0", path])):
+            tested = subprocess.run(oracle_env.command(tool, argv, scratch=work),
+                capture_output=True, stdin=subprocess.DEVNULL)
+            if tested.returncode != 0:
+                failures.append("update %s: %s exited %d: %s" % (archive, tool,
+                    tested.returncode, (tested.stdout + tested.stderr).decode(
+                        "utf-8", "replace").strip()))
+        listed = subprocess.run(oracle_env.command("pyzipfile",
+            ["python3", "-c", listing, path], scratch=work), capture_output=True,
+            stdin=subprocess.DEVNULL)
+        got = listed.stdout.decode("utf-8", "replace").splitlines()
+        if listed.returncode != 0 or sorted(got) != sorted(want):
+            failures.append("update %s: zipfile lists %s, not %s" % (archive,
+                got, want))
+            continue
+        checked += 1
+    return checked
+
+
 def run(binary, work, ours):
     """The three stages and every comparison between them."""
     import oracle_env
@@ -729,6 +767,10 @@ def run(binary, work, ours):
             predicates=predicates)
         counts.append(("fields after %s re-wrote" % label, compared, skipped))
 
+    # An append in place, and a rewrite that keeps every member raw: the two
+    # ways an update writes a zip that the corpus above does not. Each must
+    # test clean under unzip and 7-Zip and list as the probe meant it.
+    updated = check_updates(binary, work, failures)
     if failures:
         sys.stderr.write(
             "### The references disagree with what this library wrote ###\n")
@@ -758,6 +800,8 @@ def run(binary, work, ours):
     print("  %d fields skipped because a reference changes them, each named in "
         "ROUNDTRIP_SKIP, bsdtar_verbatim(), python_verbatim() or deflated_only()"
         % skipped_total)
+    print("  %d updated archives (an append in place, a raw-copy rewrite) "
+        "tested by unzip and 7-Zip and listed by zipfile as written" % updated)
     return 0
 
 

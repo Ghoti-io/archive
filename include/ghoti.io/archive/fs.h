@@ -198,15 +198,23 @@ typedef struct GARC_Fs_Update GARC_Fs_Update;
  * encrypted) is refused by ::garc_fs_update_keep() before anything is written,
  * and the caller decides.
  *
- * **With ::GARC_FS_IN_PLACE**, for an uncompressed tar only, nothing is
- * rewritten: the writer starts where the archive's end marker was, as `tar -r`
- * does, and ::garc_fs_update_archive() is NULL. That is quick for a large
- * archive and it is **not atomic**. If the process dies partway, the members
- * that were there are still read, and the one being written is cut short. A
- * destroy without a commit writes the end marker back where it was, so an
- * abandoned append leaves the archive reading as it did. A tar with a pax global
- * header is refused in place, because the header would apply to the appended
- * members too.
+ * **With ::GARC_FS_IN_PLACE**, for an uncompressed tar or zip, nothing is
+ * rewritten and ::garc_fs_update_archive() is NULL. For a tar the writer starts
+ * where the end marker was, as `tar -r` does. For a zip it starts where the
+ * central directory was, as `zip` does when it adds to an archive: the new
+ * members go there, and the directory written after them holds the old
+ * entries, kept byte for byte, and the new ones, with new end records. A zip
+ * behind a self-extracting stub keeps its stub and its offsets; its archive
+ * comment is not carried over, as no writer here writes one. That is quick for
+ * a large archive and it is **not atomic**: if the process dies partway, a tar
+ * still reads its old members and the new one is cut short, and a zip has no
+ * directory until the new one is written. A destroy without a commit puts back
+ * what followed the members - the end marker, or the directory and end records
+ * - and cuts the file to its old length, so an abandoned append leaves the
+ * archive as it was, byte for byte; a commit cuts the file where the writer
+ * stopped. A tar with a pax global header is refused in place, because the
+ * header would apply to the appended members too, and so is a split zip, and
+ * writer options asking for one.
  *
  * @param path The archive. UTF-8. Not NULL.
  * @param limits Caps for reading it, or NULL for the defaults.
@@ -215,6 +223,8 @@ typedef struct GARC_Fs_Update GARC_Fs_Update;
  *   writes: new members, and kept members of formats that are re-encoded.
  * @param flags Zero, or ::GARC_FS_IN_PLACE, ::GARC_FS_NO_SYNC and
  *   ::GARC_FS_NAME_HINT. Any other bit is ::GARC_ERR_INVALID.
+ *   ::GARC_FS_IN_PLACE on anything but an uncompressed tar or a zip is
+ *   ::GARC_ERR_UNSUPPORTED.
  * @param out_update Receives the update.
  * @return ::GARC_OK; ::GARC_ERR_UNSUPPORTED for ::GARC_FS_IN_PLACE on anything
  *   but an uncompressed tar, or for a format this library does not write;

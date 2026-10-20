@@ -165,6 +165,8 @@ typedef struct {
    * Zstd and LZMA. An AES member does not set it: its version stays 51.
    */
   int needs_63;
+  /** The highest version an adopted directory's entries need, or 0. */
+  uint16_t adopted_version;
   /** The password, copied at create and wiped on release. NULL when unset. */
   uint8_t * password;
   /** Length of @ref password. Zero with @ref have_password is an empty password. */
@@ -343,6 +345,25 @@ GARC_Result garc_tar_write_data(
  * @return GARC_OK, or GARC_ERR_IO.
  */
 GARC_Result garc_tar_write_close_member(GARC_Writer * writer);
+
+/**
+ * Begin a zip writer with an existing archive's central directory, for an
+ * append in place: the entries are kept byte for byte and written ahead of the
+ * new members' at finish, and the count starts at theirs.
+ *
+ * Scans the entries for what the end records must say about them: the highest
+ * version a reader needs, so that a zip64 end record written for the larger
+ * archive asks for at least that.
+ *
+ * @param writer A zip writer that has written nothing.
+ * @param entries The directory's bytes.
+ * @param length How many.
+ * @param count How many entries they hold.
+ * @return GARC_OK, GARC_ERR_CORRUPT when the bytes are not @p count entries,
+ *   or GARC_ERR_OOM.
+ */
+GARC_Result garc_zip_write_adopt_directory(GARC_Writer * writer,
+    const uint8_t * entries, size_t length, uint64_t count);
 
 /**
  * Copy a zip writer's password and resolve its AES strength.

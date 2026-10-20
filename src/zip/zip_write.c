@@ -1813,6 +1813,9 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
     if (zip->needs_63 && end_version < ZIP_VERSION_NEEDED_CODEC) {
       end_version = ZIP_VERSION_NEEDED_CODEC;
     }
+    if (zip->adopted_version > end_version) {
+      end_version = zip->adopted_version;
+    }
     garc_zip_put16(record + 14u, end_version);
     garc_zip_put32(record + 16u, zip->disk); // This disk.
     garc_zip_put32(record + 20u, central_disk);
@@ -1878,6 +1881,40 @@ void garc_zip_write_release(GARC_Writer * writer) {
   garc_buffer_free(writer->allocator, &writer->zip.central);
   garc_buffer_free(writer->allocator, &writer->zip.name);
   garc_buffer_free(writer->allocator, &writer->zip.extra);
+}
+
+GARC_Result garc_zip_write_adopt_directory(GARC_Writer * writer,
+    const uint8_t * entries, size_t length, uint64_t count) {
+  GARC_Zip_Write_State * zip = &writer->zip;
+  uint64_t seen = 0;
+  size_t at = 0;
+  uint16_t version = 0;
+  while (at < length) {
+    if (length - at < GARC_ZIP_CENTRAL_ENTRY_SIZE
+        || memcmp(entries + at, ZIP_SIG_CENTRAL, 4) != 0) {
+      return GARC_ERR_CORRUPT;
+    }
+    const size_t entry = zip_central_entry_length(entries + at);
+    if (entry > length - at) {
+      return GARC_ERR_CORRUPT;
+    }
+    const uint16_t needed = garc_zip_le16(entries + at + 6u);
+    if (needed > version) {
+      version = needed;
+    }
+    at += entry;
+    ++seen;
+  }
+  if (seen != count) {
+    return GARC_ERR_CORRUPT;
+  }
+  GARC_Result result = zip_central_append(writer, entries, length);
+  if (result != GARC_OK) {
+    return result;
+  }
+  zip->entries = count;
+  zip->adopted_version = version;
+  return GARC_OK;
 }
 
 GARC_Result garc_zip_write_adopt_password(GARC_Writer * writer,

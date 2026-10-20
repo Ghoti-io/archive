@@ -36,6 +36,7 @@
 
 #include "fs/fs_internal.h"
 #include "reader/reader_internal.h"
+#include "writer/writer_internal.h"
 
 /** Every flag ::garc_fs_update_begin() accepts. */
 #define GARC_FS_UPDATE_FLAGS_KNOWN                                             \
@@ -67,6 +68,15 @@ struct GARC_Fs_Update {
   uint64_t end;                     ///< Where its end marker was, in place.
   uint64_t length;                  ///< Its length before the append, in place.
   uint8_t * tail;                   ///< Its bytes from @ref end to @ref length.
+  /**
+   * The same bytes, for a zip, in a temporary file: a zip's tail is its whole
+   * central directory, which can be far larger than a tar's end marker.
+   */
+  GCU_File_Temp tail_file;
+  bool tail_in_file;                ///< Whether @ref tail_file holds the tail.
+  /** Where the archive's own offsets count from: a zip's stub, or 0. */
+  uint64_t origin;
+  bool touched;                     ///< Whether the append has written a byte.
 };
 
 ////////////////////////////////////////////////////////////////////////
@@ -75,6 +85,7 @@ struct GARC_Fs_Update {
 
 static GARC_Result update_write(void * ctx, const void * buffer, size_t size) {
   GARC_Fs_Update * update = (GARC_Fs_Update *)ctx;
+  update->touched = true;
   return gcu_file_write_bytes(&update->file, buffer, size) == GCU_FILE_OK
       ? GARC_OK
       : GARC_ERR_IO;
@@ -84,6 +95,8 @@ static GARC_Result update_patch(
     void * ctx, uint64_t offset, const void * buffer, size_t size) {
   GARC_Fs_Update * update = (GARC_Fs_Update *)ctx;
   int64_t here = 0;
+  // The writer's offsets are the archive's; the file's are past any stub.
+  offset += update->origin;
   if (offset > (uint64_t)INT64_MAX
       || gcu_file_tell(&update->file, &here) != GCU_FILE_OK
       || gcu_file_seek(&update->file, (int64_t)offset, GCU_FILE_SEEK_SET)
@@ -142,11 +155,200 @@ static GARC_Result update_find_end(const char * path,
   return GARC_OK;
 }
 
+/**
+ * A zip's directory, for an append where it lies: where it starts (which is
+ * where new members go), where the archive's offsets count from, and its
+ * entries, which the writer keeps.
+ */
+static GARC_Result update_find_zip(const char * path, const GARC_Limits * limits,
+    const GARC_Allocator * allocator, uint64_t * out_end, uint64_t * out_origin,
+    uint8_t ** out_directory, size_t * out_length, uint64_t * out_count) {
+  GARC_Stream * stream = NULL;
+  GARC_Result result = garc_fs_stream_open_with_allocator(path, allocator, &stream);
+  if (result != GARC_OK) {
+    return result;
+  }
+  GARC_Archive * archive = NULL;
+  result = garc_open_with_allocator(stream, limits, allocator, &archive);
+  if (result == GARC_OK && (garc_format(archive) != GARC_FORMAT_ZIP
+          || archive->zip.multi_disk)) {
+    // A split zip's new members would go in its last volume, with every disk
+    // field to account for; that is a rewrite's job.
+    result = GARC_ERR_UNSUPPORTED;
+  }
+  uint8_t * directory = NULL;
+  size_t length = 0;
+  if (result == GARC_OK) {
+    if (archive->zip.central_size > (uint64_t)SIZE_MAX) {
+      result = GARC_ERR_UNSUPPORTED;
+    }
+    else {
+      length = (size_t)archive->zip.central_size;
+      directory = (uint8_t *)gcu_allocator_malloc(allocator, length ? length : 1u);
+      result = directory ? garc_stream_seek(stream, archive->zip.central_offset)
+                         : GARC_ERR_OOM;
+    }
+  }
+  if (result == GARC_OK && length) {
+    result = garc_stream_read_exact(stream, directory, length);
+  }
+  if (result == GARC_OK) {
+    *out_end = archive->zip.central_offset;
+    *out_origin = archive->zip.origin;
+    *out_count = archive->zip.declared_members;
+    *out_directory = directory;
+    *out_length = length;
+    directory = NULL;
+  }
+  gcu_allocator_free(allocator, directory);
+  garc_close(archive);
+  garc_stream_destroy(stream);
+  return result;
+}
+
+/** The format of the archive at @p path, opened only to ask. */
+static GARC_Result update_format(const char * path, const GARC_Limits * limits,
+    const GARC_Allocator * allocator, GARC_Format * out_format) {
+  GARC_Stream * stream = NULL;
+  GARC_Result result = garc_fs_stream_open_with_allocator(path, allocator, &stream);
+  if (result != GARC_OK) {
+    return result;
+  }
+  GARC_Archive * archive = NULL;
+  result = garc_open_with_allocator(stream, limits, allocator, &archive);
+  if (result == GARC_OK) {
+    *out_format = garc_format(archive);
+  }
+  garc_close(archive);
+  garc_stream_destroy(stream);
+  // Not an archive this reads, uncompressed: nothing to append to in place.
+  return result == GARC_ERR_FORMAT ? GARC_ERR_UNSUPPORTED : result;
+}
+
+/** Copy the file's bytes from @p from to its end into a temporary. */
+static GARC_Result update_save_tail(GARC_Fs_Update * update, uint64_t from) {
+  GARC_Result result = garc_fs_from_file(gcu_file_temp_create(
+      &update->tail_file, NULL, "garc-tail", update->allocator));
+  if (result != GARC_OK) {
+    return result;
+  }
+  update->tail_in_file = true;
+  GCU_File_Handle saved = gcu_file_temp_handle(&update->tail_file);
+  if (from > (uint64_t)INT64_MAX
+      || gcu_file_seek(&update->file, (int64_t)from, GCU_FILE_SEEK_SET)
+          != GCU_FILE_OK) {
+    return GARC_ERR_IO;
+  }
+  uint8_t chunk[16384];
+  uint64_t left = update->length - from;
+  while (left) {
+    const size_t want = left < sizeof(chunk) ? (size_t)left : sizeof(chunk);
+    size_t got = 0;
+    if (gcu_file_read_bytes(&update->file, chunk, want, &got) != GCU_FILE_OK
+        || got != want
+        || gcu_file_write_bytes(&saved, chunk, got) != GCU_FILE_OK) {
+      return GARC_ERR_IO;
+    }
+    left -= (uint64_t)got;
+  }
+  return garc_fs_from_file(gcu_file_flush(&saved));
+}
+
+/** Write the saved tail back at @p to, and cut the file to its old length. */
+static void update_restore_tail(GARC_Fs_Update * update, uint64_t to) {
+  GCU_File_Handle saved = gcu_file_temp_handle(&update->tail_file);
+  if (gcu_file_seek(&saved, 0, GCU_FILE_SEEK_SET) != GCU_FILE_OK
+      || to > (uint64_t)INT64_MAX
+      || gcu_file_seek(&update->file, (int64_t)to, GCU_FILE_SEEK_SET)
+          != GCU_FILE_OK) {
+    return;
+  }
+  uint8_t chunk[16384];
+  uint64_t left = update->length - to;
+  while (left) {
+    const size_t want = left < sizeof(chunk) ? (size_t)left : sizeof(chunk);
+    size_t got = 0;
+    if (gcu_file_read_bytes(&saved, chunk, want, &got) != GCU_FILE_OK
+        || got != want
+        || gcu_file_write_bytes(&update->file, chunk, got) != GCU_FILE_OK) {
+      return;
+    }
+    left -= (uint64_t)got;
+  }
+  (void)gcu_file_truncate(&update->file, update->length);
+}
+
+/**
+ * Append to a zip where it lies: the new members go where its directory was,
+ * and the writer, which has the old directory's entries, writes them and the
+ * new ones' after the new members, then the end records.
+ */
+static GARC_Result update_begin_zip(GARC_Fs_Update * update, const char * path,
+    const GARC_Limits * limits, const GARC_Writer_Options * options) {
+  if (options && options->zip_volume_size) {
+    return GARC_ERR_INVALID; // a split set is not appended to where it lies
+  }
+  uint8_t * directory = NULL;
+  size_t length = 0;
+  uint64_t count = 0;
+  GARC_Result result = update_find_zip(path, limits, update->allocator,
+      &update->end, &update->origin, &directory, &length, &count);
+  if (result != GARC_OK) {
+    return result;
+  }
+  result = garc_fs_from_file(gcu_file_open(&update->file, path,
+      GCU_FILE_OPEN_UPDATE, GCU_FILE_PERMS_PRESERVE, update->allocator));
+  int64_t file_length = 0;
+  if (result == GARC_OK
+      && (gcu_file_seek(&update->file, 0, GCU_FILE_SEEK_END) != GCU_FILE_OK
+          || gcu_file_tell(&update->file, &file_length) != GCU_FILE_OK
+          || (uint64_t)file_length < update->end)) {
+    result = GARC_ERR_IO;
+  }
+  if (result == GARC_OK) {
+    update->length = (uint64_t)file_length;
+    result = update_save_tail(update, update->end);
+  }
+  if (result == GARC_OK
+      && gcu_file_seek(&update->file, (int64_t)update->end, GCU_FILE_SEEK_SET)
+          != GCU_FILE_OK) {
+    result = GARC_ERR_IO;
+  }
+  if (result == GARC_OK) {
+    GARC_Sink_Callbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.write = update_write;
+    callbacks.patch = update_patch;
+    callbacks.ctx = update;
+    // In the archive's own frame, so the new members' offsets agree with the
+    // old ones' when there is a stub in front.
+    callbacks.start = update->end - update->origin;
+    result = garc_sink_create_callback_with_allocator(
+        &callbacks, update->allocator, &update->sink);
+  }
+  if (result == GARC_OK) {
+    result = garc_writer_create_with_allocator(update->sink, GARC_FORMAT_ZIP,
+        options, update->allocator, &update->writer);
+  }
+  if (result == GARC_OK) {
+    result = garc_zip_write_adopt_directory(update->writer, directory, length, count);
+  }
+  gcu_allocator_free(update->allocator, directory);
+  return result;
+}
+
 static GARC_Result update_begin_in_place(GARC_Fs_Update * update,
     const char * path, const GARC_Limits * limits,
     const GARC_Writer_Options * options) {
-  GARC_Result result
-      = update_find_end(path, limits, update->allocator, &update->end);
+  GARC_Format format = GARC_FORMAT_TAR;
+  GARC_Result result = update_format(path, limits, update->allocator, &format);
+  if (result != GARC_OK) {
+    return result;
+  }
+  if (format == GARC_FORMAT_ZIP) {
+    return update_begin_zip(update, path, limits, options);
+  }
+  result = update_find_end(path, limits, update->allocator, &update->end);
   if (result != GARC_OK) {
     return result;
   }
@@ -297,8 +499,17 @@ GARC_Result garc_fs_update_commit(GARC_Fs_Update * update) {
     return result;
   }
   if (update->in_place) {
-    result = garc_fs_from_file(update->sync ? gcu_file_sync(&update->file)
-                                            : gcu_file_flush(&update->file));
+    // The archive now ends where the writer stopped; what the old one had past
+    // that - a zip's longer directory or comment, padding - would read as more.
+    int64_t here = 0;
+    result = garc_fs_from_file(gcu_file_tell(&update->file, &here));
+    if (result == GARC_OK) {
+      result = garc_fs_from_file(gcu_file_truncate(&update->file, (uint64_t)here));
+    }
+    if (result == GARC_OK) {
+      result = garc_fs_from_file(update->sync ? gcu_file_sync(&update->file)
+                                              : gcu_file_flush(&update->file));
+    }
     if (result == GARC_OK) {
       result = garc_fs_from_file(gcu_file_close(&update->file));
     }
@@ -325,6 +536,10 @@ void garc_fs_update_destroy(GARC_Fs_Update * update) {
   garc_writer_destroy(update->writer);
   garc_close(update->archive);
   if (update->in_place && !update->committed && update->file.stream
+      && update->tail_in_file && update->touched) {
+    update_restore_tail(update, update->end);
+  }
+  if (update->in_place && !update->committed && update->file.stream
       && update->tail && update->sink
       && garc_sink_tell(update->sink) != update->end) {
     // Abandoned after writing: the bytes that followed the members go back,
@@ -342,5 +557,8 @@ void garc_fs_update_destroy(GARC_Fs_Update * update) {
   // For a rewrite this removes the temporary unless it was renamed into place.
   garc_sink_destroy(update->sink);
   gcu_allocator_free(update->allocator, update->tail);
+  if (update->tail_in_file) {
+    gcu_file_temp_abort(&update->tail_file);
+  }
   gcu_allocator_free(update->allocator, update);
 }
