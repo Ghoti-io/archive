@@ -78,6 +78,9 @@
   GHOTIIO_ARCHIVE(garc_fs_open_with_allocator)
 #define garc_fs_pack GHOTIIO_ARCHIVE(garc_fs_pack)
 #define garc_fs_sink_create GHOTIIO_ARCHIVE(garc_fs_sink_create)
+#define garc_fs_sink_create_volumes GHOTIIO_ARCHIVE(garc_fs_sink_create_volumes)
+#define garc_fs_sink_create_volumes_with_allocator                             \
+  GHOTIIO_ARCHIVE(garc_fs_sink_create_volumes_with_allocator)
 #define garc_fs_update_archive GHOTIIO_ARCHIVE(garc_fs_update_archive)
 #define garc_fs_update_begin GHOTIIO_ARCHIVE(garc_fs_update_begin)
 #define garc_fs_update_begin_with_allocator                                    \
@@ -115,6 +118,7 @@
 #define garc_result_is_error GHOTIIO_ARCHIVE(garc_result_is_error)
 #define garc_result_is_limit GHOTIIO_ARCHIVE(garc_result_is_limit)
 #define garc_result_string GHOTIIO_ARCHIVE(garc_result_string)
+#define garc_sink_can_split GHOTIIO_ARCHIVE(garc_sink_can_split)
 #define garc_sink_create_callback GHOTIIO_ARCHIVE(garc_sink_create_callback)
 #define garc_sink_create_compress GHOTIIO_ARCHIVE(garc_sink_create_compress)
 #define garc_sink_create_compress_with_allocator                              \
@@ -126,6 +130,7 @@
   GHOTIIO_ARCHIVE(garc_sink_create_memory_with_allocator)
 #define garc_sink_data GHOTIIO_ARCHIVE(garc_sink_data)
 #define garc_sink_destroy GHOTIIO_ARCHIVE(garc_sink_destroy)
+#define garc_sink_next_volume GHOTIIO_ARCHIVE(garc_sink_next_volume)
 #define garc_sink_finish GHOTIIO_ARCHIVE(garc_sink_finish)
 #define garc_sink_is_seekable GHOTIIO_ARCHIVE(garc_sink_is_seekable)
 #define garc_sink_patch GHOTIIO_ARCHIVE(garc_sink_patch)

@@ -409,6 +409,206 @@ GARC_Result garc_fs_sink_create(const char * path, const char * method,
 }
 
 ////////////////////////////////////////////////////////////////////////
+// A split zip's volumes
+////////////////////////////////////////////////////////////////////////
+
+static bool fs_ends_with(const char * text, const char * suffix);
+static char * fs_with_suffix(const GARC_Allocator * allocator, const char * stem,
+    size_t stem_length, const char * suffix);
+
+/** What a volume sink owns: one temporary per volume, all renamed at finish. */
+typedef struct FsVolumeSink {
+  GCU_File_Temp * temps;            ///< One per volume so far. Owned.
+  size_t count;                     ///< How many.
+  size_t capacity;                  ///< How many @ref temps has room for.
+  char * dir;                       ///< Where they go. Owned.
+  char * dest;                      ///< The `.zip`, the last volume. Owned.
+  GCU_File_Sync sync;               ///< How hard each commit tries.
+  bool done;                        ///< Finished, or failed to; spent either way.
+  const GARC_Allocator * allocator; ///< Where all of this came from.
+} FsVolumeSink;
+
+/** The name of volume @p index (from 0) of @p count, as Info-ZIP names them. */
+static char * fs_volume_name(const FsVolumeSink * state, size_t index, size_t count) {
+  if (index + 1u == count) {
+    return fs_file_dup(state->allocator, state->dest);
+  }
+  const size_t stem = strlen(state->dest) - 4u;
+  const char z = state->dest[stem + 1u];
+  char suffix[16];
+  snprintf(suffix, sizeof(suffix), index + 1u < 100u ? ".%c%02zu" : ".%c%zu",
+      z, index + 1u);
+  return fs_with_suffix(state->allocator, state->dest, stem, suffix);
+}
+
+static GARC_Result fs_volume_start(FsVolumeSink * state) {
+  if (state->count == state->capacity) {
+    const size_t grown = state->capacity ? state->capacity * 2u : 4u;
+    GCU_File_Temp * bigger = (GCU_File_Temp *)gcu_allocator_realloc(
+        state->allocator, state->temps, grown * sizeof(*bigger));
+    if (!bigger) {
+      return GARC_ERR_OOM;
+    }
+    state->temps = bigger;
+    state->capacity = grown;
+  }
+  GARC_Result result = garc_fs_from_file(gcu_file_temp_create(
+      &state->temps[state->count], state->dir, ".garc-", state->allocator));
+  if (result == GARC_OK) {
+    state->count++;
+  }
+  return result;
+}
+
+static GARC_Result fs_volume_write(void * ctx, const void * buffer, size_t size) {
+  FsVolumeSink * state = (FsVolumeSink *)ctx;
+  if (state->done || !state->count) {
+    return GARC_ERR_INVALID;
+  }
+  GCU_File_Handle file = gcu_file_temp_handle(&state->temps[state->count - 1u]);
+  return gcu_file_write_bytes(&file, buffer, size) == GCU_FILE_OK
+      ? GARC_OK : GARC_ERR_IO;
+}
+
+static GARC_Result fs_volume_next(void * ctx) {
+  FsVolumeSink * state = (FsVolumeSink *)ctx;
+  return state->done ? GARC_ERR_INVALID : fs_volume_start(state);
+}
+
+static GARC_Result fs_volume_finish(GARC_Sink * sink) {
+  FsVolumeSink * state = (FsVolumeSink *)sink->cb.ctx;
+  if (state->done) {
+    return GARC_ERR_INVALID;
+  }
+  state->done = true;
+  // Every volume to its name, the .zip last, so a reader never finds an end
+  // record whose earlier volumes are not there yet. A failure part way removes
+  // the volumes already in place: half a set is not an archive.
+  GARC_Result result = GARC_OK;
+  size_t committed = 0;
+  for (; committed < state->count && result == GARC_OK; ++committed) {
+    char * name = fs_volume_name(state, committed, state->count);
+    if (!name) {
+      result = GARC_ERR_OOM;
+      break;
+    }
+    const GCU_File_Result done = gcu_file_temp_commit(&state->temps[committed],
+        name, state->sync, GCU_FILE_PERMS_PRESERVE);
+    gcu_allocator_free(state->allocator, name);
+    if (done != GCU_FILE_OK) {
+      result = done == GCU_FILE_ERR_ACCESS ? GARC_ERR_ACCESS : GARC_ERR_IO;
+      break;
+    }
+  }
+  if (result != GARC_OK) {
+    for (size_t i = 0; i < committed; ++i) {
+      char * name = fs_volume_name(state, i, state->count);
+      if (name) {
+        (void)gcu_file_remove(name);
+        gcu_allocator_free(state->allocator, name);
+      }
+    }
+    return result;
+  }
+  // A larger set written here before left volumes past this one's - name.zNN
+  // from this set's count on - and a reader finding name.z01 onward would take
+  // them for this set's.
+  for (size_t i = state->count - 1u; ; ++i) {
+    char * name = fs_volume_name(state, i, SIZE_MAX);
+    if (!name) {
+      break;
+    }
+    const bool there = gcu_file_exists(name);
+    if (there) {
+      (void)gcu_file_remove(name);
+    }
+    gcu_allocator_free(state->allocator, name);
+    if (!there) {
+      break;
+    }
+  }
+  return GARC_OK;
+}
+
+static void fs_volume_destroy(GARC_Sink * sink) {
+  FsVolumeSink * state = (FsVolumeSink *)sink->cb.ctx;
+  for (size_t i = 0; i < state->count; ++i) {
+    gcu_file_temp_abort(&state->temps[i]); // accepts one already committed
+  }
+  gcu_allocator_free(state->allocator, state->temps);
+  gcu_allocator_free(state->allocator, state->dir);
+  gcu_allocator_free(state->allocator, state->dest);
+  gcu_allocator_free(state->allocator, state);
+}
+
+GARC_Result garc_fs_sink_create_volumes_with_allocator(const char * path,
+    uint32_t flags, const GARC_Allocator * allocator, GARC_Sink ** out_sink) {
+  if (!path || !out_sink || (flags & ~GARC_FS_SINK_FLAGS_KNOWN)
+      || !fs_ends_with(path, ".zip") || gcu_file_is_directory(path)) {
+    return GARC_ERR_INVALID;
+  }
+  if (!allocator) {
+    allocator = garc_allocator_default();
+  }
+  size_t need = 0;
+  if (gcu_path_dirname(GCU_PATH_NATIVE, path, NULL, 0, &need) != GCU_PATH_OK) {
+    return GARC_ERR_INVALID;
+  }
+  FsVolumeSink * state = (FsVolumeSink *)gcu_allocator_calloc(
+      allocator, 1, sizeof(FsVolumeSink));
+  if (!state) {
+    return GARC_ERR_OOM;
+  }
+  state->allocator = allocator;
+  state->sync
+      = (flags & GARC_FS_NO_SYNC) ? GCU_FILE_SYNC_NONE : GCU_FILE_SYNC_FULL;
+  state->dir = (char *)gcu_allocator_malloc(allocator, need + 1u);
+  state->dest = fs_file_dup(allocator, path);
+  GARC_Result result = state->dir && state->dest ? GARC_OK : GARC_ERR_OOM;
+  if (result == GARC_OK
+      && gcu_path_dirname(GCU_PATH_NATIVE, path, state->dir, need + 1u, NULL)
+          != GCU_PATH_OK) {
+    result = GARC_ERR_INVALID;
+  }
+  if (result == GARC_OK && !gcu_file_is_directory(state->dir)) {
+    result = GARC_ERR_NOT_FOUND;
+  }
+  if (result == GARC_OK) {
+    result = fs_volume_start(state);
+  }
+  GARC_Sink * sink = NULL;
+  if (result == GARC_OK) {
+    // No patch: a header in a volume already left cannot be reached, which is
+    // why a split zip writer uses data descriptors.
+    GARC_Sink_Callbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.ctx = state;
+    callbacks.write = fs_volume_write;
+    callbacks.next_volume = fs_volume_next;
+    result = garc_sink_create_callback_with_allocator(&callbacks, allocator, &sink);
+  }
+  if (result != GARC_OK) {
+    for (size_t i = 0; i < state->count; ++i) {
+      gcu_file_temp_abort(&state->temps[i]);
+    }
+    gcu_allocator_free(allocator, state->temps);
+    gcu_allocator_free(allocator, state->dir);
+    gcu_allocator_free(allocator, state->dest);
+    gcu_allocator_free(allocator, state);
+    return result;
+  }
+  sink->owned_finish = fs_volume_finish;
+  sink->owned_destroy = fs_volume_destroy;
+  *out_sink = sink;
+  return GARC_OK;
+}
+
+GARC_Result garc_fs_sink_create_volumes(
+    const char * path, uint32_t flags, GARC_Sink ** out_sink) {
+  return garc_fs_sink_create_volumes_with_allocator(path, flags, NULL, out_sink);
+}
+
+////////////////////////////////////////////////////////////////////////
 // Opening by path
 ////////////////////////////////////////////////////////////////////////
 

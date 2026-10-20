@@ -194,7 +194,11 @@ which is checked against that file - its name, how far it had got, and how much
 is left - and stepped over, a volume label before it too. `garc_fs_open()` finds
 the parts by name: `name.001`, `name.002`, ... for 7-Zip's `-v`, `split -d -a
 3` or volumes GNU tar was told to write so, and `name.z01` ... `name.zip` for
-Info-ZIP's `zip -s`. A 7z behind a self-extracting stub - an executable with the archive
+Info-ZIP's `zip -s`. **A split zip is written too**: `zip_volume_size` in the
+writer's options and a sink that can start a volume
+(`garc_fs_sink_create_volumes()` names them as `zip -s` does), with no header
+or directory entry cut across two volumes and a data descriptor on every member,
+since a header in a volume already closed cannot be patched. A 7z behind a self-extracting stub - an executable with the archive
 appended, as `7z a -sfx` writes - is found by scanning the first 8 MiB of a file
 that starts like an executable, and `garc_base_offset()` says how long the stub
 was. `make check-volumes` reads split sets the pinned `zip`, `7z` and GNU tar

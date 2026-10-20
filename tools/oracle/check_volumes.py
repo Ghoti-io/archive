@@ -125,15 +125,41 @@ def main(argv):
             continue
         checked += 1
 
+    # And this library's own split zip: packed from the same tree into 64 KiB
+    # volumes, tested by 7-Zip, and read back by name.
+    ours = os.path.join(out, "ours.zip")
+    written = subprocess.run([probe, "write", ours, source], capture_output=True,
+        text=True)
+    parts = sorted(n for n in os.listdir(out) if n.startswith("ours.z"))
+    if written.returncode != 0:
+        failures.append("ours.zip: %s" % written.stderr.strip())
+    elif len(parts) < 3:
+        failures.append("ours.zip: only %d volumes written (%s)" % (len(parts),
+            parts))
+    else:
+        tested = subprocess.run(oracle_env.command("sevenzip",
+            ["7z", "t", "-bso0", "-bsp0", ours], scratch=[work]),
+            capture_output=True, stdin=subprocess.DEVNULL)
+        if tested.returncode != 0:
+            failures.append("ours.zip: 7z t exited %d: %s" % (tested.returncode,
+                tested.stderr.decode("utf-8", "replace").strip()))
+        read = subprocess.run([probe, ours], capture_output=True, text=True)
+        got = sorted(line for line in read.stdout.splitlines() if line.strip())
+        if read.returncode != 0 or got != want:
+            failures.append("ours.zip: read back %s%s" % (got, read.stderr.strip()))
+        else:
+            checked += 1
+
     if failures:
         sys.stderr.write("### check-volumes: a split archive did not read as "
             "it was written ###\n")
         for line in failures:
             sys.stderr.write("  %s\n" % line)
         return 1
-    print("check-volumes: %d split sets from zip -s, zip -fz -s, 7z -v and "
-        "GNU tar -M (with and without labels), each read back to every file's "
-        "size and CRC-32" % checked)
+    print("check-volumes: %d split sets from zip -s, zip -fz -s, 7z -v, "
+        "GNU tar -M (with and without labels) and this library's own split "
+        "zip (which 7-Zip tests), each read back to every file's size and "
+        "CRC-32" % checked)
     return 0
 
 

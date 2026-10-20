@@ -180,6 +180,20 @@ typedef struct {
    */
   struct GARC_Zip_Aes * aes_state;
   /** @} */
+
+  /**
+   * @name A split zip: which volume, and where it began
+   *
+   * Meaningful when `zip_volume_size` is set. Every byte goes through
+   * zip_out() or zip_reserve() in zip_write.c, which is where a volume is
+   * ended and the next begun.
+   * @{
+   */
+  uint32_t disk;         ///< The volume being written, from 0.
+  uint64_t disk_start;   ///< garc_sink_tell() where it began.
+  int wrote_signature;   ///< Whether the spanning signature is out.
+  uint32_t local_disk;   ///< The volume the current member's header is in.
+  /** @} */
 } GARC_Zip_Write_State;
 
 /** What the ar writer remembers. */

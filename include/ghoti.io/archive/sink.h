@@ -145,6 +145,18 @@ typedef struct GARC_Sink_Callbacks {
    * sink's.
    */
   uint64_t start;
+  /**
+   * End the current volume and start the next, for an archive split into
+   * files of a fixed size.
+   *
+   * **Optional**, and only a zip writer given a `zip_volume_size` calls it -
+   * when the next record would not fit, or the volume is full. Every byte
+   * written after it belongs to the next volume; ::garc_sink_tell() keeps
+   * counting from where it was, and the writer works out each volume's own
+   * offsets. ::garc_fs_sink_create_volumes() is the implementation for files.
+   * Return ::GARC_OK, or ::GARC_ERR_IO when the next volume cannot be started.
+   */
+  GARC_Result (*next_volume)(void * ctx);
 } GARC_Sink_Callbacks;
 
 /**
@@ -264,6 +276,24 @@ GARC_API uint64_t garc_sink_tell(const GARC_Sink * sink);
  * @return Non-zero when ::garc_sink_patch() can be used.
  */
 GARC_API int garc_sink_is_seekable(const GARC_Sink * sink);
+
+/**
+ * @brief Whether the sink can start a new volume: whether
+ * ::GARC_Sink_Callbacks.next_volume is set.
+ *
+ * @param sink The sink. NULL returns 0.
+ * @return Non-zero when ::garc_sink_next_volume() can be used.
+ */
+GARC_API int garc_sink_can_split(const GARC_Sink * sink);
+
+/**
+ * @brief End the current volume and start the next.
+ *
+ * @param sink The sink.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID for NULL or a sink that cannot split,
+ *   or the callback's failure.
+ */
+GARC_API GARC_Result garc_sink_next_volume(GARC_Sink * sink);
 
 /**
  * @brief Overwrite bytes this sink has already accepted.

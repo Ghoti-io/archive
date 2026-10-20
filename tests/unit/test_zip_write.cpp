@@ -2621,6 +2621,217 @@ TEST(ZipWrite, AnAllocationFailureAtEveryBudgetIsAStatus) {
   }
 }
 
+//-----------------------------------------------------------------------------
+// Split archives
+//-----------------------------------------------------------------------------
+
+namespace {
+
+/** A sink that keeps each volume apart, as a set of files would. */
+struct Volumes {
+  std::vector<std::vector<uint8_t>> parts{1};
+  static GARC_Result write(void * ctx, const void * buffer, size_t size) {
+    auto * self = static_cast<Volumes *>(ctx);
+    const auto * bytes = static_cast<const uint8_t *>(buffer);
+    self->parts.back().insert(self->parts.back().end(), bytes, bytes + size);
+    return GARC_OK;
+  }
+  static GARC_Result next(void * ctx) {
+    static_cast<Volumes *>(ctx)->parts.emplace_back();
+    return GARC_OK;
+  }
+};
+
+/** Write @p specs split at @p volume into @p out, with @p options' method. */
+GARC_Result write_split(const std::vector<Spec> & specs, uint64_t volume,
+    GARC_Zip_Method method, Volumes * out) {
+  GARC_Sink_Callbacks callbacks{};
+  callbacks.ctx = out;
+  callbacks.write = Volumes::write;
+  callbacks.next_volume = Volumes::next;
+  GARC_Sink * sink = nullptr;
+  GARC_Result result = garc_sink_create_callback(&callbacks, &sink);
+  if (result != GARC_OK) {
+    return result;
+  }
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_method = method;
+  options.zip_volume_size = volume;
+  GARC_Writer * writer = nullptr;
+  result = garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer);
+  for (size_t i = 0; result == GARC_OK && i < specs.size(); ++i) {
+    const GARC_Member member = member_of(specs[i]);
+    result = garc_writer_add(writer, &member);
+    if (result == GARC_OK && specs[i].type == GARC_MEMBER_FILE) {
+      result = garc_writer_write(writer, specs[i].data.data(), specs[i].data.size());
+    }
+  }
+  if (result == GARC_OK) {
+    result = garc_writer_finish(writer);
+  }
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  return result;
+}
+
+/** Read @p parts through a concatenation: names and data, in order. */
+GARC_Result read_split(const std::vector<std::vector<uint8_t>> & parts,
+    std::vector<std::pair<std::string, std::string>> * out) {
+  std::vector<GARC_Stream *> streams;
+  for (const auto & part : parts) {
+    GARC_Stream * stream = nullptr;
+    EXPECT_EQ(GARC_OK, garc_stream_create_memory(part.data(), part.size(), &stream));
+    streams.push_back(stream);
+  }
+  GARC_Stream * whole = nullptr;
+  GARC_Result result
+      = garc_stream_create_concat(streams.data(), streams.size(), &whole);
+  GARC_Archive * archive = nullptr;
+  if (result == GARC_OK) {
+    result = garc_open(whole, nullptr, &archive);
+  }
+  const GARC_Member * member = nullptr;
+  while (result == GARC_OK && (result = garc_next(archive, &member)) == GARC_OK) {
+    std::string data;
+    char buffer[4096];
+    size_t got = 0;
+    while ((result = garc_read_member(archive, buffer, sizeof(buffer), &got))
+            == GARC_OK
+        && got) {
+      data.append(buffer, got);
+    }
+    if (result != GARC_OK) {
+      break;
+    }
+    out->emplace_back(std::string(member->name, member->name_length), data);
+  }
+  garc_close(archive);
+  garc_stream_destroy(whole);
+  for (GARC_Stream * stream : streams) {
+    garc_stream_destroy(stream);
+  }
+  return result == GARC_END ? GARC_OK : result;
+}
+
+std::vector<Spec> split_corpus() {
+  std::vector<Spec> specs;
+  Spec big;
+  big.name = "big.bin";
+  big.data = incompressible(200000);
+  specs.push_back(big);
+  Spec dir;
+  dir.name = "dir/";
+  dir.type = GARC_MEMBER_DIRECTORY;
+  specs.push_back(dir);
+  for (int i = 0; i < 40; ++i) {
+    // Small members, so that headers fall near the volumes' ends.
+    Spec small;
+    small.name = "dir/small-" + std::to_string(i) + ".txt";
+    small.data = incompressible(1500 + 97 * (size_t)i);
+    specs.push_back(small);
+  }
+  Spec empty;
+  empty.name = "empty";
+  specs.push_back(empty);
+  return specs;
+}
+
+} // namespace
+
+TEST(ZipWrite, ASplitArchiveIsWrittenInVolumesAndReadsBack) {
+  const std::vector<Spec> specs = split_corpus();
+  for (const auto & [label, method] : methods()) {
+    SCOPED_TRACE(label);
+    Volumes volumes;
+    ASSERT_EQ(GARC_OK, write_split(specs, 65536, method, &volumes));
+    ASSERT_GE(volumes.parts.size(), 3u);
+    // The spanning signature first, and every volume but the last full or
+    // ended early for a record that would not fit.
+    ASSERT_GE(volumes.parts[0].size(), 4u);
+    EXPECT_EQ(0, std::memcmp(volumes.parts[0].data(), "PK\x07\x08", 4));
+    for (size_t i = 0; i < volumes.parts.size(); ++i) {
+      EXPECT_LE(volumes.parts[i].size(), 65536u) << i;
+      if (i + 1 < volumes.parts.size()) {
+        EXPECT_GT(volumes.parts[i].size(), 65536u - 1024u) << i;
+      }
+    }
+    // And no local header or directory entry is cut across two volumes.
+    for (size_t i = 0; i < volumes.parts.size(); ++i) {
+      const std::vector<uint8_t> & part = volumes.parts[i];
+      for (size_t at = 0; at + 4 <= part.size(); ++at) {
+        if (part[at] != 'P' || part[at + 1] != 'K') {
+          continue;
+        }
+        if (part[at + 2] == 3 && part[at + 3] == 4) {
+          EXPECT_LE(at + 30u + le16(part, at + 26) + le16(part, at + 28), part.size())
+              << "a local header cut at the end of volume " << i;
+        }
+      }
+    }
+    std::vector<std::pair<std::string, std::string>> got;
+    ASSERT_EQ(GARC_OK, read_split(volumes.parts, &got));
+    ASSERT_EQ(got.size(), specs.size());
+    for (size_t i = 0; i < specs.size(); ++i) {
+      EXPECT_EQ(got[i].first, specs[i].name) << i;
+      EXPECT_TRUE(got[i].second == specs[i].data) << specs[i].name;
+    }
+  }
+}
+
+TEST(ZipWrite, ASplitArchiveThatFitsOneVolumeIsOneVolume) {
+  // As Info-ZIP's zip -s writes it: one file, the spanning signature still
+  // first, which unzip and 7-Zip both read.
+  std::vector<Spec> specs(1);
+  specs[0].name = "a.txt";
+  specs[0].data = "small\n";
+  Volumes volumes;
+  ASSERT_EQ(GARC_OK, write_split(specs, 65536, GARC_ZIP_METHOD_DEFLATE, &volumes));
+  ASSERT_EQ(volumes.parts.size(), 1u);
+  EXPECT_EQ(0, std::memcmp(volumes.parts[0].data(), "PK\x07\x08", 4));
+  std::vector<std::pair<std::string, std::string>> got;
+  ASSERT_EQ(GARC_OK, read_split(volumes.parts, &got));
+  ASSERT_EQ(got.size(), 1u);
+  EXPECT_EQ(got[0].second, "small\n");
+}
+
+TEST(ZipWrite, ASplitIsRefusedWhereItCannotBeWritten) {
+  Volumes volumes;
+  GARC_Sink_Callbacks callbacks{};
+  callbacks.ctx = &volumes;
+  callbacks.write = Volumes::write;
+  callbacks.next_volume = Volumes::next;
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_callback(&callbacks, &sink));
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  GARC_Writer * writer = nullptr;
+  // Smaller than a volume may be.
+  options.zip_volume_size = 65535;
+  EXPECT_EQ(GARC_ERR_INVALID, garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer));
+  // Local sizes, which would patch a header in a volume already left.
+  options.zip_volume_size = 65536;
+  options.zip_sizes = GARC_ZIP_SIZES_LOCAL;
+  EXPECT_EQ(GARC_ERR_INVALID, garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer));
+  garc_sink_destroy(sink);
+  // A sink that cannot start a volume.
+  GARC_Sink * memory = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_memory(&memory));
+  options.zip_sizes = GARC_ZIP_SIZES_AUTO;
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED,
+      garc_writer_create(memory, GARC_FORMAT_ZIP, &options, &writer));
+  EXPECT_FALSE(garc_sink_can_split(memory));
+  EXPECT_EQ(GARC_ERR_INVALID, garc_sink_next_volume(memory));
+  garc_sink_destroy(memory);
+  // A name longer than a volume can hold beside its header.
+  std::vector<Spec> specs(1);
+  specs[0].name = std::string(65530, 'n');
+  specs[0].data = "x";
+  Volumes too_long;
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED,
+      write_split(specs, 65536, GARC_ZIP_METHOD_STORED, &too_long));
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

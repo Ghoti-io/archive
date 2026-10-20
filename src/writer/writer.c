@@ -59,6 +59,7 @@ void garc_writer_options_default(GARC_Writer_Options * options) {
   // Off, because a zip64 field on a member that does not need one is refused by
   // some old readers. GARC_Writer_Options says why the knob exists at all.
   options->zip_force_zip64 = 0;
+  options->zip_volume_size = 0;
   // LZMA2 solid, which is 7-Zip's default and the zero of both fields.
   options->sevenz_method = GARC_SEVENZ_LZMA2;
   options->sevenz_non_solid = 0;
@@ -206,6 +207,9 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
       case GARC_ZIP_SIZES_DESCRIPTOR:
         break;
       case GARC_ZIP_SIZES_LOCAL:
+        if (resolved.zip_volume_size) {
+          return GARC_ERR_INVALID; // a header in an earlier volume is not patched
+        }
         if (!garc_sink_is_seekable(sink)) {
           // **Refused here rather than at the first member**, and by name rather
           // than as "unsupported": the caller asked for a form of archive this
@@ -232,6 +236,15 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
         // known before a byte is written, and a refusal afterwards would leave a
         // truncated archive behind it.
         return GARC_ERR_UNSUPPORTED;
+    }
+    if (resolved.zip_volume_size) {
+      if (resolved.zip_volume_size < 65536u) {
+        return GARC_ERR_INVALID;
+      }
+      if (!garc_sink_can_split(sink)) {
+        // A split needs a sink that can start the next volume.
+        return GARC_ERR_UNSUPPORTED;
+      }
     }
     if (!resolved.zip_password && resolved.zip_password_length) {
       return GARC_ERR_INVALID;

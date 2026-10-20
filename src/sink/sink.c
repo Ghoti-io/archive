@@ -250,6 +250,17 @@ int garc_sink_is_seekable(const GARC_Sink * sink) {
   return sink && sink->cb.patch ? 1 : 0;
 }
 
+int garc_sink_can_split(const GARC_Sink * sink) {
+  return sink && sink->cb.next_volume ? 1 : 0;
+}
+
+GARC_Result garc_sink_next_volume(GARC_Sink * sink) {
+  if (!sink || !sink->cb.next_volume) {
+    return GARC_ERR_INVALID;
+  }
+  return sink->cb.next_volume(sink->cb.ctx);
+}
+
 GARC_Result garc_sink_patch(
     GARC_Sink * sink, uint64_t offset, const void * data, size_t size) {
   if (!sink || (!data && size)) {

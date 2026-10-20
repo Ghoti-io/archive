@@ -380,6 +380,43 @@ GARC_API GARC_Result garc_fs_sink_create_with_allocator(const char * path,
     const GARC_Allocator * allocator, GARC_Sink ** out_sink);
 
 /**
+ * @brief Create a sink that writes a split zip's volumes as files.
+ *
+ * For a zip writer given ::GARC_Writer_Options.zip_volume_size. Each volume
+ * goes to a temporary file in @p path's directory, and ::garc_sink_finish()
+ * renames them as Info-ZIP's `zip -s` names them: `name.z01`, `name.z02`, ...,
+ * and the last, which holds the end record, @p path itself. An archive that
+ * fits one volume is `name.zip` alone. Volumes past the new set's from an
+ * earlier, larger set at the same name are removed, since garc_fs_open() would
+ * otherwise read them as part of it. A finish that fails part way removes the
+ * volumes it had put in place; ::garc_sink_destroy() without a finish removes
+ * every temporary and leaves the old files as they were.
+ *
+ * @param path The `.zip` (any case) to write. UTF-8. Not NULL.
+ * @param flags Zero or ::GARC_FS_NO_SYNC. Any other bit is ::GARC_ERR_INVALID.
+ * @param out_sink Receives the sink on success.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID for a NULL argument, a path that does
+ *   not end in `.zip` or is a directory, ::GARC_ERR_NOT_FOUND when the
+ *   directory does not exist, ::GARC_ERR_ACCESS, ::GARC_ERR_OOM, or
+ *   ::GARC_ERR_IO. A commit that fails is ::GARC_ERR_ACCESS or ::GARC_ERR_IO
+ *   from ::garc_sink_finish().
+ */
+GARC_API GARC_Result garc_fs_sink_create_volumes(
+    const char * path, uint32_t flags, GARC_Sink ** out_sink);
+
+/**
+ * @brief ::garc_fs_sink_create_volumes() with an explicit allocator.
+ *
+ * @param path The `.zip` to write.
+ * @param flags Zero or ::GARC_FS_NO_SYNC.
+ * @param allocator For the sink and its state. NULL uses the default.
+ * @param out_sink Receives the sink on success.
+ * @return As ::garc_fs_sink_create_volumes().
+ */
+GARC_API GARC_Result garc_fs_sink_create_volumes_with_allocator(const char * path,
+    uint32_t flags, const GARC_Allocator * allocator, GARC_Sink ** out_sink);
+
+/**
  * @brief Open an archive file, detecting compression around it.
  *
  * The containers are tried first, on the file itself. If none matches, the

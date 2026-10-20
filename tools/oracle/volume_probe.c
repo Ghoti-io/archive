@@ -24,7 +24,10 @@
  * way garc_fs_open() finds a split set's other parts, and print what is in it.
  *
  * Usage:
- *   volume_probe <path>
+ *   volume_probe <path>                 read, as below
+ *   volume_probe write <name.zip> <dir>  pack @p dir as a zip split into
+ *                                        64 KiB volumes, through
+ *                                        garc_fs_sink_create_volumes()
  *
  * One row per file member - `name`, `size`, `crc32` in hex - tab-separated, in
  * the archive's order. check_volumes.py compares them with the source files
@@ -40,9 +43,43 @@
 #include <ghoti.io/archive/fs.h>
 #include <ghoti.io/compress/crc32.h>
 
+/** Pack @p dir into a split zip at @p path, deflated, 64 KiB volumes. */
+static int write_split(const char * path, const char * dir) {
+  GARC_Sink * sink = NULL;
+  GARC_Result result = garc_fs_sink_create_volumes(path, GARC_FS_NO_SYNC, &sink);
+  GARC_Writer * writer = NULL;
+  if (result == GARC_OK) {
+    GARC_Writer_Options options;
+    garc_writer_options_default(&options);
+    options.zip_method = GARC_ZIP_METHOD_DEFLATE;
+    options.zip_volume_size = 65536u;
+    result = garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer);
+  }
+  if (result == GARC_OK) {
+    result = garc_fs_pack(writer, dir, 0);
+  }
+  if (result == GARC_OK) {
+    result = garc_writer_finish(writer);
+  }
+  if (result == GARC_OK) {
+    result = garc_sink_finish(sink);
+  }
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  if (result != GARC_OK) {
+    fprintf(stderr, "%s: write: %s\n", path, garc_result_string(result));
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char ** argv) {
+  if (argc == 4 && strcmp(argv[1], "write") == 0) {
+    return write_split(argv[2], argv[3]);
+  }
   if (argc != 2) {
-    fprintf(stderr, "usage: %s <path>\n", argv[0]);
+    fprintf(stderr, "usage: %s <path>\n       %s write <name.zip> <dir>\n",
+        argv[0], argv[0]);
     return 2;
   }
   GARC_Archive * archive = NULL;

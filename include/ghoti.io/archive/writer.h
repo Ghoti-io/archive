@@ -286,6 +286,24 @@ typedef struct GARC_Writer_Options {
   int zip_force_zip64;
 
   /**
+   * Split the zip into volumes of this many bytes, or 0 for one file.
+   *
+   * What Info-ZIP's `zip -s` and WinZip write: every volume but the last is
+   * exactly this long, the first starts with the spanning signature, each
+   * member's offset counts from the start of the volume its header is in, and
+   * the end records name the disks - ::garc_fs_sink_create_volumes() writes
+   * them as `name.z01`, `name.z02`, ..., `name.zip`. No header or directory
+   * entry is split across two volumes (a volume ends early instead); data is.
+   * The sink must be able to start a new volume (::garc_sink_can_split()),
+   * and since a header in an earlier volume cannot be patched every member
+   * gets a data descriptor - ::GARC_ZIP_SIZES_LOCAL is refused. At least
+   * 65,536 bytes, the smallest volume PKWARE's note allows; at most 65,534
+   * volumes. A record that cannot fit even an empty volume is
+   * ::GARC_ERR_UNSUPPORTED. Ignored for every other format.
+   */
+  uint64_t zip_volume_size;
+
+  /**
    * How a 7z archive's data is compressed. Ignored for tar and zip.
    *
    * ::GARC_SEVENZ_LZMA2 is 0 and is the default, as it is 7-Zip's.

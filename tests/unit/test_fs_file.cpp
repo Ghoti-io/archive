@@ -645,6 +645,83 @@ TEST_F(FsFile, ANumberedSplitOpensFromItsFirstPartWhateverItHolds) {
   }
 }
 
+/** Write @p entries as a zip split at 64 KiB to @p path. */
+GARC_Result write_split_zip(const std::string & path, const std::vector<Entry> & entries,
+    bool finish = true) {
+  GARC_Sink * sink = nullptr;
+  GARC_Result result = garc_fs_sink_create_volumes(path.c_str(), GARC_FS_NO_SYNC, &sink);
+  if (result != GARC_OK) {
+    return result;
+  }
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_volume_size = 65536;
+  GARC_Writer * writer = nullptr;
+  result = garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer);
+  for (size_t i = 0; result == GARC_OK && i < entries.size(); ++i) {
+    const GARC_Member member = file_member(entries[i]);
+    result = garc_writer_add(writer, &member);
+    if (result == GARC_OK && !entries[i].second.empty()) {
+      result = garc_writer_write(writer, entries[i].second.data(), entries[i].second.size());
+    }
+  }
+  if (result == GARC_OK) {
+    result = garc_writer_finish(writer);
+  }
+  if (result == GARC_OK && finish) {
+    result = garc_sink_finish(sink);
+  }
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  return result;
+}
+
+/** A large member that does not compress, so a set needs several volumes. */
+std::vector<Entry> volume_sample(size_t length) {
+  std::string big;
+  uint32_t state = 7;
+  for (size_t i = 0; i < length; ++i) {
+    state = state * 1103515245u + 12345u;
+    big.push_back(static_cast<char>(state >> 16));
+  }
+  return {{"big.bin", big}, {"a.txt", "alpha"}};
+}
+
+TEST_F(FsFile, AVolumeSinkWritesTheSetUnderInfoZipsNames) {
+  const auto entries = volume_sample(200000);
+  ASSERT_EQ(GARC_OK, write_split_zip(at("set.zip"), entries));
+  EXPECT_EQ(names(), (std::set<std::string>{"set.z01", "set.z02", "set.z03", "set.zip"}));
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(GARC_OK, garc_fs_open(at("set.zip").c_str(), nullptr, nullptr, 0, &archive));
+  EXPECT_EQ(read_all(archive), entries);
+  garc_close(archive);
+
+  // A smaller set at the same name: the old set's extra volumes go, or a
+  // reader finding set.z01 onward would take set.z02 and set.z03 for this
+  // set's.
+  const auto smaller = volume_sample(100000);
+  ASSERT_EQ(GARC_OK, write_split_zip(at("set.zip"), smaller));
+  EXPECT_EQ(names(), (std::set<std::string>{"set.z01", "set.zip"}));
+  ASSERT_EQ(GARC_OK, garc_fs_open(at("set.zip").c_str(), nullptr, nullptr, 0, &archive));
+  EXPECT_EQ(read_all(archive), smaller);
+  garc_close(archive);
+
+  // One volume's worth is set.zip alone.
+  ASSERT_EQ(GARC_OK, write_split_zip(at("one.zip"), {{"a.txt", "alpha"}}));
+  EXPECT_TRUE(gcu_file_exists(at("one.zip").c_str()));
+  EXPECT_FALSE(gcu_file_exists(at("one.z01").c_str()));
+}
+
+TEST_F(FsFile, AVolumeSinkThatIsNotFinishedLeavesNothing) {
+  ASSERT_EQ(GARC_OK, write_split_zip(at("gone.zip"), volume_sample(200000), false));
+  EXPECT_TRUE(names().empty());
+  GARC_Sink * sink = nullptr;
+  EXPECT_EQ(GARC_ERR_INVALID, garc_fs_sink_create_volumes(at("x.tar").c_str(), 0, &sink));
+  EXPECT_EQ(GARC_ERR_NOT_FOUND,
+      garc_fs_sink_create_volumes(at("missing/x.zip").c_str(), 0, &sink));
+  EXPECT_EQ(GARC_ERR_INVALID, garc_fs_sink_create_volumes(nullptr, 0, &sink));
+}
+
 TEST_F(FsFile, EveryAllocationFailureIsReportedAndFreesWhatItTook) {
   GARC_Sink * sink = nullptr;
   ASSERT_EQ(GARC_OK, garc_fs_sink_create(at("in.tar.xz").c_str(), "xz", nullptr,

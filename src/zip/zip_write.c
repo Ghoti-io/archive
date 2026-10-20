@@ -296,6 +296,115 @@ static int zip_name_needs_utf8_flag(const char * name, size_t length) {
  * @param length How many.
  * @return GARC_OK or GARC_ERR_OOM.
  */
+////////////////////////////////////////////////////////////////////////
+// Volumes
+////////////////////////////////////////////////////////////////////////
+//
+// A split zip is written as one stream of bytes through a sink that can start
+// a new volume, and every byte goes through one of the two functions below so
+// that the cut is made in one place. Data may run from one volume into the
+// next; a header, a directory entry, a descriptor or an end record may not,
+// so before each one zip_reserve() ends a volume that has no room for it.
+
+/** The most volumes a split archive may have here: 16-bit disk numbers. */
+#define ZIP_MAX_VOLUMES 65534u
+
+/** The spanning signature at the start of the first volume. */
+static const uint8_t ZIP_SIG_SPANNING[4] = {'P', 'K', 7, 8};
+
+static int zip_split(const GARC_Writer * writer) {
+  return writer->options.zip_volume_size != 0u;
+}
+
+/** Bytes left in the volume being written. */
+static uint64_t zip_volume_left(const GARC_Writer * writer) {
+  const uint64_t used = garc_sink_tell(writer->sink) - writer->zip.disk_start;
+  return writer->options.zip_volume_size - used;
+}
+
+/** End this volume and begin the next. */
+static GARC_Result zip_next_volume(GARC_Writer * writer) {
+  GARC_Zip_Write_State * zip = &writer->zip;
+  if (zip->disk + 1u >= ZIP_MAX_VOLUMES) {
+    return GARC_ERR_UNSUPPORTED;
+  }
+  GARC_Result result = garc_sink_next_volume(writer->sink);
+  if (result != GARC_OK) {
+    return result;
+  }
+  zip->disk++;
+  zip->disk_start = garc_sink_tell(writer->sink);
+  return GARC_OK;
+}
+
+/** The spanning signature, before the first byte of a split archive. */
+static GARC_Result zip_volume_begin(GARC_Writer * writer) {
+  GARC_Zip_Write_State * zip = &writer->zip;
+  if (!zip_split(writer) || zip->wrote_signature) {
+    return GARC_OK;
+  }
+  zip->wrote_signature = 1;
+  zip->disk = 0;
+  zip->disk_start = garc_sink_tell(writer->sink);
+  return garc_sink_write(writer->sink, ZIP_SIG_SPANNING, sizeof(ZIP_SIG_SPANNING));
+}
+
+/**
+ * Make room for a record of @p length bytes in one volume.
+ *
+ * Starts the next volume when this one cannot hold it, and refuses a record no
+ * volume could hold. A no-op for an archive that is not split.
+ */
+static GARC_Result zip_reserve(GARC_Writer * writer, uint64_t length) {
+  if (!zip_split(writer)) {
+    return GARC_OK;
+  }
+  GARC_Result result = zip_volume_begin(writer);
+  if (result != GARC_OK) {
+    return result;
+  }
+  if (length <= zip_volume_left(writer)) {
+    return GARC_OK;
+  }
+  if (length > writer->options.zip_volume_size) {
+    return GARC_ERR_UNSUPPORTED;
+  }
+  return zip_next_volume(writer);
+}
+
+/** Write data, which may run from one volume into the next. */
+static GARC_Result zip_out(GARC_Writer * writer, const void * bytes, size_t length) {
+  if (!zip_split(writer)) {
+    return garc_sink_write(writer->sink, bytes, length);
+  }
+  GARC_Result result = zip_volume_begin(writer);
+  const uint8_t * at = (const uint8_t *)bytes;
+  while (result == GARC_OK && length) {
+    uint64_t room = zip_volume_left(writer);
+    if (!room) {
+      result = zip_next_volume(writer);
+      continue;
+    }
+    const size_t take = (uint64_t)length < room ? length : (size_t)room;
+    result = garc_sink_write(writer->sink, at, take);
+    at += take;
+    length -= take;
+  }
+  return result;
+}
+
+/** A whole record: room for it, then its bytes. */
+static GARC_Result zip_record(GARC_Writer * writer, const void * bytes, size_t length) {
+  GARC_Result result = zip_reserve(writer, length);
+  return result == GARC_OK ? zip_out(writer, bytes, length) : result;
+}
+
+/** Where the next byte goes, as the volume it is in counts. */
+static uint64_t zip_here(const GARC_Writer * writer) {
+  const uint64_t at = garc_sink_tell(writer->sink);
+  return zip_split(writer) ? at - writer->zip.disk_start : at;
+}
+
 static GARC_Result zip_central_append(
     GARC_Writer * writer, const void * bytes, size_t length) {
   GARC_Zip_Write_State * zip = &writer->zip;
@@ -410,7 +519,7 @@ static int zip_needs_zip64(const GARC_Writer * writer, uint64_t size,
   }
   return writer->options.zip_force_zip64
       || largest >= (uint64_t)ZIP_MARKER32
-      || garc_sink_tell(writer->sink) >= (uint64_t)ZIP_MARKER32;
+      || zip_here(writer) >= (uint64_t)ZIP_MARKER32;
 }
 
 /**
@@ -564,7 +673,7 @@ static GARC_Result zip_deflate_emit_bytes(
       return encrypted;
     }
   }
-  const GARC_Result result = garc_sink_write(writer->sink, bytes, used);
+  const GARC_Result result = zip_out(writer, bytes, used);
   if (result != GARC_OK) {
     if (zip->aes_state) {
       garc_zip_aes_restore(zip->aes_state, &saved);
@@ -766,9 +875,11 @@ GARC_Result garc_zip_write_member(
   // Which discipline this member uses. AUTO asks the sink; the other two were
   // settled at garc_writer_create(), which is where LOCAL over a sink that cannot
   // patch is refused - so by here the answer cannot fail.
+  // A split archive cannot patch a header in a volume it has left, so it is
+  // the pipe case whatever the sink can do.
   const int descriptor = writer->options.zip_sizes == GARC_ZIP_SIZES_DESCRIPTOR
       || (writer->options.zip_sizes == GARC_ZIP_SIZES_AUTO
-          && !garc_sink_is_seekable(writer->sink));
+          && (!garc_sink_is_seekable(writer->sink) || zip_split(writer)));
   // **A member whose contents are already known needs no descriptor**, and a
   // stored one cannot be read from a pipe with one: nothing in stored data says
   // where it ends. A directory, an empty file and a symlink's target are all
@@ -942,6 +1053,14 @@ GARC_Result garc_zip_write_member(
   }
   zip->name.length = name_length;
 
+  // The header, its name and its extra in one volume of a split archive; the
+  // member's offset is where that leaves it.
+  result = zip_reserve(writer, sizeof(header) + name_length + local_extra);
+  if (result != GARC_OK) {
+    return result;
+  }
+  zip->local_offset = zip_here(writer);
+  zip->local_disk = zip->disk;
   result = garc_sink_write(writer->sink, header, sizeof(header));
   if (result != GARC_OK) {
     return result;
@@ -978,7 +1097,7 @@ GARC_Result garc_zip_write_member(
     if (result != GARC_OK) {
       return result;
     }
-    result = garc_sink_write(writer->sink, prefix, prefix_len);
+    result = zip_out(writer, prefix, prefix_len);
     gsec_wipe(prefix, sizeof(prefix));
     if (result != GARC_OK) {
       garc_zip_aes_destroy(zip->aes_state);
@@ -1042,7 +1161,7 @@ GARC_Result garc_zip_write_data(
           gsec_wipe(block, sizeof(block));
           return encrypted;
         }
-        const GARC_Result written = garc_sink_write(writer->sink, block, n);
+        const GARC_Result written = zip_out(writer, block, n);
         gsec_wipe(block, n);
         if (written != GARC_OK) {
           garc_zip_aes_restore(zip->aes_state, &saved);
@@ -1056,7 +1175,7 @@ GARC_Result garc_zip_write_data(
       zip->running_crc = crc;
       return GARC_OK;
     }
-    const GARC_Result result = garc_sink_write(writer->sink, data, size);
+    const GARC_Result result = zip_out(writer, data, size);
     if (result != GARC_OK) {
       return result;
     }
@@ -1128,7 +1247,7 @@ static GARC_Result zip_write_descriptor(GARC_Writer * writer, uint32_t crc) {
     garc_zip_put32(descriptor + 8u, (uint32_t)zip->compressed);
     garc_zip_put32(descriptor + 12u, (uint32_t)zip->declared);
   }
-  return garc_sink_write(writer->sink, descriptor, length);
+  return zip_record(writer, descriptor, length);
 }
 
 /**
@@ -1262,7 +1381,7 @@ GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
       zip->aes_state = NULL;
       return sealed;
     }
-    sealed = garc_sink_write(writer->sink, tag, sizeof(tag));
+    sealed = zip_out(writer, tag, sizeof(tag));
     gsec_wipe(tag, sizeof(tag));
     garc_zip_aes_destroy(zip->aes_state);
     zip->aes_state = NULL;
@@ -1314,7 +1433,8 @@ GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
   garc_zip_put16(entry + 28u, (uint16_t)zip->name.length);
   garc_zip_put16(entry + 30u, (uint16_t)extra_length);
   garc_zip_put16(entry + 32u, 0u); // No member comment.
-  garc_zip_put16(entry + 34u, 0u); // Disk 0, which is the only disk there is.
+  // The volume the header is in: 0 unless the archive is split.
+  garc_zip_put16(entry + 34u, (uint16_t)zip->local_disk);
   garc_zip_put16(entry + 36u, 0u); // Internal attributes: no writer sets these.
   garc_zip_put32(entry + 38u, zip->external_attributes);
   garc_zip_put32(entry + 42u, zip->local_offset >= (uint64_t)ZIP_MARKER32
@@ -1374,6 +1494,12 @@ static size_t zip_extra_without_zip64(
 GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
     const char * name, size_t name_length) {
   GARC_Zip_Write_State * zip = &writer->zip;
+  if (zip_split(writer)) {
+    // The copy works out its offset and its zip64 fields before it writes,
+    // and a split archive only knows its offset after the header has found a
+    // volume. Copying through the codec works; this does not, yet.
+    return GARC_ERR_UNSUPPORTED;
+  }
   GARC_Zip_Raw_Entry e;
   GARC_Result result = garc_zip_raw_entry(source, &e);
   if (result != GARC_OK) {
@@ -1508,7 +1634,7 @@ GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
     const size_t want = left < sizeof(chunk) ? (size_t)left : sizeof(chunk);
     result = garc_zip_raw_read(source, copied, chunk, want);
     if (result == GARC_OK) {
-      result = garc_sink_write(writer->sink, chunk, want);
+      result = zip_out(writer, chunk, want);
     }
     copied += want;
   }
@@ -1529,7 +1655,7 @@ GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
       garc_zip_put32(trailer + 8u, (uint32_t)e.compressed_size);
       garc_zip_put32(trailer + 12u, (uint32_t)e.size);
     }
-    result = garc_sink_write(writer->sink, trailer, length);
+    result = zip_record(writer, trailer, length);
   }
 
   if (result == GARC_OK) {
@@ -1585,12 +1711,53 @@ GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
   return GARC_OK;
 }
 
+/** The length of the central directory entry that starts at @p entry. */
+static size_t zip_central_entry_length(const uint8_t * entry) {
+  return GARC_ZIP_CENTRAL_ENTRY_SIZE + garc_zip_le16(entry + 28u)
+      + garc_zip_le16(entry + 30u) + garc_zip_le16(entry + 32u);
+}
+
 GARC_Result garc_zip_write_end(GARC_Writer * writer) {
   GARC_Zip_Write_State * zip = &writer->zip;
-  const uint64_t central_offset = garc_sink_tell(writer->sink);
+  GARC_Result result = GARC_OK;
 
-  GARC_Result result
-      = garc_sink_write(writer->sink, zip->central.bytes, zip->central.length);
+  // The directory. In one write when the archive is one file; entry by entry
+  // when it is split, so that no entry is cut across two volumes, counting the
+  // ones that land on the last.
+  uint64_t central_offset = zip_here(writer);
+  uint32_t central_disk = zip->disk;
+  uint64_t on_last_disk = zip->entries;
+  if (!zip_split(writer)) {
+    result = garc_sink_write(writer->sink, zip->central.bytes, zip->central.length);
+  }
+  else {
+    on_last_disk = 0;
+    size_t at = 0;
+    while (result == GARC_OK && at < zip->central.length) {
+      const uint8_t * entry = (const uint8_t *)zip->central.bytes + at;
+      const size_t length = zip_central_entry_length(entry);
+      const uint32_t before = zip->disk;
+      result = zip_reserve(writer, length);
+      if (result == GARC_OK && at == 0) {
+        central_offset = zip_here(writer);
+        central_disk = zip->disk;
+      }
+      if (result == GARC_OK) {
+        if (zip->disk != before) {
+          on_last_disk = 0;
+        }
+        result = zip_out(writer, entry, length);
+        on_last_disk++;
+      }
+      at += length;
+    }
+    if (result == GARC_OK && !zip->central.length) {
+      // An empty archive: the directory, of nothing, is where the end is.
+      result = zip_volume_begin(writer);
+      central_offset = zip_here(writer);
+      central_disk = zip->disk;
+    }
+  }
   if (result != GARC_OK) {
     return result;
   }
@@ -1616,7 +1783,20 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
       || zip->entries > (uint64_t)ZIP_MARKER16
       || central_size >= (uint64_t)ZIP_MARKER32
       || central_offset >= (uint64_t)ZIP_MARKER32 || tail_looks_like_locator;
+  // The end records together in one volume, so that the locator is the 20
+  // bytes before the end record in a volume as well as in the whole.
+  const uint32_t disk_before_end = zip->disk;
+  result = zip_reserve(writer, GARC_ZIP_EOCD_SIZE
+      + (need_zip64_end
+          ? GARC_ZIP_ZIP64_EOCD_SIZE + GARC_ZIP_ZIP64_LOCATOR_SIZE : 0u));
+  if (result != GARC_OK) {
+    return result;
+  }
+  if (zip->disk != disk_before_end) {
+    on_last_disk = 0; // the end records began a volume no entry is on
+  }
   if (need_zip64_end) {
+    const uint64_t record_offset = zip_here(writer);
     uint8_t record[GARC_ZIP_ZIP64_EOCD_SIZE];
     memcpy(record, ZIP_SIG_ZIP64_EOCD, 4);
     // The size field counts the record *after* itself, which is 56 - 12: four
@@ -1634,9 +1814,9 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
       end_version = ZIP_VERSION_NEEDED_CODEC;
     }
     garc_zip_put16(record + 14u, end_version);
-    garc_zip_put32(record + 16u, 0u); // This disk.
-    garc_zip_put32(record + 20u, 0u); // The disk the directory starts on.
-    garc_zip_put64(record + 24u, zip->entries);
+    garc_zip_put32(record + 16u, zip->disk); // This disk.
+    garc_zip_put32(record + 20u, central_disk);
+    garc_zip_put64(record + 24u, on_last_disk);
     garc_zip_put64(record + 32u, zip->entries);
     garc_zip_put64(record + 40u, central_size);
     garc_zip_put64(record + 48u, central_offset);
@@ -1647,9 +1827,9 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
 
     uint8_t locator[GARC_ZIP_ZIP64_LOCATOR_SIZE];
     memcpy(locator, ZIP_SIG_ZIP64_LOCATOR, 4);
-    garc_zip_put32(locator + 4u, 0u); // The disk the zip64 record is on.
-    garc_zip_put64(locator + 8u, central_offset + central_size);
-    garc_zip_put32(locator + 16u, 1u); // The number of disks.
+    garc_zip_put32(locator + 4u, zip->disk); // The disk the zip64 record is on.
+    garc_zip_put64(locator + 8u, record_offset);
+    garc_zip_put32(locator + 16u, zip->disk + 1u); // The number of disks.
     result = garc_sink_write(writer->sink, locator, sizeof(locator));
     if (result != GARC_OK) {
       return result;
@@ -1658,8 +1838,8 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
 
   uint8_t eocd[GARC_ZIP_EOCD_SIZE];
   memcpy(eocd, ZIP_SIG_EOCD, 4);
-  garc_zip_put16(eocd + 4u, 0u); // This disk.
-  garc_zip_put16(eocd + 6u, 0u); // The disk the directory starts on.
+  garc_zip_put16(eocd + 4u, (uint16_t)zip->disk); // This disk.
+  garc_zip_put16(eocd + 6u, (uint16_t)central_disk);
   // Marked only where the value does not fit, which is the same rule the members'
   // fields follow. `zip -fz` marks the central offset on an archive whose offset
   // fits, and this does not: the forced flag is about the *members'* fields and
@@ -1667,7 +1847,9 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
   // reader has to work around.
   const uint16_t entries16 = zip->entries > (uint64_t)ZIP_MARKER16
       ? ZIP_MARKER16 : (uint16_t)zip->entries;
-  garc_zip_put16(eocd + 8u, entries16);
+  const uint16_t here16 = on_last_disk > (uint64_t)ZIP_MARKER16
+      ? ZIP_MARKER16 : (uint16_t)on_last_disk;
+  garc_zip_put16(eocd + 8u, here16);
   garc_zip_put16(eocd + 10u, entries16);
   garc_zip_put32(eocd + 12u, central_size >= (uint64_t)ZIP_MARKER32
       ? ZIP_MARKER32 : (uint32_t)central_size);
