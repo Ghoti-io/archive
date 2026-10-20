@@ -611,7 +611,7 @@ static GARC_Result reader_read_member(GARC_Archive * archive, void * buffer,
   // Through the identification window, which for ar and cpio still holds the
   // first bytes of the first member's data: their headers are shorter than the
   // window, tar's is exactly as long.
-  GARC_Result result = garc_tar_read(archive, (uint8_t *)buffer, want, &got);
+  GARC_Result result = garc_tar_read_data(archive, (uint8_t *)buffer, want, &got);
   if (result != GARC_OK) {
     return result;
   }

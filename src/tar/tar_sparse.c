@@ -498,7 +498,7 @@ GARC_Result garc_tar_sparse_read(GARC_Archive * archive, void * buffer,
       }
       size_t got = 0;
       GARC_Result result
-          = garc_tar_read(archive, (uint8_t *)buffer, (size_t)want, &got);
+          = garc_tar_read_data(archive, (uint8_t *)buffer, (size_t)want, &got);
       if (result != GARC_OK) {
         return result;
       }

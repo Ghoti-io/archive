@@ -16,13 +16,16 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <algorithm>
 #include <cstring>
+#include <utility>
 #include <map>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "tar_builder.h"
 #include "tar_manifest.h"
 #include "test_helpers.h"
 
@@ -963,6 +966,214 @@ TEST(TarVariant, AnEmptyArchiveIsAnArchive) {
 
   garc_close(archive);
   garc_stream_destroy(stream);
+}
+
+//-----------------------------------------------------------------------------
+// GNU multi-volume
+//-----------------------------------------------------------------------------
+
+namespace {
+
+/** A GNU continuation header: `remaining` bytes of `name`, from `offset`. */
+garctest::TarHeader continuation(
+    const std::string & name, uint64_t remaining, uint64_t offset) {
+  garctest::TarHeader header = garctest::file_header(name, remaining, 0644u, 'M');
+  header.octal(369, 12, offset);
+  header.checksum();
+  return header;
+}
+
+/** Walk @p parts through a concatenation, names and data, or a status. */
+GARC_Result walk_volumes(const std::vector<std::vector<uint8_t>> & parts,
+    std::vector<std::pair<std::string, std::string>> * out) {
+  std::vector<GARC_Stream *> streams;
+  for (const auto & part : parts) {
+    GARC_Stream * stream = nullptr;
+    EXPECT_EQ(GARC_OK, garc_stream_create_memory(part.data(), part.size(), &stream));
+    streams.push_back(stream);
+  }
+  GARC_Stream * whole = nullptr;
+  GARC_Result result
+      = garc_stream_create_concat(streams.data(), streams.size(), &whole);
+  GARC_Archive * archive = nullptr;
+  if (result == GARC_OK) {
+    result = garc_open(whole, nullptr, &archive);
+  }
+  const GARC_Member * member = nullptr;
+  while (result == GARC_OK && (result = garc_next(archive, &member)) == GARC_OK) {
+    std::string data;
+    char buffer[300];
+    size_t got = 0;
+    while ((result = garc_read_member(archive, buffer, sizeof(buffer), &got))
+            == GARC_OK
+        && got) {
+      data.append(buffer, got);
+    }
+    if (result != GARC_OK) {
+      break;
+    }
+    out->emplace_back(std::string(member->name, member->name_length), data);
+  }
+  garc_close(archive);
+  garc_stream_destroy(whole);
+  for (GARC_Stream * stream : streams) {
+    garc_stream_destroy(stream);
+  }
+  return result == GARC_END ? GARC_OK : result;
+}
+
+std::string pattern(size_t length) {
+  std::string out;
+  for (size_t i = 0; i < length; ++i) {
+    out.push_back(static_cast<char>('a' + (i * 7) % 26));
+  }
+  return out;
+}
+
+/**
+ * A file of 3000 bytes across three volumes, as GNU tar -M lays it out: the
+ * first volume ends inside the data with no marker, and each later one starts
+ * with an `M` header - after a `V` label when @p labels - then the rest.
+ */
+std::vector<std::vector<uint8_t>> three_volumes(bool labels) {
+  const std::string big = pattern(3000);
+  using garctest::TarArchive;
+  using garctest::file_header;
+  std::vector<std::vector<uint8_t>> parts;
+  TarArchive one;
+  one.header(file_header("big.bin", 3000)).raw(std::vector<uint8_t>(big.begin(), big.begin() + 1024));
+  parts.push_back(one.bytes());
+  TarArchive two;
+  if (labels) {
+    two.header(file_header("Volume 2", 0, 0644u, 'V'));
+  }
+  two.header(continuation("big.bin", 1976, 1024))
+      .raw(std::vector<uint8_t>(big.begin() + 1024, big.begin() + 2048));
+  parts.push_back(two.bytes());
+  TarArchive three;
+  if (labels) {
+    three.header(file_header("Volume 3", 0, 0644u, 'V'));
+  }
+  three.header(continuation("big.bin", 952, 2048))
+      .data(big.substr(2048))
+      .header(file_header("small.txt", 6))
+      .data("small\n")
+      .marker();
+  parts.push_back(three.bytes());
+  return parts;
+}
+
+} // namespace
+
+TEST(TarVolumes, AFileAcrossGnuVolumesReadsWhole) {
+  const std::vector<std::pair<std::string, std::string>> want = {
+      {"big.bin", pattern(3000)}, {"small.txt", "small\n"}};
+  for (bool labels : {false, true}) {
+    SCOPED_TRACE(labels);
+    std::vector<std::pair<std::string, std::string>> got;
+    EXPECT_EQ(GARC_OK, walk_volumes(three_volumes(labels), &got));
+    EXPECT_TRUE(got == want);
+  }
+}
+
+TEST(TarVolumes, SkippingAFileAcrossVolumesStillChecksEachContinuation) {
+  // garc_next() without reading steps over the data, through the boundaries.
+  const auto parts = three_volumes(false);
+  std::vector<GARC_Stream *> streams;
+  for (const auto & part : parts) {
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(GARC_OK, garc_stream_create_memory(part.data(), part.size(), &stream));
+    streams.push_back(stream);
+  }
+  GARC_Stream * whole = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_concat(streams.data(), streams.size(), &whole));
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(GARC_OK, garc_open(whole, nullptr, &archive));
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(GARC_OK, garc_next(archive, &member));
+  ASSERT_EQ(GARC_OK, garc_next(archive, &member));
+  EXPECT_EQ(std::string(member->name, member->name_length), "small.txt");
+  EXPECT_EQ(GARC_END, garc_next(archive, &member));
+  garc_close(archive);
+  garc_stream_destroy(whole);
+  for (GARC_Stream * stream : streams) {
+    garc_stream_destroy(stream);
+  }
+}
+
+TEST(TarVolumes, AContinuationThatDoesNotContinueTheFileIsCorrupt) {
+  std::vector<std::pair<std::string, std::string>> got;
+  {
+    // The wrong offset.
+    auto parts = three_volumes(false);
+    garctest::TarHeader wrong = continuation("big.bin", 1976, 1000);
+    std::copy(wrong.bytes.begin(), wrong.bytes.end(), parts[1].begin());
+    EXPECT_EQ(GARC_ERR_CORRUPT, walk_volumes(parts, &got));
+  }
+  {
+    // Another file's name.
+    auto parts = three_volumes(false);
+    garctest::TarHeader wrong = continuation("other.bin", 1976, 1024);
+    std::copy(wrong.bytes.begin(), wrong.bytes.end(), parts[1].begin());
+    EXPECT_EQ(GARC_ERR_CORRUPT, walk_volumes(parts, &got));
+  }
+  {
+    // A volume missing: the third follows the first, and its continuation
+    // says the file had got further than the first volume took it.
+    auto parts = three_volumes(false);
+    parts.erase(parts.begin() + 1);
+    EXPECT_EQ(GARC_ERR_CORRUPT, walk_volumes(parts, &got));
+  }
+  {
+    // A labelled volume with no continuation where the file ran over.
+    auto parts = three_volumes(true);
+    garctest::TarHeader plain = garctest::file_header("big.bin", 1976);
+    std::copy(plain.bytes.begin(), plain.bytes.end(), parts[1].begin() + 512);
+    EXPECT_EQ(GARC_ERR_CORRUPT, walk_volumes(parts, &got));
+  }
+  {
+    // A continuation where nothing was owed: two whole archives end to end
+    // where the second starts with one.
+    const auto parts = three_volumes(false);
+    garctest::TarArchive first;
+    first.header(garctest::file_header("a", 3)).data("abc");
+    std::vector<std::vector<uint8_t>> set = {first.bytes(), parts[1]};
+    EXPECT_EQ(GARC_ERR_CORRUPT, walk_volumes(set, &got));
+  }
+}
+
+TEST(TarVolumes, AFileCutWithSplitIsReadStraightThrough) {
+  // split -b cuts anywhere, and its parts are named .001, .002 like GNU's
+  // volumes: no labels, no continuations, just the bytes. Cut on a block and
+  // off one, inside the data and between members.
+  const std::string big = pattern(3000);
+  garctest::TarArchive archive;
+  archive.header(garctest::file_header("big.bin", 3000)).data(big)
+      .header(garctest::file_header("small.txt", 6)).data("small\n").marker();
+  const std::vector<uint8_t> & bytes = archive.bytes();
+  const std::vector<std::pair<std::string, std::string>> want = {
+      {"big.bin", big}, {"small.txt", "small\n"}};
+  for (const std::vector<size_t> & cuts : std::vector<std::vector<size_t>>{
+           {1024}, {1000}, {3584}, {700, 1536, 2600, 3584, 4000}}) {
+    SCOPED_TRACE(cuts.size());
+    std::vector<std::vector<uint8_t>> parts;
+    size_t from = 0;
+    for (size_t cut : cuts) {
+      parts.emplace_back(bytes.begin() + (std::ptrdiff_t)from,
+          bytes.begin() + (std::ptrdiff_t)cut);
+      from = cut;
+    }
+    parts.emplace_back(bytes.begin() + (std::ptrdiff_t)from, bytes.end());
+    std::vector<std::pair<std::string, std::string>> got;
+    EXPECT_EQ(GARC_OK, walk_volumes(parts, &got));
+    EXPECT_TRUE(got == want);
+  }
+}
+
+TEST(TarVolumes, ALaterVolumeOnItsOwnIsRefusedByName) {
+  const auto parts = three_volumes(false);
+  std::vector<std::pair<std::string, std::string>> got;
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED, walk_volumes({parts[2]}, &got));
 }
 
 int main(int argc, char ** argv) {

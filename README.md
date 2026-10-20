@@ -188,12 +188,17 @@ compress read on past the end of the first stream.
 **Split archives are read whole.** `garc_stream_create_concat()` makes one stream
 of several, and a split zip read through it has every disk field honoured,
 zip64's included, because its offsets count from the start of the part they are
-in. `garc_fs_open()` finds the parts by name: `name.001`, `name.002`, ... for
-7-Zip's `-v` or `split -d -a 3`, and `name.z01` ... `name.zip` for Info-ZIP's
-`zip -s`. A 7z behind a self-extracting stub - an executable with the archive
+in. GNU tar's multi-volume archives (`tar -M`) read the same way: each volume
+after the first starts with a continuation header for the file that ran over,
+which is checked against that file - its name, how far it had got, and how much
+is left - and stepped over, a volume label before it too. `garc_fs_open()` finds
+the parts by name: `name.001`, `name.002`, ... for 7-Zip's `-v`, `split -d -a
+3` or volumes GNU tar was told to write so, and `name.z01` ... `name.zip` for
+Info-ZIP's `zip -s`. A 7z behind a self-extracting stub - an executable with the archive
 appended, as `7z a -sfx` writes - is found by scanning the first 8 MiB of a file
 that starts like an executable, and `garc_base_offset()` says how long the stub
-was. `make check-volumes` reads split sets the pinned `zip` and `7z` wrote, and
+was. `make check-volumes` reads split sets the pinned `zip`, `7z` and GNU tar
+wrote, and
 `check-sevenz-writer` reads an archive behind the image's real `7zCon.sfx`.
 
 The zip fixtures are 23 archives from four writers - Info-ZIP's `zip`,

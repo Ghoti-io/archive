@@ -220,6 +220,24 @@ typedef struct {
   uint64_t sparse_pos;      ///< Bytes of the real file handed out so far.
   size_t sparse_index;      ///< The first region not wholly behind sparse_pos.
   /** @} */
+
+  /**
+   * @name GNU multi-volume, when the stream is a concatenation of volumes
+   *
+   * Set up on the first read: when the stream is a seekable concatenation of
+   * more than one part, each part after the first is a volume that may begin
+   * with a `V` label and, if a member's data runs over, an `M` header naming
+   * it. garc_tar_read() and garc_tar_skip() stop at each boundary and deal
+   * with those headers there. See tar_volume_boundary().
+   * @{
+   */
+  int volumes_known;        ///< Whether the set-up has run.
+  size_t volume_next_index; ///< The part the next boundary starts, or 0.
+  uint64_t volume_next;     ///< Where it starts, or UINT64_MAX for none.
+  /** Bytes of the current member's data still owed, while reading data. */
+  uint64_t volume_owed;
+  int volume_in_data;       ///< Whether @ref volume_owed applies.
+  /** @} */
 } GARC_Tar_State;
 
 /**

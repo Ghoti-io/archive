@@ -16,8 +16,9 @@
 only test that it is read is one made by the writers people use. In the
 pinned image this asks Info-ZIP's `zip -s` for a split zip (`name.z01`,
 `name.z02`, ..., `name.zip`), the same with `-fz` so the zip64 locator's disk
-fields are in play, and 7-Zip's `-v` for a numbered split (`name.7z.001`,
-...). Each is opened by `volume_probe` through garc_fs_open() - from the
+fields are in play, 7-Zip's `-v` for a numbered split (`name.7z.001`, ...),
+and GNU tar's `-M` for a multi-volume tar, whose later volumes start with a
+continuation header for the file that ran over. Each is opened by `volume_probe` through garc_fs_open() - from the
 `.zip`, from the `.z01`, and from the `.001` - and every file it reads is
 compared with the file that went in: name, size and CRC-32. The source is
 generated here, so the comparison is with the bytes and not with another
@@ -46,6 +47,14 @@ CASES = [
         "../out/split64.zip", "."], "zip", "split64.z"),
     ("split.7z.001", ["7z", "a", "-bso0", "-bsp0", "-mmt=1", "-v50k",
         "../out/split.7z", "."], "sevenzip", "split.7z."),
+    # GNU tar's multi-volume: 64 KiB volumes, more names than it needs (it
+    # writes only as many as it fills), labelled with -V on the second run.
+    ("multi.tar.001", ["tar", "-c", "-M", "-L", "64"]
+        + [a for n in range(1, 9) for a in ("-f", "../out/multi.tar.%03d" % n)]
+        + ["."], "tar", "multi.tar."),
+    ("label.tar.001", ["tar", "-c", "-M", "-L", "64", "-V", "set"]
+        + [a for n in range(1, 9) for a in ("-f", "../out/label.tar.%03d" % n)]
+        + ["."], "tar", "label.tar."),
 ]
 
 
@@ -84,7 +93,7 @@ def main(argv):
     files = source_tree(source)
     want = sorted("%s\t%d\t%08x" % (name, len(data), zlib.crc32(data) & 0xFFFFFFFF)
         for name, data in files.items())
-    print(oracle_env.provenance(["zip", "sevenzip"]), flush=True)
+    print(oracle_env.provenance(["zip", "sevenzip", "tar"]), flush=True)
 
     failures = []
     checked = 0
@@ -107,7 +116,9 @@ def main(argv):
         if read.returncode != 0:
             failures.append("%s: %s" % (start, read.stderr.strip()))
             continue
-        got = sorted(line for line in read.stdout.splitlines() if line.strip())
+        # tar, given `.`, names its members `./name`; the others do not.
+        got = sorted(line[2:] if line.startswith("./") else line
+            for line in read.stdout.splitlines() if line.strip())
         if got != want:
             failures.append("%s: read\n      %s\n    wanted\n      %s"
                 % (start, "\n      ".join(got), "\n      ".join(want)))
@@ -120,8 +131,9 @@ def main(argv):
         for line in failures:
             sys.stderr.write("  %s\n" % line)
         return 1
-    print("check-volumes: %d split sets from zip -s, zip -fz -s and 7z -v, "
-        "each read back to every file's size and CRC-32" % checked)
+    print("check-volumes: %d split sets from zip -s, zip -fz -s, 7z -v and "
+        "GNU tar -M (with and without labels), each read back to every file's "
+        "size and CRC-32" % checked)
     return 0
 
 

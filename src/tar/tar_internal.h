@@ -156,6 +156,32 @@ GARC_Result garc_tar_read(GARC_Archive * archive, uint8_t * destination,
 GARC_Result garc_tar_skip(GARC_Archive * archive, uint64_t count);
 
 /**
+ * Skip @p count bytes, of which the first @p owed are the current member's
+ * data - which is what a GNU multi-volume boundary inside them is checked
+ * against. garc_tar_skip() is this with nothing owed.
+ *
+ * @param archive The archive.
+ * @param count Bytes to skip.
+ * @param owed How many of them are member data.
+ * @return GARC_OK or a failure.
+ */
+GARC_Result garc_tar_skip_owing(
+    GARC_Archive * archive, uint64_t count, uint64_t owed);
+
+/**
+ * garc_tar_read() for a member's data: what a GNU multi-volume boundary inside
+ * it is held to is the member's data still owed, `data_remaining`.
+ *
+ * @param archive The archive.
+ * @param destination Where the bytes go.
+ * @param count How many to read; no more than `data_remaining`.
+ * @param out_got Receives how many arrived.
+ * @return As garc_tar_read().
+ */
+GARC_Result garc_tar_read_data(GARC_Archive * archive, uint8_t * destination,
+    size_t count, size_t * out_got);
+
+/**
  * The logical read position: the stream's own, less the unread peek window.
  *
  * ::garc_stream_tell counts what the stream has served, and identification read

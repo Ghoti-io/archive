@@ -329,6 +329,181 @@ uint64_t garc_tar_offset(const GARC_Archive * archive) {
   return served - pending;
 }
 
+////////////////////////////////////////////////////////////////////////
+// GNU multi-volume
+////////////////////////////////////////////////////////////////////////
+//
+// GNU tar's -M writes an archive across volumes of a fixed size: the first
+// holds headers and data until it is full, with no end marker, and each later
+// one starts - after a `V` label, when there is one - with an `M` header for
+// the member whose data ran over: its name, the offset its data had reached,
+// and how much is left. Read through a concatenation of the volumes (see
+// garc_stream_create_concat(), or garc_fs_open() on `name.001`), the bytes are
+// one tar except for those headers at each part's start, so the reader stops
+// at every boundary and deals with them there, holding the `M` header to the
+// member it continues.
+
+/**
+ * GNU's `offset` field, in the old GNU header's part of the block: how far into
+ * the member's data a continuation (`M`) header starts.
+ */
+#define TAR_OFF_GNU_OFFSET 369u
+#define TAR_LEN_GNU_OFFSET 12u ///< See TAR_OFF_GNU_OFFSET.
+
+/** Up to one block straight from the stream; `*out_got` says how much. */
+static GARC_Result tar_read_whole(
+    GARC_Stream * stream, uint8_t * block, size_t * out_got) {
+  size_t total = 0;
+  while (total < GARC_TAR_BLOCK) {
+    size_t got = 0;
+    GARC_Result result
+        = garc_stream_read(stream, block + total, GARC_TAR_BLOCK - total, &got);
+    if (result != GARC_OK) {
+      return result;
+    }
+    if (!got) {
+      break;
+    }
+    total += got;
+  }
+  *out_got = total;
+  return GARC_OK;
+}
+
+/** Where the next part starts, if the stream is a seekable concatenation. */
+static void tar_volume_set_up(GARC_Archive * archive) {
+  GARC_Tar_State * tar = &archive->tar;
+  tar->volumes_known = 1;
+  tar->volume_next_index = 0;
+  tar->volume_next = UINT64_MAX;
+  if (archive->format != GARC_FORMAT_TAR
+      || garc_stream_part_count(archive->stream) < 2u) {
+    return;
+  }
+  uint64_t start = 0;
+  if (garc_stream_part_offset(archive->stream, 1u, &start) == GARC_OK) {
+    tar->volume_next_index = 1u;
+    tar->volume_next = start;
+  }
+}
+
+/** Advance to the boundary after the one just handled. */
+static void tar_volume_advance(GARC_Archive * archive) {
+  GARC_Tar_State * tar = &archive->tar;
+  uint64_t start = 0;
+  const size_t next = tar->volume_next_index + 1u;
+  if (next < garc_stream_part_count(archive->stream)
+      && garc_stream_part_offset(archive->stream, next, &start) == GARC_OK) {
+    tar->volume_next_index = next;
+    tar->volume_next = start;
+  }
+  else {
+    tar->volume_next_index = 0;
+    tar->volume_next = UINT64_MAX;
+  }
+}
+
+/**
+ * At the start of a volume after the first: the label and the continuation.
+ *
+ * @param archive The archive, its stream exactly at the boundary.
+ * @param owed Bytes of the current member's data still owed here, 0 between
+ *   members.
+ * A boundary that is not on a block, or a part that starts with neither a label
+ * nor a continuation where a member ran over, is not a GNU volume but a file
+ * cut with `split -b`: just the bytes in pieces, read straight through.
+ *
+ * @return GARC_OK with the stream past whatever belonged to the volume rather
+ *   than to the archive; GARC_ERR_CORRUPT for a continuation that does not
+ *   continue the member, one where none was owed, or a labelled volume with no
+ *   continuation for the member that ran over; GARC_ERR_UNSUPPORTED for a
+ *   sparse member across volumes; or the stream's failure.
+ */
+static GARC_Result tar_volume_boundary(GARC_Archive * archive, uint64_t owed) {
+  GARC_Stream * stream = archive->stream;
+  const uint64_t boundary = garc_stream_tell(stream);
+  tar_volume_advance(archive);
+  if ((boundary - archive->start_offset) % GARC_TAR_BLOCK) {
+    // Not on a block: a file cut with `split -b`, which is just the bytes in
+    // pieces. GNU's volumes end on a block, always.
+    return GARC_OK;
+  }
+  uint8_t block[GARC_TAR_BLOCK];
+  size_t got = 0;
+  GARC_Result result = tar_read_whole(stream, block, &got);
+  if (result != GARC_OK) {
+    return result;
+  }
+  uint64_t after_label = boundary;
+  if (got == sizeof(block) && block[GARC_TAR_OFF_TYPEFLAG] == 'V'
+      && garc_tar_block_is_header(block)) {
+    // The volume's label: the volume's, not the archive's.
+    after_label = boundary + GARC_TAR_BLOCK;
+    result = tar_read_whole(stream, block, &got);
+    if (result != GARC_OK) {
+      return result;
+    }
+  }
+  const int continuation = got == sizeof(block)
+      && block[GARC_TAR_OFF_TYPEFLAG] == 'M' && garc_tar_block_is_header(block);
+  if (!owed) {
+    if (continuation) {
+      return GARC_ERR_CORRUPT; // a continuation of nothing
+    }
+    // A member's header, or the end: the archive's own bytes, put back.
+    return garc_stream_seek(stream, after_label);
+  }
+  if (!continuation) {
+    if (after_label != boundary) {
+      // A label, and then no continuation for the file that ran over: a GNU
+      // volume, and the wrong one.
+      return GARC_ERR_CORRUPT;
+    }
+    // Neither a label nor a continuation: not a GNU volume but a file cut in
+    // pieces, whose next byte is the member's next byte.
+    return garc_stream_seek(stream, boundary);
+  }
+  if (archive->tar.sparse) {
+    return GARC_ERR_UNSUPPORTED;
+  }
+  const GARC_Member * member = &archive->member;
+  uint64_t remaining = 0;
+  uint64_t offset = 0;
+  if (garc_tar_parse_uint(block + GARC_TAR_OFF_SIZE, GARC_TAR_LEN_SIZE,
+          &remaining) != GARC_OK
+      || garc_tar_parse_uint(block + TAR_OFF_GNU_OFFSET, TAR_LEN_GNU_OFFSET,
+             &offset) != GARC_OK) {
+    return GARC_ERR_CORRUPT;
+  }
+  // The name as the header can hold it: GNU truncates a long one to the field.
+  size_t name_length = 0;
+  while (name_length < GARC_TAR_LEN_NAME && block[name_length]) {
+    ++name_length;
+  }
+  const size_t compared = member->name_length < GARC_TAR_LEN_NAME
+      ? member->name_length : GARC_TAR_LEN_NAME;
+  if (remaining != owed || offset != member->size - owed
+      || name_length != compared
+      || (compared && memcmp(block, member->name, compared) != 0)) {
+    return GARC_ERR_CORRUPT;
+  }
+  return GARC_OK;
+}
+
+/** How many of @p count bytes may be read before the next boundary. */
+static uint64_t tar_volume_room(GARC_Archive * archive, uint64_t count) {
+  if (!archive->tar.volumes_known) {
+    tar_volume_set_up(archive);
+  }
+  if (archive->tar.volume_next == UINT64_MAX) {
+    return count;
+  }
+  const uint64_t at = garc_stream_tell(archive->stream);
+  const uint64_t room = archive->tar.volume_next > at
+      ? archive->tar.volume_next - at : 0u;
+  return room < count ? room : count;
+}
+
 GARC_Result garc_tar_read(GARC_Archive * archive, uint8_t * destination,
     size_t count, size_t * out_got) {
   size_t total = 0;
@@ -349,9 +524,22 @@ GARC_Result garc_tar_read(GARC_Archive * archive, uint8_t * destination,
   // "the stream ended partway through" (one to count - 1), which are the two
   // answers a caller has to tell apart.
   while (total < count) {
+    size_t want = (size_t)tar_volume_room(archive, count - total);
+    if (!want) {
+      // At a volume boundary: what the volume put there before the archive's
+      // next byte. A member's data being read owes what the caller asked for
+      // and has not had yet, and more beyond.
+      const uint64_t owed = archive->tar.volume_in_data
+          ? archive->tar.volume_owed - (uint64_t)total : 0u;
+      GARC_Result result = tar_volume_boundary(archive, owed);
+      if (result != GARC_OK) {
+        return result;
+      }
+      continue;
+    }
     size_t got = 0;
     GARC_Result result = garc_stream_read(
-        archive->stream, destination + total, count - total, &got);
+        archive->stream, destination + total, want, &got);
     if (result != GARC_OK) {
       return result;
     }
@@ -362,6 +550,15 @@ GARC_Result garc_tar_read(GARC_Archive * archive, uint8_t * destination,
   }
   *out_got = total;
   return GARC_OK;
+}
+
+GARC_Result garc_tar_read_data(GARC_Archive * archive, uint8_t * destination,
+    size_t count, size_t * out_got) {
+  archive->tar.volume_in_data = 1;
+  archive->tar.volume_owed = archive->data_remaining;
+  const GARC_Result result = garc_tar_read(archive, destination, count, out_got);
+  archive->tar.volume_in_data = 0;
+  return result;
 }
 
 GARC_Result garc_tar_skip(GARC_Archive * archive, uint64_t count) {
@@ -375,7 +572,29 @@ GARC_Result garc_tar_skip(GARC_Archive * archive, uint64_t count) {
   // If a format ever wants to skip before reading a block, this is the function
   // that has to learn about the window, and the two call sites in garc_tar_next()
   // and garc_tar_read_long_field() are what establish the rule today.
-  return count ? garc_stream_skip(archive->stream, count) : GARC_OK;
+  return garc_tar_skip_owing(archive, count, 0u);
+}
+
+GARC_Result garc_tar_skip_owing(
+    GARC_Archive * archive, uint64_t count, uint64_t owed) {
+  // In steps that stop at each volume boundary; see tar_volume_boundary().
+  while (count) {
+    const uint64_t step = tar_volume_room(archive, count);
+    if (!step) {
+      GARC_Result result = tar_volume_boundary(archive, owed);
+      if (result != GARC_OK) {
+        return result;
+      }
+      continue;
+    }
+    GARC_Result result = garc_stream_skip(archive->stream, step);
+    if (result != GARC_OK) {
+      return result;
+    }
+    count -= step;
+    owed = owed > step ? owed - step : 0u;
+  }
+  return GARC_OK;
 }
 
 /**
@@ -398,8 +617,11 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
   // together. A caller is never required to read bytes it does not want in
   // order to reach the next header.
   if (archive->data_remaining || archive->data_padding) {
-    GARC_Result skipped = garc_tar_skip(
-        archive, archive->data_remaining + archive->data_padding);
+    // The data first, owed to the member, so that a volume boundary inside it
+    // is held to the member it continues.
+    GARC_Result skipped = garc_tar_skip_owing(
+        archive, archive->data_remaining + archive->data_padding,
+        archive->data_remaining);
     archive->data_remaining = 0;
     archive->data_padding = 0;
     if (skipped != GARC_OK) {
@@ -503,6 +725,12 @@ GARC_Result garc_tar_next(GARC_Archive * archive) {
     // describes. Checked before the header is parsed, because a carrier's own
     // name, mode and times describe nothing.
     const uint8_t typeflag = block[GARC_TAR_OFF_TYPEFLAG];
+    if (typeflag == 'M') {
+      // A GNU multi-volume continuation met as a member: a later volume read
+      // on its own, whose first bytes are the end of a file that started in
+      // a volume this stream does not have. Its data is not a file.
+      return GARC_ERR_UNSUPPORTED;
+    }
     if (typeflag == 'L' || typeflag == 'K') {
       uint64_t declared = 0;
       result = garc_tar_parse_uint(

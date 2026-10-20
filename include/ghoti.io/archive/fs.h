@@ -392,7 +392,12 @@ GARC_API GARC_Result garc_fs_sink_create_with_allocator(const char * path,
  *
  * **A split archive is opened whole.** Given `name.001`, the consecutive parts
  * `name.002`, `name.003`, ... that exist are read after it, whatever the
- * archive inside is - 7-Zip's `-v` and `split -d -a 3` both write this. Given
+ * archive inside is - 7-Zip's `-v` and `split -d -a 3` both write this, and so
+ * does GNU tar's `-M` when its volumes are named that way, whose continuation
+ * headers the tar reader checks at each part's start. (The names do not say
+ * which of the two a tar's parts are, so a part that starts on a block with
+ * what checks as a GNU label or continuation header is taken for a volume, and
+ * any other part is read straight on.) Given
  * `name.zip` or `name.z01` when `name.z01` exists, the split zip `name.z01`
  * ... `name.zNN`, `name.zip` is read, as Info-ZIP's `zip -s` writes it. The
  * parts go through ::garc_stream_create_concat(), and a set missing a part is

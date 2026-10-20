@@ -157,11 +157,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   callbacks.seek = seekable ? &source_seek : nullptr;
   callbacks.size = sized ? &source_size : nullptr;
 
+  // Memory with the seekable bit is two memory parts end to end - a split
+  // set, or GNU multi-volume - cut where the body's first byte says, on a
+  // block when the sized bit is set (where GNU's volumes end) and anywhere
+  // otherwise (where split -b cuts). The bits mean nothing else for memory.
+  const bool two_parts = memory && seekable;
+  GARC_Stream * halves[2] = {nullptr, nullptr};
   GARC_Stream * stream = nullptr;
-  GARC_Result created = memory
-      ? garc_stream_create_memory(body, body_size, &stream)
-      : garc_stream_create_callback(&callbacks, &stream);
+  GARC_Result created = GARC_OK;
+  if (two_parts) {
+    size_t cut = body_size ? (size_t)body[0] * body_size / 256u : 0u;
+    if (sized) {
+      cut -= cut % 512u;
+    }
+    created = garc_stream_create_memory(body, cut, &halves[0]);
+    if (created == GARC_OK) {
+      created = garc_stream_create_memory(body + cut, body_size - cut, &halves[1]);
+    }
+    if (created == GARC_OK) {
+      created = garc_stream_create_concat(halves, 2, &stream);
+    }
+  }
+  else {
+    created = memory ? garc_stream_create_memory(body, body_size, &stream)
+                     : garc_stream_create_callback(&callbacks, &stream);
+  }
   if (created != GARC_OK) {
+    garc_stream_destroy(halves[0]);
+    garc_stream_destroy(halves[1]);
     return 0;
   }
 
@@ -173,6 +196,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     REQUIRE(archive == nullptr, "a failed open handed back an archive");
     allocator.stop_failing();
     garc_stream_destroy(stream);
+    garc_stream_destroy(halves[0]);
+    garc_stream_destroy(halves[1]);
     REQUIRE(allocator.live() == 0u, "a failed open leaked");
     return 0;
   }
@@ -241,6 +266,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   allocator.stop_failing();
   garc_close(archive);
   garc_stream_destroy(stream);
+  garc_stream_destroy(halves[0]);
+  garc_stream_destroy(halves[1]);
   REQUIRE(allocator.live() == 0u, "close left a block behind");
   return 0;
 }
