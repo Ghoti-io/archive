@@ -1303,7 +1303,7 @@ fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 
 ORACLE := tools/oracle
 ORACLE_RUN := python3 $(ORACLE)/oracle_run.py
-ORACLE_IMAGE := localhost/ghoti-archive-oracle-refs:deb13
+ORACLE_IMAGE := localhost/ghoti-archive-oracle-refs:deb13-2
 
 # Every reference, in the order containers/IMAGES lists them. One list rather
 # than one per gate, because they are one image: a gate that named a subset would

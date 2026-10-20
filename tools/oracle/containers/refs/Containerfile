@@ -84,6 +84,7 @@ RUN apt-get update -qq \
       zip=3.0-15+deb13u1 \
       unzip=6.0-29+deb13u1 \
       7zip=25.01+dfsg-1~deb13u2 \
+      sharutils=1:4.15.2-12 \
       libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -92,11 +93,11 @@ RUN apt-get update -qq \
 # which puts a quoting layer between a check and the fact it checks.
 COPY tar-version bsdtar-version pytarfile-version \
       zip-version unzip-version sevenzip-version pyzipfile-version \
-      /usr/local/bin/
+      uudecode-version /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/tar-version /usr/local/bin/bsdtar-version \
       /usr/local/bin/pytarfile-version /usr/local/bin/zip-version \
       /usr/local/bin/unzip-version /usr/local/bin/sevenzip-version \
-      /usr/local/bin/pyzipfile-version
+      /usr/local/bin/pyzipfile-version /usr/local/bin/uudecode-version
 
 # A locale, pinned, because regex lost 1,855 differential rows to an image that
 # had none. tar speaks bytes, which is the whole reason this library refuses to
@@ -114,4 +115,5 @@ ENV TZ=UTC LC_TIME=C.UTF-8
 
 ENTRYPOINT []
 CMD ["sh", "-c", "tar-version; bsdtar-version; pytarfile-version; \
-zip-version; unzip-version; sevenzip-version; pyzipfile-version"]
+zip-version; unzip-version; sevenzip-version; pyzipfile-version; \
+uudecode-version"]

@@ -69,6 +69,7 @@ PROBE = {
     # "(x64) : Copyright ... : 2025-08-03", and the architecture is the host's.
     "sevenzip": (["sevenzip-version"], "7-Zip 25.01"),
     "pyzipfile": (["pyzipfile-version"], "Python 3.13.5 zipfile"),
+    "uudecode": (["uudecode-version"], "uudecode (GNU sharutils) 4.15.2"),
 }
 
 # The program each reference is invoked as, where it differs from the name.

@@ -23,8 +23,9 @@ reading is compared with that and never with another reading.
   - `text.shar`: **run by `sh`** in the container, and the tree it makes is
     compared with the intent - names, types, sizes, bytes, modes, link targets.
     There is no second shar reader: running it is the only meaning a shar has.
-  - `uu.shar`: no `uudecode` in the image, so the body is decoded here with
-    `binascii`, which is an independent implementation of the same encoding.
+  - `uu.shar`: **run by `sh`** with GNU sharutils' `uudecode`, and its body is
+    also decoded here with `binascii`, an independent implementation of the
+    same encoding. Each member's bytes and mode are compared with the intent.
 
 Neither reference is asked what it cannot say: bsdtar's listing has no CRC
 (extraction supplies it) and a time only to the day.
@@ -128,7 +129,7 @@ def main(argv):
         shutil.rmtree(work)
     os.makedirs(work)
 
-    print(oracle_env.provenance(["bsdtar", "sevenzip"]), flush=True)
+    print(oracle_env.provenance(["bsdtar", "sevenzip", "uudecode"]), flush=True)
     written = subprocess.run([probe, "write", work], capture_output=True,
         text=True)
     if written.returncode != 0:
@@ -277,6 +278,37 @@ def main(argv):
                 failures.append("uu.shar: %s: %s is %r, intended %r"
                     % (name, label, have, intended))
 
+    # And the uuencoded script, run: sh, with GNU sharutils' uudecode. The
+    # decoding above is binascii's reading of the same bytes; this is what a
+    # person running the script gets.
+    extract_uu = os.path.join(work, "extract-uu")
+    os.makedirs(extract_uu)
+    ran = reference("uudecode", ["sh", "-c",
+        "cd '%s' && sh ../uu.shar" % extract_uu], work)
+    if ran.returncode != 0:
+        failures.append("running uu.shar exited %d: %s" % (ran.returncode,
+            ran.stderr.decode("utf-8", "replace").strip()))
+    made = set()
+    for here, _directories, files in os.walk(extract_uu):
+        for entry in files:
+            made.add(os.path.relpath(os.path.join(here, entry),
+                extract_uu).encode("utf-8"))
+    if made != set(wanted):
+        failures.append("running uu.shar made %s, intended %s"
+            % (sorted(made), sorted(wanted)))
+    for name, row in wanted.items():
+        full = os.path.join(extract_uu, name.decode("utf-8"))
+        if not os.path.isfile(full):
+            continue
+        data = open(full, "rb").read()
+        mode = "%04o" % stat.S_IMODE(os.lstat(full).st_mode)
+        for label, have, intended in (("size", str(len(data)), row["size"]),
+                ("crc", crc_of(data), row["crc"]), ("mode", mode, row["mode"])):
+            compared += 1
+            if have != intended:
+                failures.append("uu.shar run: %s: %s is %r, intended %r"
+                    % (name, label, have, intended))
+
     if failures:
         sys.stderr.write("### check-arcpio-writer: the references disagree "
             "with the writers ###\n")
@@ -285,7 +317,8 @@ def main(argv):
         return 1
     print("check-arcpio-writer: files.a, newc.cpio and odc.cpio listed and "
         "extracted by libarchive (the cpio pair also tested by 7-Zip), "
-        "text.shar run by sh, uu.shar decoded; %d fields compared against "
+        "text.shar run by sh, uu.shar decoded by binascii and run by sh with "
+        "uudecode; %d fields compared against "
         "the intent" % compared)
     return 0
 

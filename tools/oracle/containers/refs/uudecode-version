@@ -1,0 +1,4 @@
+#!/bin/sh
+# GNU sharutils' uudecode, which decodes the body of a shar written with
+# shar_uuencode. Its first line is "uudecode (GNU sharutils) 4.15.2".
+exec uudecode --version 2>/dev/null | head -1

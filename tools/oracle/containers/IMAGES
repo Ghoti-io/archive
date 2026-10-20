@@ -48,13 +48,13 @@
 # Building it:
 #   make oracle-build
 
-tar	localhost/ghoti-archive-oracle-refs:deb13	tar (GNU tar) 1.35	Writes all four tar formats; the corpus is generated with its --format flag
-bsdtar	localhost/ghoti-archive-oracle-refs:deb13	libarchive 3.7.4	The second reader. A corpus written and read back by GNU tar alone measures GNU tar
-pytarfile	localhost/ghoti-archive-oracle-refs:deb13	Python 3.13.5 tarfile	A third implementation, and the scriptable one: the member metadata every fixture is checked against comes from here
-zip	localhost/ghoti-archive-oracle-refs:deb13	Zip 3.0	Info-ZIP's writer, which is what most zip files in the world were written by; its defaults are the extra fields a reader meets
-unzip	localhost/ghoti-archive-oracle-refs:deb13	UnZip 6.00	Info-ZIP's reader, a separate program with a separate version; `unzip -t` is the accepted answer to whether a zip is valid
-sevenzip	localhost/ghoti-archive-oracle-refs:deb13	7-Zip 25.01	A fourth implementation, and the writer for what the others will not write: WinZip AES, and a different version-made-by
-pyzipfile	localhost/ghoti-archive-oracle-refs:deb13	Python 3.13.5 zipfile	The scriptable reading, as pytarfile is for tar - and the only writer here that will store an arbitrary member name
+tar	localhost/ghoti-archive-oracle-refs:deb13-2	tar (GNU tar) 1.35	Writes all four tar formats; the corpus is generated with its --format flag
+bsdtar	localhost/ghoti-archive-oracle-refs:deb13-2	libarchive 3.7.4	The second reader. A corpus written and read back by GNU tar alone measures GNU tar
+pytarfile	localhost/ghoti-archive-oracle-refs:deb13-2	Python 3.13.5 tarfile	A third implementation, and the scriptable one: the member metadata every fixture is checked against comes from here
+zip	localhost/ghoti-archive-oracle-refs:deb13-2	Zip 3.0	Info-ZIP's writer, which is what most zip files in the world were written by; its defaults are the extra fields a reader meets
+unzip	localhost/ghoti-archive-oracle-refs:deb13-2	UnZip 6.00	Info-ZIP's reader, a separate program with a separate version; `unzip -t` is the accepted answer to whether a zip is valid
+sevenzip	localhost/ghoti-archive-oracle-refs:deb13-2	7-Zip 25.01	A fourth implementation, and the writer for what the others will not write: WinZip AES, and a different version-made-by
+pyzipfile	localhost/ghoti-archive-oracle-refs:deb13-2	Python 3.13.5 zipfile	The scriptable reading, as pytarfile is for tar - and the only writer here that will store an arbitrary member name
 
 # Not here yet:
 #   star      the fourth tar implementation. It reads formats the other three
@@ -64,3 +64,4 @@ pyzipfile	localhost/ghoti-archive-oracle-refs:deb13	Python 3.13.5 zipfile	The sc
 #             name. It would be the reference for a *structural* disagreement
 #             rather than a reading one - which record a value came from, not
 #             what the value was - and nothing has needed that yet either.
+uudecode	localhost/ghoti-archive-oracle-refs:deb13-2	uudecode (GNU sharutils) 4.15.2	What a uuencoded shar is run with: the body of every member check-arcpio-writer's uu.shar extracts
