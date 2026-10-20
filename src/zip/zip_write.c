@@ -648,7 +648,16 @@ GARC_Result garc_zip_write_member(
   if (memchr(member->name, '\0', member->name_length)) {
     return GARC_ERR_INVALID;
   }
-  if (member->name_length > 0xFFFFu) {
+  // **A directory's name ends in `/`, added when the caller left it off.** zip
+  // has no type field every reader honours: Python's zipfile and Info-ZIP's
+  // unzip look at the slash and nothing else, so a directory written as `sub`
+  // was extracted by both as an empty file, and the `sub/x` after it then
+  // failed. That is encoding the member's type, not rewriting its name; tar's
+  // typeflag says the same thing in its own field.
+  const int add_slash = member->type == GARC_MEMBER_DIRECTORY
+      && member->name[member->name_length - 1u] != '/';
+  const size_t name_length = member->name_length + (add_slash ? 1u : 0u);
+  if (name_length > 0xFFFFu) {
     // The name length field is 16 bits, and there is no carrier record in zip to
     // put a longer one in. A refusal rather than a truncation.
     return GARC_ERR_UNSUPPORTED;
@@ -817,8 +826,8 @@ GARC_Result garc_zip_write_member(
   if (member->type == GARC_MEMBER_DIRECTORY) {
     // The DOS attribute bit, which is how a zip written for Windows says
     // "directory" - and what this library's own reader falls back to when
-    // `version made by` does not say Unix. Set from the *type*, which is not
-    // normalising the name: a caller's trailing slash is still theirs.
+    // `version made by` does not say Unix. Set from the *type*, as the slash
+    // added above is.
     zip->external_attributes |= ZIP_DOS_DIRECTORY;
   }
 
@@ -897,15 +906,28 @@ GARC_Result garc_zip_write_member(
   garc_zip_put32(header + 14u, 0u);
   garc_zip_put32(header + 18u, zip->used_zip64 ? ZIP_MARKER32 : 0u);
   garc_zip_put32(header + 22u, zip->used_zip64 ? ZIP_MARKER32 : 0u);
-  garc_zip_put16(header + 26u, (uint16_t)member->name_length);
+  garc_zip_put16(header + 26u, (uint16_t)name_length);
   garc_zip_put16(header + 28u, (uint16_t)local_extra);
 
-  GARC_Result result = garc_sink_write(writer->sink, header, sizeof(header));
+  // The name as both records will carry it, slash included, kept until finish
+  // for the directory entry.
+  GARC_Result result
+      = garc_buffer_grow(writer->allocator, &zip->name, name_length);
+  if (result != GARC_OK) {
+    return result;
+  }
+  memcpy(zip->name.bytes, member->name, member->name_length);
+  if (add_slash) {
+    zip->name.bytes[member->name_length] = '/';
+  }
+  zip->name.length = name_length;
+
+  result = garc_sink_write(writer->sink, header, sizeof(header));
   if (result != GARC_OK) {
     return result;
   }
   zip->crc_offset = zip->local_offset + 14u;
-  result = garc_sink_write(writer->sink, member->name, member->name_length);
+  result = garc_sink_write(writer->sink, zip->name.bytes, name_length);
   if (result != GARC_OK) {
     return result;
   }
@@ -918,16 +940,8 @@ GARC_Result garc_zip_write_member(
     }
   }
 
-  // The name and the central extra are kept until finish, when the directory is
-  // written. Two buffers rather than one concatenation, because the entry's two
-  // length fields describe them separately and a single buffer would have to be
-  // split again to fill them in.
-  result = garc_buffer_grow(writer->allocator, &zip->name, member->name_length);
-  if (result != GARC_OK) {
-    return result;
-  }
-  memcpy(zip->name.bytes, member->name, member->name_length);
-  zip->name.length = member->name_length;
+  // The central extra is kept until finish too, in a buffer of its own: the
+  // entry's two length fields describe the name and the extra separately.
   result = garc_buffer_grow(writer->allocator, &zip->extra, central_extra);
   if (result != GARC_OK) {
     return result;
@@ -1300,6 +1314,253 @@ GARC_Result garc_zip_write_close_member(GARC_Writer * writer) {
     }
   }
   zip->entries++;
+  return GARC_OK;
+}
+
+/** Strong encryption, which nothing here reads and so nothing here copies. */
+#define ZIP_FLAG_STRONG 0x0040u
+
+/**
+ * Copy the extra field without its zip64 field, which the copy rebuilds.
+ *
+ * @param from The source extra field.
+ * @param length Its length.
+ * @param to At least @p length bytes.
+ * @return How many bytes went to @p to.
+ */
+static size_t zip_extra_without_zip64(
+    const uint8_t * from, size_t length, uint8_t * to) {
+  size_t out = 0;
+  size_t at = 0;
+  while (length - at >= 4u) {
+    const uint16_t id = garc_zip_le16(from + at);
+    const size_t field = 4u + (size_t)garc_zip_le16(from + at + 2u);
+    if (field > length - at) {
+      break;
+    }
+    if (id != 0x0001u) {
+      memcpy(to + out, from + at, field);
+      out += field;
+    }
+    at += field;
+  }
+  // A truncated last field: the reader accepted the entry, and the copy keeps
+  // the bytes as they were rather than deciding what they meant.
+  memcpy(to + out, from + at, length - at);
+  return out + (length - at);
+}
+
+GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
+    const char * name, size_t name_length) {
+  GARC_Zip_Write_State * zip = &writer->zip;
+  GARC_Zip_Raw_Entry e;
+  GARC_Result result = garc_zip_raw_entry(source, &e);
+  if (result != GARC_OK) {
+    return result;
+  }
+  if (!name) {
+    name = (const char *)e.name;
+    name_length = e.name_length;
+  }
+  if (!name_length || memchr(name, '\0', name_length)) {
+    return GARC_ERR_INVALID;
+  }
+  if (name_length > 0xFFFFu) {
+    return GARC_ERR_UNSUPPORTED;
+  }
+  // A trailing slash is what makes a zip member a directory, so a rename may
+  // not add one or take one away: the bytes were written as one or the other.
+  const int was_directory
+      = e.name_length && e.name[e.name_length - 1u] == (uint8_t)'/';
+  if (was_directory != (name[name_length - 1u] == '/')) {
+    return GARC_ERR_INVALID;
+  }
+  if (e.flags & ZIP_FLAG_STRONG) {
+    return GARC_ERR_UNSUPPORTED;
+  }
+  if (e.extra_length > 0xFFFFu) {
+    return GARC_ERR_UNSUPPORTED;
+  }
+
+  const uint64_t local_offset = garc_sink_tell(writer->sink);
+  const int size_marker = e.size >= (uint64_t)ZIP_MARKER32;
+  const int compressed_marker = e.compressed_size >= (uint64_t)ZIP_MARKER32;
+  const int offset_marker = local_offset >= (uint64_t)ZIP_MARKER32;
+  const int zip64 = writer->options.zip_force_zip64 || size_marker
+      || compressed_marker || offset_marker;
+  const int descriptor = (e.flags & ZIP_FLAG_DATA_DESCRIPTOR) != 0;
+
+  // The extras, rebuilt: zip64 first where it is needed, then everything else
+  // the source carried - its timestamps, its Unix ids, its WinZip AES field -
+  // in the order the source had them.
+  uint8_t * local_extra = (uint8_t *)gcu_allocator_malloc(
+      writer->allocator, e.extra_length + 20u);
+  uint8_t * central_extra = (uint8_t *)gcu_allocator_malloc(
+      writer->allocator, e.extra_length + 28u);
+  uint8_t * comment = (uint8_t *)gcu_allocator_malloc(
+      writer->allocator, (size_t)e.comment_length + 1u);
+  if (!local_extra || !central_extra || !comment) {
+    gcu_allocator_free(writer->allocator, local_extra);
+    gcu_allocator_free(writer->allocator, central_extra);
+    gcu_allocator_free(writer->allocator, comment);
+    return GARC_ERR_OOM;
+  }
+  size_t local_length = 0;
+  size_t central_length = 0;
+  if (zip64) {
+    // The local field has both sizes whenever it is there; zeros with a
+    // descriptor, which carries them after the data.
+    garc_zip_put16(local_extra, 0x0001u);
+    garc_zip_put16(local_extra + 2u, 16u);
+    garc_zip_put64(local_extra + 4u, descriptor ? 0u : e.size);
+    garc_zip_put64(local_extra + 12u, descriptor ? 0u : e.compressed_size);
+    local_length = 20u;
+    // The central one has a value for each field that holds the marker, in
+    // APPNOTE's order. Forced zip64 marks the sizes, as the writer's own
+    // members do.
+    const int mark_sizes = size_marker || compressed_marker
+        || writer->options.zip_force_zip64;
+    size_t payload = 0;
+    if (mark_sizes) {
+      garc_zip_put64(central_extra + 4u + payload, e.size);
+      payload += 8u;
+      garc_zip_put64(central_extra + 4u + payload, e.compressed_size);
+      payload += 8u;
+    }
+    if (offset_marker) {
+      garc_zip_put64(central_extra + 4u + payload, local_offset);
+      payload += 8u;
+    }
+    if (payload) {
+      garc_zip_put16(central_extra, 0x0001u);
+      garc_zip_put16(central_extra + 2u, (uint16_t)payload);
+      central_length = 4u + payload;
+    }
+  }
+  local_length
+      += zip_extra_without_zip64(e.extra, e.extra_length, local_extra + local_length);
+  central_length += zip_extra_without_zip64(
+      e.extra, e.extra_length, central_extra + central_length);
+  if (local_length > 0xFFFFu || central_length > 0xFFFFu) {
+    result = GARC_ERR_UNSUPPORTED;
+  }
+  // The first read of the source. Everything above refuses without moving the
+  // reader, so a refused copy leaves the member there to be copied another way.
+  if (result == GARC_OK) {
+    result = garc_zip_raw_comment(source, comment, e.comment_length);
+  }
+  const int mark_central_sizes = size_marker || compressed_marker
+      || (zip64 && writer->options.zip_force_zip64);
+  uint16_t version = e.version_needed;
+  if (zip64 && version < ZIP_VERSION_NEEDED_ZIP64) {
+    version = ZIP_VERSION_NEEDED_ZIP64;
+  }
+
+  if (result == GARC_OK) {
+    uint8_t header[GARC_ZIP_LOCAL_HEADER_SIZE];
+    memcpy(header, ZIP_SIG_LOCAL, 4);
+    garc_zip_put16(header + 4u, version);
+    garc_zip_put16(header + 6u, e.flags);
+    garc_zip_put16(header + 8u, e.method);
+    garc_zip_put16(header + 10u, e.dos_time);
+    garc_zip_put16(header + 12u, e.dos_date);
+    garc_zip_put32(header + 14u, descriptor ? 0u : e.crc32);
+    garc_zip_put32(header + 18u, descriptor ? 0u
+        : (zip64 ? ZIP_MARKER32 : (uint32_t)e.compressed_size));
+    garc_zip_put32(header + 22u, descriptor ? 0u
+        : (zip64 ? ZIP_MARKER32 : (uint32_t)e.size));
+    garc_zip_put16(header + 26u, (uint16_t)name_length);
+    garc_zip_put16(header + 28u, (uint16_t)local_length);
+    result = garc_sink_write(writer->sink, header, sizeof(header));
+  }
+  if (result == GARC_OK) {
+    result = garc_sink_write(writer->sink, name, name_length);
+  }
+  if (result == GARC_OK && local_length) {
+    result = garc_sink_write(writer->sink, local_extra, local_length);
+  }
+  // The data, byte for byte: compressed, and encrypted where it was.
+  uint8_t chunk[16384];
+  uint64_t copied = 0;
+  while (result == GARC_OK && copied < e.compressed_size) {
+    const uint64_t left = e.compressed_size - copied;
+    const size_t want = left < sizeof(chunk) ? (size_t)left : sizeof(chunk);
+    result = garc_zip_raw_read(source, copied, chunk, want);
+    if (result == GARC_OK) {
+      result = garc_sink_write(writer->sink, chunk, want);
+    }
+    copied += want;
+  }
+  if (result == GARC_OK && descriptor) {
+    // Kept where the source had one. ZipCrypto with a descriptor checks the
+    // password against the DOS time rather than the CRC, so dropping the
+    // descriptor would make a right password look wrong.
+    uint8_t trailer[ZIP_DESCRIPTOR_SIZE_64];
+    memcpy(trailer, ZIP_SIG_DESCRIPTOR, 4);
+    garc_zip_put32(trailer + 4u, e.crc32);
+    size_t length = ZIP_DESCRIPTOR_SIZE_32;
+    if (zip64) {
+      garc_zip_put64(trailer + 8u, e.compressed_size);
+      garc_zip_put64(trailer + 16u, e.size);
+      length = ZIP_DESCRIPTOR_SIZE_64;
+    }
+    else {
+      garc_zip_put32(trailer + 8u, (uint32_t)e.compressed_size);
+      garc_zip_put32(trailer + 12u, (uint32_t)e.size);
+    }
+    result = garc_sink_write(writer->sink, trailer, length);
+  }
+
+  if (result == GARC_OK) {
+    uint8_t entry[GARC_ZIP_CENTRAL_ENTRY_SIZE];
+    memcpy(entry, ZIP_SIG_CENTRAL, 4);
+    garc_zip_put16(entry + 4u, e.version_made_by);
+    garc_zip_put16(entry + 6u, version);
+    garc_zip_put16(entry + 8u, e.flags);
+    garc_zip_put16(entry + 10u, e.method);
+    garc_zip_put16(entry + 12u, e.dos_time);
+    garc_zip_put16(entry + 14u, e.dos_date);
+    garc_zip_put32(entry + 16u, e.crc32);
+    garc_zip_put32(entry + 20u,
+        mark_central_sizes ? ZIP_MARKER32 : (uint32_t)e.compressed_size);
+    garc_zip_put32(entry + 24u,
+        mark_central_sizes ? ZIP_MARKER32 : (uint32_t)e.size);
+    garc_zip_put16(entry + 28u, (uint16_t)name_length);
+    garc_zip_put16(entry + 30u, (uint16_t)central_length);
+    garc_zip_put16(entry + 32u, e.comment_length);
+    garc_zip_put16(entry + 34u, 0u);
+    garc_zip_put16(entry + 36u, e.internal_attributes);
+    garc_zip_put32(entry + 38u, e.external_attributes);
+    garc_zip_put32(entry + 42u,
+        offset_marker ? ZIP_MARKER32 : (uint32_t)local_offset);
+    result = zip_central_append(writer, entry, sizeof(entry));
+    if (result == GARC_OK) {
+      result = zip_central_append(writer, name, name_length);
+    }
+    if (result == GARC_OK && central_length) {
+      result = zip_central_append(writer, central_extra, central_length);
+    }
+    if (result == GARC_OK && e.comment_length) {
+      result = zip_central_append(writer, comment, e.comment_length);
+    }
+  }
+  gcu_allocator_free(writer->allocator, local_extra);
+  gcu_allocator_free(writer->allocator, central_extra);
+  gcu_allocator_free(writer->allocator, comment);
+  if (result != GARC_OK) {
+    return result;
+  }
+  zip->entries++;
+  // What the zip64 end record says it needs is the most any member asked for.
+  if (e.method == GARC_ZIP_METHOD_AES) {
+    zip->wrote_aes = 1;
+  }
+  else if (e.version_needed >= ZIP_VERSION_NEEDED_CODEC) {
+    zip->needs_63 = 1;
+  }
+  else if (e.version_needed >= ZIP_VERSION_NEEDED_BZIP2) {
+    zip->needs_46 = 1;
+  }
   return GARC_OK;
 }
 

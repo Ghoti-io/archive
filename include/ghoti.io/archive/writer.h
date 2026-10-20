@@ -82,7 +82,10 @@
  *
  * **Nothing is normalised.** A directory's trailing slash is the caller's to
  * include or leave out, and the typeflag is what says it is a directory either
- * way. This is the writing half of the reader's rule that a member reports what
+ * way. The one exception is zip, where the slash *is* the type field: Python's
+ * zipfile and Info-ZIP's unzip look at nothing else, and extract a directory
+ * named without one as an empty file. So a zip directory's name gets a `/` when
+ * it has none. This is the writing half of the reader's rule that a member reports what
  * the container said: a writer that appended a slash, stripped a leading `./`,
  * or rewrote a name that ::garc_name_check() has findings about would be
  * deciding something the caller is better placed to decide - and phase F's
@@ -457,6 +460,52 @@ GARC_API GARC_Result garc_writer_write(
  *   ::GARC_ERR_IO; once the writer has failed, the status that failed it.
  */
 GARC_API GARC_Result garc_writer_finish(GARC_Writer * writer);
+
+/**
+ * @brief For ::garc_writer_copy_member(): copy a zip member as it is stored.
+ *
+ * Its compressed - and encrypted - bytes, CRC, method, times, attributes,
+ * comment and extra fields, with nothing decompressed, recompressed,
+ * decrypted or re-encrypted, so no password is needed and a method this
+ * library cannot write (implode, PPMd) is carried unchanged. Only zip into zip.
+ */
+#define GARC_COPY_RAW ((uint32_t)1u << 0)
+
+/**
+ * @brief Copy the archive's current member into the writer.
+ *
+ * The member is the one ::garc_next() last returned, and none of its data may
+ * have been read yet: a reader cannot go back for it, so a member already read
+ * from is ::GARC_ERR_INVALID rather than a short copy. After the call the
+ * member's data has been consumed, and the walk goes on with ::garc_next().
+ *
+ * **Between any two formats**, by default: the metadata and the data are
+ * carried across and the writer writes them by its own rules, refusals
+ * included - a fifo into zip is ::GARC_ERR_UNSUPPORTED as it is from
+ * ::garc_writer_add(). A sparse tar member is written as its real content. A
+ * zip symlink whose target is compressed is read and written as a target. A
+ * member that cannot be read - encrypted with no password set, or in a method
+ * with no codec - is refused **before anything is written**, so the writer is
+ * left as it was and the member can be skipped. A read that fails after the
+ * member's header is out fails the writer, as ::garc_writer_add() describes.
+ *
+ * With ::GARC_COPY_RAW, zip into zip, the stored bytes are copied unchanged:
+ * see the flag.
+ *
+ * @param writer The writer.
+ * @param archive The archive, positioned on the member to copy.
+ * @param as NULL to copy the member as it is, or the metadata to write in its
+ *   place - a rename, a new time. Its type and size must be the source's; with
+ *   ::GARC_COPY_RAW only its name is used.
+ * @param flags Zero or ::GARC_COPY_RAW. Any other bit is ::GARC_ERR_INVALID.
+ * @return ::GARC_OK; ::GARC_ERR_INVALID for a member already read from, an
+ *   @p as that changes the type or size, or a raw rename that adds or removes a
+ *   directory's trailing slash; ::GARC_ERR_UNSUPPORTED for ::GARC_COPY_RAW
+ *   between other formats; otherwise whatever ::garc_read_member(),
+ *   ::garc_writer_add() or ::garc_writer_write() returned.
+ */
+GARC_API GARC_Result garc_writer_copy_member(GARC_Writer * writer,
+    GARC_Archive * archive, const GARC_Member * as, uint32_t flags);
 
 /**
  * @brief How many members have been added.

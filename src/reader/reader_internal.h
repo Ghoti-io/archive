@@ -371,6 +371,17 @@ typedef struct {
   size_t extra_length;           ///< Length of the entry's extra field.
   int used_zip64;                ///< Whether a 0x0001 field supplied a value.
   GARC_Zip_Encryption encryption; ///< Which scheme, where there is one.
+  /**
+   * @name Kept for a raw copy, which writes the entry back as it was
+   * @{
+   */
+  uint16_t version_needed;       ///< The entry's version needed to extract.
+  uint16_t dos_time;             ///< The entry's MS-DOS time, as stored.
+  uint16_t dos_date;             ///< The entry's MS-DOS date, as stored.
+  uint16_t internal_attributes;  ///< The entry's internal attributes.
+  uint64_t comment_offset;       ///< Absolute offset of the member's comment.
+  uint16_t comment_length;       ///< Its length; read only when a copy asks.
+  /** @} */
   /** @} */
 } GARC_Zip_State;
 
@@ -434,6 +445,15 @@ struct GARC_Archive {
   GARC_Member member;
   /** Non-zero when @ref member is meaningful. */
   int have_member;
+  /**
+   * Non-zero once ::garc_read_member() has been asked for the current member's
+   * bytes, whatever it answered.
+   *
+   * ::garc_writer_copy_member() copies a member from its start, and a reader
+   * cannot go back to it, so a member already read from is refused there rather
+   * than copied short.
+   */
+  int member_touched;
   /** Non-zero once the end of the archive has been reached. */
   int at_end;
 

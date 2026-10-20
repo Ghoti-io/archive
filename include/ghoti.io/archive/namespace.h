@@ -140,6 +140,7 @@
 #define garc_stream_tell GHOTIIO_ARCHIVE(garc_stream_tell)
 #define garc_version_number GHOTIIO_ARCHIVE(garc_version_number)
 #define garc_writer_add GHOTIIO_ARCHIVE(garc_writer_add)
+#define garc_writer_copy_member GHOTIIO_ARCHIVE(garc_writer_copy_member)
 #define garc_writer_create GHOTIIO_ARCHIVE(garc_writer_create)
 #define garc_writer_create_with_allocator                                      \
   GHOTIIO_ARCHIVE(garc_writer_create_with_allocator)

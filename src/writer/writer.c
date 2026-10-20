@@ -38,6 +38,7 @@
 #include <string.h>
 
 #include "ar/ar_internal.h"
+#include "reader/reader_internal.h"
 #include "cpio/cpio_internal.h"
 #include "sevenz/sevenz_internal.h"
 #include "shar/shar_internal.h"
@@ -456,6 +457,154 @@ GARC_Result garc_writer_finish(GARC_Writer * writer) {
   }
   writer->finished = 1;
   return GARC_OK;
+}
+
+/** Every flag ::garc_writer_copy_member() accepts. */
+#define GARC_COPY_KNOWN (GARC_COPY_RAW)
+
+/** How much of a member is moved per read. */
+#define GARC_COPY_CHUNK 16384u
+
+/**
+ * A symlink's target from its data, for a source that keeps the target there.
+ *
+ * zip and cpio store a symlink's target as the member's data, and a zip
+ * reader lends it as the link target only when it is stored in the clear. In
+ * every other case the target is read here, so that every writer is handed a
+ * link with a target and no data, which is what each of them takes.
+ */
+static GARC_Result copy_read_target(GARC_Archive * archive,
+    const GARC_Allocator * allocator, char ** out, size_t * out_length) {
+  const uint64_t size = archive->member.size;
+  const uint64_t cap = archive->limits.max_name_bytes;
+  if (cap && size > cap) {
+    return GARC_ERR_LIMIT_NAME_BYTES;
+  }
+  if (size > (uint64_t)SIZE_MAX - 1u) {
+    return GARC_ERR_OOM;
+  }
+  char * target = (char *)gcu_allocator_malloc(allocator, (size_t)size + 1u);
+  if (!target) {
+    return GARC_ERR_OOM;
+  }
+  size_t have = 0;
+  for (;;) {
+    size_t got = 0;
+    GARC_Result result = garc_read_member(
+        archive, target + have, (size_t)size - have + (have == size), &got);
+    if (result != GARC_OK) {
+      gcu_allocator_free(allocator, target);
+      return result;
+    }
+    if (!got) {
+      break;
+    }
+    have += got;
+    if (have > (size_t)size) {
+      gcu_allocator_free(allocator, target);
+      return GARC_ERR_CORRUPT;
+    }
+  }
+  *out = target;
+  *out_length = have;
+  return GARC_OK;
+}
+
+GARC_Result garc_writer_copy_member(GARC_Writer * writer,
+    GARC_Archive * archive, const GARC_Member * as, uint32_t flags) {
+  if (!writer || !archive || (flags & ~GARC_COPY_KNOWN)) {
+    return GARC_ERR_INVALID;
+  }
+  if (writer->failed) {
+    return writer->failed;
+  }
+  if (writer->finished || !archive->have_member || archive->member_touched) {
+    return GARC_ERR_INVALID;
+  }
+  const GARC_Member * source = &archive->member;
+  if (as && (as->type != source->type || as->size != source->size)) {
+    return GARC_ERR_INVALID;
+  }
+
+  if (flags & GARC_COPY_RAW) {
+    if (writer->format != GARC_FORMAT_ZIP || archive->format != GARC_FORMAT_ZIP) {
+      return GARC_ERR_UNSUPPORTED;
+    }
+    GARC_Result result = writer_close_member(writer);
+    if (result != GARC_OK) {
+      return result;
+    }
+    const uint64_t before = garc_sink_tell(writer->sink);
+    result = garc_zip_write_raw(writer, archive, as ? as->name : NULL,
+        as ? as->name_length : 0u);
+    // A raw copy reads the source by offset, which moves the stream a stored
+    // member is read from - so once it has read anything the member is spent.
+    // Its refusals (a name, strong encryption, a field too long, memory) come
+    // before the first read and leave the member as it was.
+    if (result == GARC_OK || garc_sink_tell(writer->sink) != before
+        || (result != GARC_ERR_INVALID && result != GARC_ERR_UNSUPPORTED
+            && result != GARC_ERR_OOM)) {
+      archive->member_touched = 1;
+    }
+    if (result != GARC_OK) {
+      return writer_fail(writer, result, before, 1);
+    }
+    writer->member_count++;
+    return GARC_OK;
+  }
+
+  GARC_Member member = as ? *as : *source;
+  char * target = NULL;
+  uint8_t * chunk = NULL;
+  GARC_Result result = GARC_OK;
+  if (member.type == GARC_MEMBER_SYMLINK) {
+    // A link is written as a target and no data, by every writer.
+    if (!member.link_target) {
+      size_t length = 0;
+      result = copy_read_target(archive, writer->allocator, &target, &length);
+      if (result != GARC_OK) {
+        return result;
+      }
+      member.link_target = target;
+      member.link_target_length = length;
+    }
+    member.size = 0;
+    result = garc_writer_add(writer, &member);
+    gcu_allocator_free(writer->allocator, target);
+    return result;
+  }
+  if (member.type != GARC_MEMBER_FILE) {
+    // Directories, hard links, devices and fifos carry no data to move.
+    member.size = 0;
+    return garc_writer_add(writer, &member);
+  }
+
+  chunk = (uint8_t *)gcu_allocator_malloc(writer->allocator, GARC_COPY_CHUNK);
+  if (!chunk) {
+    return GARC_ERR_OOM;
+  }
+  // The first bytes before the header. A member that cannot be read at all -
+  // encrypted with no password, a method with no codec - is refused here, with
+  // nothing written, so the caller can skip it and go on.
+  size_t got = 0;
+  result = garc_read_member(archive, chunk, GARC_COPY_CHUNK, &got);
+  if (result == GARC_OK) {
+    result = garc_writer_add(writer, &member);
+  }
+  while (result == GARC_OK && got) {
+    result = garc_writer_write(writer, chunk, got);
+    if (result != GARC_OK) {
+      break;
+    }
+    result = garc_read_member(archive, chunk, GARC_COPY_CHUNK, &got);
+    if (result != GARC_OK && writer->have_member) {
+      // The header is out and part of the data with it. The member cannot be
+      // finished honestly, so the writer fails with the reader's status.
+      writer->failed = result;
+    }
+  }
+  gcu_allocator_free(writer->allocator, chunk);
+  return result;
 }
 
 uint64_t garc_writer_member_count(const GARC_Writer * writer) {

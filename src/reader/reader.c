@@ -334,6 +334,7 @@ GARC_Result garc_reader_account(GARC_Archive * archive) {
   archive->member_count++;
   archive->total_declared_bytes += member->size;
   archive->have_member = 1;
+  archive->member_touched = 0;
   return GARC_OK;
 }
 
@@ -533,6 +534,9 @@ GARC_Result garc_find(GARC_Archive * archive, const void * name,
   return result;
 }
 
+static GARC_Result reader_read_member(GARC_Archive * archive, void * buffer,
+    size_t capacity, size_t * out_read);
+
 GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,
     size_t capacity, size_t * out_read) {
   if (!archive || !out_read || (!buffer && capacity)) {
@@ -541,6 +545,13 @@ GARC_Result garc_read_member(GARC_Archive * archive, void * buffer,
   if (!archive->have_member) {
     return GARC_ERR_INVALID;
   }
+  archive->member_touched = 1;
+  return reader_read_member(archive, buffer, capacity, out_read);
+}
+
+/** garc_read_member() past its argument checks. */
+static GARC_Result reader_read_member(GARC_Archive * archive, void * buffer,
+    size_t capacity, size_t * out_read) {
   if (archive->format == GARC_FORMAT_ZIP && archive->data_refusal == GARC_OK) {
     // The zip reader's own read, because a zip member's bytes may have to be
     // decompressed and are checksummed either way. Dispatched here rather than

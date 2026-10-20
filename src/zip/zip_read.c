@@ -1247,6 +1247,7 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   }
 
   zip->version_made_by = garc_zip_le16(entry + 4u);
+  zip->version_needed = garc_zip_le16(entry + 6u);
   zip->flags = garc_zip_le16(entry + 8u);
   zip->method = garc_zip_le16(entry + 10u);
   const uint16_t dos_time = garc_zip_le16(entry + 12u);
@@ -1258,8 +1259,14 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   const uint16_t extra_length = garc_zip_le16(entry + 30u);
   const uint16_t comment_length = garc_zip_le16(entry + 32u);
   const uint16_t disk_start = garc_zip_le16(entry + 34u);
+  zip->internal_attributes = garc_zip_le16(entry + 36u);
   zip->external_attributes = garc_zip_le32(entry + 38u);
   uint64_t local_offset = garc_zip_le32(entry + 42u);
+  zip->dos_time = dos_time;
+  zip->dos_date = dos_date;
+  zip->comment_length = comment_length;
+  zip->comment_offset = zip->cursor + GARC_ZIP_CENTRAL_ENTRY_SIZE + name_length
+      + extra_length;
 
   if (disk_start != 0u && disk_start != ZIP_MARKER16) {
     // A member on another disk, in an archive whose end record said one disk.
@@ -1868,4 +1875,47 @@ const char * garc_zip_archive_comment(
   }
   *out_length = zip->comment.length;
   return zip->comment.bytes;
+}
+
+GARC_Result garc_zip_raw_entry(
+    const GARC_Archive * archive, GARC_Zip_Raw_Entry * out) {
+  const GARC_Zip_State * zip = &archive->zip;
+  memset(out, 0, sizeof(*out));
+  out->version_made_by = zip->version_made_by;
+  out->version_needed = zip->version_needed;
+  out->flags = zip->flags;
+  out->method = zip->method;
+  out->dos_time = zip->dos_time;
+  out->dos_date = zip->dos_date;
+  out->crc32 = zip->crc32;
+  out->compressed_size = zip->compressed_size;
+  out->size = archive->member.size;
+  out->internal_attributes = zip->internal_attributes;
+  out->external_attributes = zip->external_attributes;
+  out->extra = (const uint8_t *)zip->extra.bytes;
+  out->extra_length = zip->extra.length;
+  out->name = (const uint8_t *)zip->name.bytes;
+  out->name_length = zip->name.length;
+  out->comment_length = zip->comment_length;
+  return GARC_OK;
+}
+
+GARC_Result garc_zip_raw_comment(
+    GARC_Archive * archive, uint8_t * buffer, size_t length) {
+  if (length != archive->zip.comment_length) {
+    return GARC_ERR_INTERNAL;
+  }
+  return length ? zip_read_at(archive, archive->zip.comment_offset, buffer,
+                      length)
+                : GARC_OK;
+}
+
+GARC_Result garc_zip_raw_read(
+    GARC_Archive * archive, uint64_t at, void * buffer, size_t length) {
+  if (at > archive->zip.compressed_size
+      || (uint64_t)length > archive->zip.compressed_size - at) {
+    return GARC_ERR_INTERNAL;
+  }
+  return zip_read_at(archive, archive->member.data_offset + at,
+      (uint8_t *)buffer, length);
 }

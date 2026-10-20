@@ -36,6 +36,7 @@
 #include <ghoti.io/archive/macros.h>
 
 #include <ghoti.io/archive/zip.h>
+#include <ghoti.io/archive/writer.h>
 #include <ghoti.io/security/aes_ctr.h>
 #include <ghoti.io/security/hmac.h>
 #include <stdint.h>
@@ -542,6 +543,88 @@ GARC_Result garc_zip_skip(GARC_Archive * archive);
  *   last declared entry, or a failure.
  */
 GARC_Result garc_zip_next(GARC_Archive * archive);
+
+/**
+ * A central directory entry as it was written, for copying a member unchanged.
+ *
+ * Everything a raw copy writes back that is not derived from where the copy
+ * lands: the method and flags, the CRC and both sizes, the times and
+ * attributes, and the extra field - from which the writer drops the zip64 field
+ * and rebuilds it for the member's new offset.
+ */
+typedef struct GARC_Zip_Raw_Entry {
+  uint16_t version_made_by;      ///< As stored.
+  uint16_t version_needed;       ///< As stored; raised to 45 if zip64 is added.
+  uint16_t flags;                ///< General purpose flags, encryption included.
+  uint16_t method;               ///< 99 for WinZip AES, the real one in 0x9901.
+  uint16_t dos_time;             ///< MS-DOS time.
+  uint16_t dos_date;             ///< MS-DOS date.
+  uint32_t crc32;                ///< The declared CRC-32.
+  uint64_t compressed_size;      ///< Bytes of data, encryption headers included.
+  uint64_t size;                 ///< Uncompressed size.
+  uint16_t internal_attributes;  ///< As stored.
+  uint32_t external_attributes;  ///< As stored.
+  const uint8_t * extra;         ///< The central entry's extra field.
+  size_t extra_length;           ///< Its length.
+  const uint8_t * name;          ///< The name, as stored.
+  size_t name_length;            ///< Its length.
+  uint16_t comment_length;       ///< The member comment's length.
+} GARC_Zip_Raw_Entry;
+
+/**
+ * Describe the current zip member for a raw copy.
+ *
+ * @param archive A zip archive with a current member.
+ * @param out Receives the entry. Its pointers are into the archive's state and
+ *   last until the next ::garc_next().
+ * @return ::GARC_OK.
+ */
+GARC_Result garc_zip_raw_entry(
+    const GARC_Archive * archive, GARC_Zip_Raw_Entry * out);
+
+/**
+ * Read the current member's comment, which the walk does not.
+ *
+ * @param archive A zip archive with a current member.
+ * @param buffer At least ::GARC_Zip_Raw_Entry.comment_length bytes.
+ * @param length That length.
+ * @return ::GARC_OK, or a stream failure.
+ */
+GARC_Result garc_zip_raw_comment(
+    GARC_Archive * archive, uint8_t * buffer, size_t length);
+
+/**
+ * Read the current member's stored bytes, compressed and encrypted as they are.
+ *
+ * @param archive A zip archive with a current member.
+ * @param at Offset into the member's data.
+ * @param buffer Destination.
+ * @param length How many; inside the compressed size with @p at.
+ * @return ::GARC_OK, ::GARC_ERR_CORRUPT for a short archive, or a stream failure.
+ */
+GARC_Result garc_zip_raw_read(
+    GARC_Archive * archive, uint64_t at, void * buffer, size_t length);
+
+/**
+ * Write @p source's current member into a zip writer as it was stored.
+ *
+ * The compressed and encrypted bytes, the CRC, both sizes, the method, the
+ * flags, the times, the attributes, the comment and every extra field but
+ * zip64, which is rebuilt for where the member lands now. A data descriptor
+ * stays when the source had one. Nothing is opened in the writer: the member
+ * is complete when this returns.
+ *
+ * @param writer A zip writer with no member open.
+ * @param source A zip archive with a current member.
+ * @param name The name to give it, or NULL for its own.
+ * @param name_length Its length.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID for a rename that adds or removes the
+ *   trailing slash that makes a directory, ::GARC_ERR_UNSUPPORTED for strong
+ *   encryption or a field that will not fit, ::GARC_ERR_OOM, or a stream or sink
+ *   failure.
+ */
+GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
+    const char * name, size_t name_length);
 
 /**
  * The most bytes deflate can turn @p size bytes into.
