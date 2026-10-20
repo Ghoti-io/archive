@@ -1650,6 +1650,23 @@ TEST(WriterFailure, ASinkThatRefusesOnceNeverYieldsAWrongArchive) {
   }
 }
 
+TEST(WriterFailure, AnEmptyArWhoseMagicWasRefusedWritesItOnTheRetry) {
+  // The end of an empty ar is its magic alone. It was marked written before
+  // the write, so a refused write and a retry finished an archive of no bytes.
+  // The fuzz harness for every writer found it on its third execution.
+  BufferDrain drain;
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_callback(drain.callbacks(), &sink), GARC_OK);
+  GARC_Writer * writer = nullptr;
+  ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_AR, nullptr, &writer), GARC_OK);
+  drain.fail_writes(1);
+  EXPECT_EQ(garc_writer_finish(writer), GARC_ERR_IO);
+  ASSERT_EQ(garc_writer_finish(writer), GARC_OK);
+  EXPECT_EQ(std::string(drain.bytes().begin(), drain.bytes().end()), "!<arch>\n");
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+}
+
 TEST(WriterFailure, ARefusalThatWroteNothingLeavesTheWriterUsable) {
   for (const GARC_Format format : kEveryWriteFormat) {
     SCOPED_TRACE(garc_format_string(format));

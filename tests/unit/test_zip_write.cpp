@@ -885,6 +885,22 @@ TEST(ZipWrite, TheRefusalsAreRefusedAndTheArchiveStaysWritable) {
     cases.push_back({"a symlink with a declared size", spec, GARC_ERR_INVALID});
   }
   {
+    // A trailing slash is how zip says "directory", so a file named that way
+    // would read back as one.
+    Spec spec;
+    spec.name = "looks/like/a/dir/";
+    spec.data = "but is a file\n";
+    cases.push_back({"a file whose name ends in a slash", spec, GARC_ERR_INVALID});
+  }
+  {
+    Spec spec;
+    spec.name = "link/";
+    spec.type = GARC_MEMBER_SYMLINK;
+    spec.link = "hello.txt";
+    cases.push_back({"a symlink whose name ends in a slash", spec,
+        GARC_ERR_INVALID});
+  }
+  {
     Spec spec;
     spec.name = "fifo";
     spec.type = GARC_MEMBER_FIFO;
@@ -930,6 +946,42 @@ TEST(ZipWrite, TheRefusalsAreRefusedAndTheArchiveStaysWritable) {
     ASSERT_EQ(trip.open_result(), GARC_OK);
     ASSERT_EQ(trip.members().size(), 1u);
     EXPECT_EQ(trip.members()[0].name, "after.txt");
+  }
+}
+
+TEST(ZipWrite, ADirectoryEndingLikeALocatorGetsARealOne) {
+  // The 20 bytes before the end record are where a zip64 locator goes, and with
+  // no zip64 record they are the last directory entry's. A name ending
+  // "PK\6\7" and sixteen bytes more put the signature exactly there, and this
+  // library's reader and Python's zipfile each took it for a locator. Writing
+  // the zip64 records leaves a real locator there instead.
+  const std::string name
+      = std::string("tail") + std::string("PK\x06\x07", 4) + std::string(16, '\xff');
+  for (GARC_Member_Type type : {GARC_MEMBER_FILE, GARC_MEMBER_SYMLINK}) {
+    SCOPED_TRACE(static_cast<int>(type));
+    Built built;
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    Spec spec;
+    spec.name = name;
+    spec.type = type;
+    if (type == GARC_MEMBER_SYMLINK) {
+      spec.link = "target";
+    }
+    else {
+      spec.data = "data\n";
+    }
+    ASSERT_EQ(built.add(spec), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+    const std::vector<uint8_t> bytes = built.bytes();
+    const std::string text(bytes.begin(), bytes.end());
+    // The zip64 end record, then the locator, then the end record.
+    ASSERT_GE(text.size(), 98u);
+    EXPECT_EQ(text.compare(text.size() - 22 - 20 - 56, 4, std::string("PK\x06\x06", 4)), 0);
+    EXPECT_EQ(text.compare(text.size() - 22 - 20, 4, std::string("PK\x06\x07", 4)), 0);
+    Roundtrip trip(bytes);
+    ASSERT_EQ(trip.open_result(), GARC_OK);
+    ASSERT_EQ(trip.members().size(), 1u);
+    EXPECT_EQ(trip.members()[0].name, name);
   }
 }
 

@@ -235,6 +235,17 @@ public:
     return *this;
   }
 
+  /**
+   * With zip64(), write the real 32-bit values in the end record, not markers.
+   *
+   * What this library's writer does when it writes zip64 records for an
+   * archive whose values all fit: a marker over a value that fits is a lie.
+   */
+  ZipBuilder & zip64_plain_counts() {
+    zip64_plain_counts_ = true;
+    return *this;
+  }
+
   /** Write the 32-bit markers in the end record with **no** zip64 record. */
   ZipBuilder & zip64_markers_only() {
     zip64_markers_only_ = true;
@@ -377,7 +388,7 @@ public:
         : (declared_ >= 0 ? declared_ : static_cast<int>(members_.size()))));
     append16(eocd, static_cast<uint16_t>(declared_ >= 0
         ? declared_ : static_cast<int>(members_.size())));
-    if (zip64_ || zip64_markers_only_) {
+    if ((zip64_ && !zip64_plain_counts_) || zip64_markers_only_) {
       // The markers that say "the real values are in the zip64 record". A writer
       // producing zip64 records writes these whatever the values would have been,
       // which is why a reader has to look for the locator rather than waiting for
@@ -447,6 +458,7 @@ private:
   uint16_t disk_ = 0;
   uint16_t central_disk_ = 0;
   bool zip64_ = false;
+  bool zip64_plain_counts_ = false;
   bool zip64_markers_only_ = false;
   bool zip64_break_record_ = false;
   uint32_t zip64_locator_disk_ = 0;

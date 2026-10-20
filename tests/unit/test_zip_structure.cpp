@@ -1053,6 +1053,51 @@ TEST(ZipStructure, MarkersWithNoZipSixtyFourRecordAreCorrupt) {
   EXPECT_EQ(built.open_result(), GARC_ERR_CORRUPT);
 }
 
+TEST(ZipStructure, ADirectoryWhoseLastNameEndsLikeALocatorIsReadAsWritten) {
+  // The 20 bytes before the end record are the zip64 locator's place, and with
+  // no zip64 record they are the end of the last directory entry. A name ending
+  // "PK\6\7" and sixteen bytes more puts the signature exactly there, here with
+  // disk fields a real locator would be refused for. The reader used to take it
+  // for a locator and refuse the archive as multi-disk; this library's writer
+  // produced such archives. The fuzz harness over every writer found it.
+  const std::string name
+      = std::string("tail") + std::string("PK\x06\x07", 4) + std::string(16, '\xff');
+  ZipBuilder builder;
+  builder.add("first.txt", "one\n");
+  builder.add(name, "two\n");
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  EXPECT_FALSE(garc_zip_has_zip64_end_record(built.archive()));
+  size_t members = 0;
+  EXPECT_EQ(built.walk(&members), GARC_END);
+  EXPECT_EQ(members, 2u);
+}
+
+TEST(ZipStructure, ZipSixtyFourRecordsWithPlainCountsAreRead) {
+  // What this library's writer writes when it needs the records and every value
+  // fits: the real counts in the 32-bit fields, and the records in front.
+  ZipBuilder builder;
+  builder.add("hello.txt", "hello, archive\n");
+  builder.zip64().zip64_plain_counts();
+  Built built(builder.build());
+  ASSERT_EQ(built.open_result(), GARC_OK);
+  EXPECT_TRUE(garc_zip_has_zip64_end_record(built.archive()));
+}
+
+TEST(ZipStructure, ABrokenZipSixtyFourHalfWithPlainCountsIsStillCorrupt) {
+  // The control on the reading above. Nothing in the end record asks for zip64,
+  // so only the position of the directory tells the two apart: with a real
+  // zip64 record there are 76 bytes between the directory and the end record,
+  // and the 32-bit fields alone find no directory signature where they say it
+  // starts. Reading past a broken zip64 half would let two readers see two
+  // directories in one file.
+  ZipBuilder builder;
+  builder.add("hello.txt", "hello, archive\n");
+  builder.zip64().zip64_plain_counts().zip64_break_record();
+  Built built(builder.build());
+  EXPECT_EQ(built.open_result(), GARC_ERR_CORRUPT);
+}
+
 TEST(ZipStructure, EveryZipSixtyFourSizeIsTakenFromTheFieldThatOverflowed) {
   // All three values in one field, in the order the specification gives:
   // uncompressed size, compressed size, local header offset. The corpus's

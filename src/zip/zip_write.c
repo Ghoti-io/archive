@@ -654,6 +654,15 @@ GARC_Result garc_zip_write_member(
     return GARC_ERR_UNSUPPORTED;
   }
 
+  // zip has no type field for a directory: a name that ends in `/` is one, to
+  // every reader including this library's. A file or symlink named that way
+  // would come back as a directory, so it is refused rather than written as
+  // something else. The fuzz harness over every writer found it.
+  if (member->type != GARC_MEMBER_DIRECTORY
+      && member->name[member->name_length - 1u] == '/') {
+    return GARC_ERR_INVALID;
+  }
+
   const char * data = NULL;
   uint64_t size = member->size;
   switch (member->type) {
@@ -1264,10 +1273,23 @@ GARC_Result garc_zip_write_end(GARC_Writer * writer) {
   // **The zip64 end record, when any of the end record's own fields will not
   // fit** - and also when the caller forced zip64, so that a forced archive is
   // one throughout rather than one with zip64 members and a 1993 end record.
+  //
+  // **And when the directory's own last bytes would read as a zip64 locator.**
+  // The locator is the 20 bytes before the end record, and with no zip64 record
+  // those are the last directory entry's: a name ending "PK\6\7" and sixteen
+  // bytes more puts the signature exactly there, and Python's zipfile and this
+  // library's reader would each take it for a locator. A real locator in front
+  // of the end record leaves nothing to guess. The fuzz harness over every
+  // writer found it.
+  const int tail_looks_like_locator
+      = central_size >= (uint64_t)GARC_ZIP_ZIP64_LOCATOR_SIZE
+      && memcmp(zip->central.bytes + central_size - GARC_ZIP_ZIP64_LOCATOR_SIZE,
+             ZIP_SIG_ZIP64_LOCATOR, 4)
+          == 0;
   const int need_zip64_end = writer->options.zip_force_zip64
       || zip->entries > (uint64_t)ZIP_MARKER16
       || central_size >= (uint64_t)ZIP_MARKER32
-      || central_offset >= (uint64_t)ZIP_MARKER32;
+      || central_offset >= (uint64_t)ZIP_MARKER32 || tail_looks_like_locator;
   if (need_zip64_end) {
     uint8_t record[GARC_ZIP_ZIP64_EOCD_SIZE];
     memcpy(record, ZIP_SIG_ZIP64_EOCD, 4);

@@ -277,6 +277,50 @@ static GARC_Result zip_read_zip64(GARC_Archive * archive,
   return deferred != GARC_OK ? deferred : GARC_ERR_CORRUPT;
 }
 
+/**
+ * Whether a zip64 locator signature before the end record is really the tail of
+ * the central directory.
+ *
+ * The locator is the 20 bytes before the end record, and so is the end of the
+ * last central directory entry when there is no zip64 record: a name ending
+ * `PK\6\7` and sixteen bytes more puts the signature exactly there. This
+ * library's writer once wrote such archives; Python's zipfile reads the same
+ * position the same way.
+ *
+ * Answered only when nothing in the end record asks for zip64, and only when the
+ * 32-bit fields alone place a central directory signature where the directory
+ * would start with no zip64 record in between. A real zip64 archive puts 76
+ * bytes of records between its directory and its end record, so the 32-bit
+ * view of it finds no signature there, and a broken zip64 half stays an error
+ * rather than being read past - two readers seeing two directories in one file
+ * is the thing to avoid.
+ *
+ * @param archive The archive.
+ * @param eocd_offset Where the end record is.
+ * @param entries The end record's entry count.
+ * @param central_size Its central directory size.
+ * @param central_declared Its central directory offset.
+ * @return Non-zero when the signature is directory bytes.
+ */
+static int zip_locator_is_directory_bytes(GARC_Archive * archive,
+    uint64_t eocd_offset, uint16_t entries, uint64_t central_size,
+    uint64_t central_declared) {
+  if (entries == ZIP_MARKER16 || central_size == ZIP_MARKER32
+      || central_declared == ZIP_MARKER32 || !entries) {
+    return 0;
+  }
+  if (central_size < GARC_ZIP_ZIP64_LOCATOR_SIZE
+      || central_size > eocd_offset - archive->start_offset) {
+    return 0;
+  }
+  uint8_t signature[4];
+  if (zip_read_at(archive, eocd_offset - central_size, signature, 4u)
+      != GARC_OK) {
+    return 0;
+  }
+  return memcmp(signature, ZIP_SIG_CENTRAL, 4) == 0;
+}
+
 GARC_Result garc_zip_open(GARC_Archive * archive, uint64_t eocd_offset) {
   GARC_Zip_State * zip = &archive->zip;
 
@@ -326,11 +370,19 @@ GARC_Result garc_zip_open(GARC_Archive * archive, uint64_t eocd_offset) {
       uint64_t record_offset = 0;
       result = zip_read_zip64(archive, locator_offset, &record_offset, &entries,
           &central_size, &central_declared);
-      if (result != GARC_OK) {
+      if (result == GARC_OK) {
+        zip->is_zip64 = 1;
+        central_end = record_offset;
+      }
+      else if ((result != GARC_ERR_CORRUPT && result != GARC_ERR_UNSUPPORTED)
+          || !zip_locator_is_directory_bytes(archive, eocd_offset, entries_total,
+              central_size, central_declared)) {
         return result;
       }
-      zip->is_zip64 = 1;
-      central_end = record_offset;
+      // Otherwise the four bytes were the end of the last directory entry -
+      // a name or an extra field that happens to end "PK\6\7" and sixteen bytes
+      // more - and the 32-bit fields are the archive's, read as they are.
+      result = GARC_OK;
     }
   }
 

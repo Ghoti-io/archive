@@ -161,9 +161,13 @@ GARC_Result garc_ar_write_end(GARC_Writer * writer) {
     return GARC_OK;
   }
   // An archive of nothing is the magic and nothing else, which every reader
-  // takes as an empty one.
-  writer->ar.started = 1;
-  return garc_sink_write(writer->sink, AR_MAGIC, 8u);
+  // takes as an empty one. Marked started only once the magic is out: a sink
+  // that refused it and is asked again must be given it again.
+  GARC_Result result = garc_sink_write(writer->sink, AR_MAGIC, 8u);
+  if (result == GARC_OK) {
+    writer->ar.started = 1;
+  }
+  return result;
 }
 
 void garc_ar_write_release(GARC_Writer * writer) {

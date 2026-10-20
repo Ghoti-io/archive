@@ -1249,7 +1249,7 @@ endef
 # aggregate target below. Two lists is how a harness comes to exist, build, and
 # never be run by `make fuzz` - which adding the writer harness demonstrated, by
 # building and passing while the aggregate still named three.
-FUZZ_HARNESSES := stream tar name writer find zip sevenz arcpio
+FUZZ_HARNESSES := stream tar name writer writers find zip sevenz arcpio
 
 $(foreach harness,$(FUZZ_HARNESSES),\
 	$(eval $(call fuzz-rule,fuzz_$(harness),$(harness))))
