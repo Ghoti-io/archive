@@ -80,6 +80,14 @@ GARC_Result garc_ar_write_member(
   if (member->type != GARC_MEMBER_FILE) {
     return GARC_ERR_UNSUPPORTED;
   }
+  if (writer->member_count == 0 && member->name_length >= 9u
+      && memcmp(member->name, "__.SYMDEF", 9u) == 0) {
+    // First in an archive, that name is BSD's symbol table to every ar reader,
+    // this one included, and is skipped rather than reported: the file would
+    // be written and never read back. After a member it is an ordinary name.
+    // fuzz_writers found it.
+    return GARC_ERR_UNSUPPORTED;
+  }
 
   const int short_form = member->name_length <= 15u
       && !memchr(member->name, '/', member->name_length)

@@ -2098,6 +2098,8 @@ typedef struct {
   uint32_t name_length; ///< Its name's length.
   uint16_t method;      ///< Its method.
   uint16_t aes_method;  ///< Its real method, for a WinZip AES member.
+  uint16_t aes_version; ///< AE-1 or AE-2, likewise.
+  uint8_t aes_strength; ///< Its key size, likewise.
   int encryption;       ///< Its GARC_Zip_Encryption, from the local header.
 } Zip_Stream_Record;
 
@@ -2334,6 +2336,10 @@ static GARC_Result zs_finish_member(GARC_Archive * archive) {
   record.encryption = (int)zip->encryption;
   record.aes_method = zip->encryption == GARC_ZIP_ENCRYPTION_AES
       ? zip->aes_method : 0u;
+  record.aes_version = zip->encryption == GARC_ZIP_ENCRYPTION_AES
+      ? zip->aes_version : 0u;
+  record.aes_strength = zip->encryption == GARC_ZIP_ENCRYPTION_AES
+      ? zip->aes_strength : 0u;
   result = zs_grow(archive->allocator, &zip->records,
       (zip->record_count + 1u) * sizeof(record));
   if (result != GARC_OK) {
@@ -2430,9 +2436,10 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
             = (central_method == GARC_ZIP_METHOD_AES && extra.have_aes)
             ? GARC_ZIP_ENCRYPTION_AES : GARC_ZIP_ENCRYPTION_ZIPCRYPTO;
       }
-      const uint16_t central_aes_method
-          = central_encryption == GARC_ZIP_ENCRYPTION_AES
-          ? extra.aes_real_method : 0u;
+      const int central_aes = central_encryption == GARC_ZIP_ENCRYPTION_AES;
+      const uint16_t central_aes_method = central_aes ? extra.aes_real_method : 0u;
+      const uint16_t central_aes_version = central_aes ? extra.aes_version : 0u;
+      const uint8_t central_aes_strength = central_aes ? extra.aes_strength : 0u;
       if (garc_zip_le16(entry + 34u) != 0u) {
         return GARC_ERR_UNSUPPORTED; // on another disk, as garc_zip_open() says
       }
@@ -2444,7 +2451,9 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
           || record.crc != garc_zip_le32(entry + 16u)
           || record.compressed != compressed || record.size != size
           || record.encryption != central_encryption
-          || record.aes_method != central_aes_method) {
+          || record.aes_method != central_aes_method
+          || record.aes_version != central_aes_version
+          || record.aes_strength != central_aes_strength) {
         return GARC_ERR_CORRUPT;
       }
       ++seen;

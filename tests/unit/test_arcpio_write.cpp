@@ -671,6 +671,50 @@ TEST(ArCpioWrite, ARefusedFormatCombinationIsStillRefused) {
   garc_sink_destroy(sink);
 }
 
+TEST(ArWrite, ASymbolTableNameFirstIsRefusedAndLaterIsAFile) {
+  // Every ar reader skips a first member named __.SYMDEF... as BSD's symbol
+  // table, so written first it would never be read back; fuzz_writers found
+  // the writer accepting it. After a member it is an ordinary name.
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_memory(&sink));
+  GARC_Writer * writer = nullptr;
+  ASSERT_EQ(GARC_OK, garc_writer_create(sink, GARC_FORMAT_AR, nullptr, &writer));
+  GARC_Member member;
+  std::memset(&member, 0, sizeof(member));
+  member.type = GARC_MEMBER_FILE;
+  member.name = "__.SYMDEF SORTED";
+  member.name_length = std::strlen(member.name);
+  member.size = 1;
+  const uint64_t before = garc_sink_tell(sink);
+  EXPECT_EQ(GARC_ERR_UNSUPPORTED, garc_writer_add(writer, &member));
+  EXPECT_EQ(before, garc_sink_tell(sink));
+  GARC_Member first = member;
+  first.name = "first.o";
+  first.name_length = 7;
+  ASSERT_EQ(GARC_OK, garc_writer_add(writer, &first));
+  ASSERT_EQ(GARC_OK, garc_writer_write(writer, "1", 1));
+  ASSERT_EQ(GARC_OK, garc_writer_add(writer, &member));
+  ASSERT_EQ(GARC_OK, garc_writer_write(writer, "2", 1));
+  ASSERT_EQ(GARC_OK, garc_writer_finish(writer));
+  const void * data = nullptr;
+  size_t size = 0;
+  ASSERT_EQ(GARC_OK, garc_sink_data(sink, &data, &size));
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_memory(data, size, &stream));
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(GARC_OK, garc_open(stream, nullptr, &archive));
+  std::vector<std::string> names;
+  const GARC_Member * got = nullptr;
+  while (garc_next(archive, &got) == GARC_OK) {
+    names.emplace_back(got->name, got->name_length);
+  }
+  EXPECT_EQ(names, (std::vector<std::string>{"first.o", "__.SYMDEF SORTED"}));
+  garc_close(archive);
+  garc_stream_destroy(stream);
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

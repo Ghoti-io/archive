@@ -1959,6 +1959,34 @@ TEST(Zip, AnEndRecordThatDisagreesWithTheWalkIsRefusedOnAPipe) {
   }
 }
 
+TEST(Zip, AnAesFieldThatDisagreesWithTheDirectoryIsCorruptOnAPipe) {
+  // The pipe's walk decides how an AES member is encrypted from the local
+  // header; the directory's field must say the same key size and version, or
+  // the archive reads two ways. fuzz_zip found the strength unchecked.
+  const std::vector<uint8_t> clean = two_aes_members();
+  ASSERT_FALSE(clean.empty());
+  const std::string haystack(clean.begin(), clean.end());
+  const size_t central = haystack.find(std::string("PK\x01\x02", 4));
+  ASSERT_NE(central, std::string::npos);
+  const size_t field = haystack.find(std::string("\x01\x99\x07\x00", 4), central);
+  ASSERT_NE(field, std::string::npos);
+  // 0 changes nothing; then the version's low byte, and the strength.
+  for (size_t at : {size_t(0), field + 4, field + 8}) {
+    SCOPED_TRACE(at);
+    std::vector<uint8_t> bytes = clean;
+    if (at) {
+      bytes[at] = static_cast<uint8_t>(bytes[at] == 1 ? 2 : 1);
+    }
+    Piped piped(bytes);
+    ASSERT_EQ(piped.open_result(), GARC_OK);
+    const GARC_Member * member = nullptr;
+    GARC_Result result;
+    while ((result = garc_next(piped.archive(), &member)) == GARC_OK) {
+    }
+    EXPECT_EQ(result, at ? GARC_ERR_CORRUPT : GARC_END);
+  }
+}
+
 TEST(Zip, TheCommentIsReadFromAPipeAsFromAFile) {
   // python-comments.zip has one; the streamed walk keeps it as the seekable
   // reader does, so garc_zip_comment() answers the same on both.
