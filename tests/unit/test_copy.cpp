@@ -16,7 +16,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <dirent.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include <ghoti.io/archive/archive.h>
+#include <ghoti.io/cutil/dir.h>
 
 #include "tar_manifest.h"
 #include "test_helpers.h"
@@ -123,21 +123,31 @@ std::vector<Read> read_all(const std::vector<uint8_t> & bytes, GARC_Result * ope
 
 std::vector<std::string> fixtures(const std::string & directory,
     const char * suffix) {
+  // Through cutil rather than opendir(): readdir() on a 32-bit target built
+  // without large-file support fails on a filesystem with 64-bit inode
+  // numbers, and listed nothing on i686 under qemu.
   std::vector<std::string> names;
-  DIR * dir = opendir((std::string(GARC_TEST_DATA) + "/" + directory).c_str());
-  if (!dir) {
+  const std::string path = std::string(GARC_TEST_DATA) + "/" + directory;
+  GCU_Dir handle;
+  std::memset(&handle, 0, sizeof(handle));
+  if (gcu_dir_open(&handle, path.c_str(), nullptr) != GCU_FILE_OK) {
     return names;
   }
-  while (struct dirent * entry = readdir(dir)) {
-    const std::string name = entry->d_name;
+  for (;;) {
+    const char * entry = nullptr;
+    bool done = false;
+    if (gcu_dir_read(&handle, &entry, nullptr, &done) != GCU_FILE_OK || done) {
+      break;
+    }
+    const std::string name = entry;
     if (name.size() > std::strlen(suffix)
         && name.compare(name.size() - std::strlen(suffix), std::strlen(suffix),
                suffix)
             == 0) {
-      names.push_back(std::string(GARC_TEST_DATA) + "/" + directory + "/" + name);
+      names.push_back(path + "/" + name);
     }
   }
-  closedir(dir);
+  gcu_dir_close(&handle);
   std::sort(names.begin(), names.end());
   return names;
 }
