@@ -84,7 +84,9 @@ const char * garc_format_string(GARC_Format format) {
  *    is a 7z and I need to seek" rather than "I do not know what this is".
  * 3. Failing both, and only on a seekable stream: is there an end record within
  *    the last 65,557 bytes? That is the only way to find a zip behind a
- *    self-extracting stub, whose first bytes are an executable's.
+ *    self-extracting stub, whose first bytes are an executable's. And if the
+ *    first bytes *are* an executable's, is there a 7z signature with a valid
+ *    start header in its first 8 MiB? That is a 7-Zip self-extractor.
  *
  * Question 3 comes last because it is the expensive one and because it can say
  * yes about a file whose last bytes merely look like a record - which is exactly
@@ -171,6 +173,18 @@ static GARC_Result reader_identify(GARC_Archive * archive) {
       // An I/O or allocation failure while looking. Reported as itself: a caller
       // told "not an archive" because a read failed would go and check the
       // bytes, which are fine.
+      return found;
+    }
+    // A 7z behind a self-extracting stub, whose header is not at the end and
+    // whose signature is not at the front.
+    uint64_t sfx = 0;
+    found = garc_sevenz_locate_sfx(archive, &sfx);
+    if (found == GARC_OK) {
+      archive->sevenz_sfx = sfx;
+      archive->format = GARC_FORMAT_SEVENZ;
+      return GARC_OK;
+    }
+    if (found != GARC_ERR_FORMAT) {
       return found;
     }
   }
@@ -652,6 +666,16 @@ GARC_Result garc_reader_discard(GARC_Archive * archive, uint64_t count) {
 
 uint64_t garc_member_count(const GARC_Archive * archive) {
   return archive ? archive->member_count : 0u;
+}
+
+uint64_t garc_base_offset(const GARC_Archive * archive) {
+  if (!archive) {
+    return 0;
+  }
+  if (archive->format == GARC_FORMAT_ZIP) {
+    return garc_zip_base_offset(archive);
+  }
+  return archive->format == GARC_FORMAT_SEVENZ ? archive->sevenz_sfx : 0u;
 }
 
 uint64_t garc_total_declared_bytes(const GARC_Archive * archive) {

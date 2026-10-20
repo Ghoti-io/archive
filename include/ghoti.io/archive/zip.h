@@ -63,10 +63,11 @@
  * one. So, for now, are bzip2 and xz with one: both formats mark their own end,
  * but compress's decoders read on into a following stream (and xz's into zero
  * padding) instead of stopping at the first, and neither yet reports the bytes
- * it took past that end, so the descriptor's position cannot be found. An encrypted member with sizes in
- * its header is listed and skipped; its data is refused. A symlink is reported
- * as a file, because the bit that says otherwise is in the directory. On a
- * seekable stream none of this applies: the directory is read first, as above.
+ * it took past that end, so the descriptor's position cannot be found. An
+ * encrypted member with sizes in its header is listed and skipped; its data is
+ * refused. A symlink is reported as a file, because the bit that says
+ * otherwise is in the directory. On a seekable stream none of this applies:
+ * the directory is read first, as above.
  *
  * **A zip must end where the stream ends.** The scan for the end record starts
  * at the end and goes back at most 65,557 bytes, which is the largest a record

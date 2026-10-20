@@ -472,6 +472,11 @@ struct GARC_Archive {
    * it can be known.
    */
   uint64_t start_offset;
+  /**
+   * Bytes of self-extractor stub between @ref start_offset and a 7z's
+   * signature header, or 0. Found by garc_sevenz_locate_sfx().
+   */
+  uint64_t sevenz_sfx;
 
   /** The member garc_next() last handed out. */
   GARC_Member member;

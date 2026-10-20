@@ -320,6 +320,98 @@ TEST(SevenZ, ANonSeekableStreamIsNamedAsSuch) {
   EXPECT_EQ(opened.open_result(), GARC_ERR_NOT_SEEKABLE);
 }
 
+/** @p archive behind @p stub, the way a self-extractor is laid out. */
+std::vector<uint8_t> behind(const std::string & stub, const std::vector<uint8_t> & archive) {
+  std::vector<uint8_t> out(stub.begin(), stub.end());
+  out.insert(out.end(), archive.begin(), archive.end());
+  return out;
+}
+
+/** A stub of @p length bytes that starts like @p magic and holds no signature. */
+std::string stub_of(const std::string & magic, size_t length) {
+  std::string stub = magic;
+  for (size_t i = stub.size(); i < length; ++i) {
+    stub.push_back(static_cast<char>((i * 131u + 7u) % 251u));
+  }
+  return stub;
+}
+
+TEST(SevenZ, AnArchiveBehindAnExecutableStubIsFoundAndReadTheSame) {
+  // 7-Zip's self-extractors are an executable with the archive appended: a PE
+  // on Windows, an ELF on Linux (the pinned image's 7zCon.sfx), Mach-O on a Mac.
+  const std::vector<uint8_t> plain = fixture("nonsolid.7z");
+  std::map<std::string, Seen> want;
+  {
+    Opened opened(plain);
+    ASSERT_EQ(opened.open_result(), GARC_OK);
+    ASSERT_EQ(walk(opened.archive(), &want), GARC_END);
+    EXPECT_EQ(garc_base_offset(opened.archive()), 0u);
+  }
+  ASSERT_FALSE(want.empty());
+  const std::string magics[] = {std::string("MZ"), std::string("\x7f" "ELF", 4),
+      std::string("\xcf\xfa\xed\xfe", 4)};
+  for (const std::string & magic : magics) {
+    for (size_t length : {4u, 70000u, 518752u}) {
+      SCOPED_TRACE(length);
+      const std::vector<uint8_t> bytes = behind(stub_of(magic, length), plain);
+      Opened opened(bytes);
+      ASSERT_EQ(opened.open_result(), GARC_OK);
+      EXPECT_EQ(garc_format(opened.archive()), GARC_FORMAT_SEVENZ);
+      EXPECT_EQ(garc_base_offset(opened.archive()), length);
+      std::map<std::string, Seen> got;
+      EXPECT_EQ(walk(opened.archive(), &got), GARC_END);
+      ASSERT_EQ(got.size(), want.size());
+      for (const auto & [name, seen] : want) {
+        EXPECT_EQ(got[name].data, seen.data) << name;
+        EXPECT_EQ(got[name].status, seen.status) << name;
+      }
+      // And a find, which rewinds, rewinds to the archive and not the stub.
+      const GARC_Member * member = nullptr;
+      EXPECT_EQ(garc_find(opened.archive(), "sub/one", 7, &member), GARC_OK);
+    }
+  }
+}
+
+TEST(SevenZ, ASignatureWhoseStartHeaderDoesNotCheckIsPassedOver) {
+  // A stub can contain the six signature bytes - the self-extractor's own
+  // code looks for them - and only a start header whose CRC matches and whose
+  // next header lies in the file is the archive.
+  const std::vector<uint8_t> plain = fixture("nonsolid.7z");
+  std::string stub = stub_of("MZ", 4096);
+  std::string decoy(plain.begin(), plain.begin() + 32);
+  decoy[9] = static_cast<char>(decoy[9] ^ 0x01); // the start header's CRC
+  stub += decoy;
+  stub += stub_of("x", 1000);
+  const std::vector<uint8_t> bytes = behind(stub, plain);
+  Opened opened(bytes);
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  EXPECT_EQ(garc_base_offset(opened.archive()), stub.size());
+}
+
+TEST(SevenZ, OnlyAnExecutableIsScannedAndOnlyItsFirstEightMiB) {
+  const std::vector<uint8_t> plain = fixture("basic.7z");
+  {
+    // Not an executable: a text file that happens to have a 7z in it is not one.
+    Opened opened(behind(stub_of("hello", 5000), plain));
+    EXPECT_EQ(opened.open_result(), GARC_ERR_FORMAT);
+  }
+  {
+    // Past the bound.
+    Opened opened(behind(stub_of("MZ", (8u << 20) + 16u), plain));
+    EXPECT_EQ(opened.open_result(), GARC_ERR_FORMAT);
+  }
+  {
+    // Just inside it.
+    Opened opened(behind(stub_of("MZ", (8u << 20) - 64u), plain));
+    EXPECT_EQ(opened.open_result(), GARC_OK);
+  }
+  {
+    // A stream that cannot seek is not scanned: the header is at the end anyway.
+    Opened opened(behind(stub_of("MZ", 100), plain), nullptr, false);
+    EXPECT_EQ(opened.open_result(), GARC_ERR_FORMAT);
+  }
+}
+
 TEST(SevenZ, NamesAreUtf8) {
   Opened opened(fixture("basic.7z"));
   ASSERT_EQ(opened.open_result(), GARC_OK);

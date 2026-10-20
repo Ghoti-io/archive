@@ -1571,6 +1571,91 @@ static GARC_Result read_exact(
   return GARC_OK;
 }
 
+/** Whether @p bytes start the way an executable does. */
+static int sz_looks_executable(const uint8_t * bytes, size_t length) {
+  if (length < 4u) {
+    return 0;
+  }
+  static const uint8_t elf[4] = {0x7fu, 'E', 'L', 'F'};
+  static const uint8_t macho[4][4] = {{0xfeu, 0xedu, 0xfau, 0xceu},
+      {0xfeu, 0xedu, 0xfau, 0xcfu}, {0xceu, 0xfau, 0xedu, 0xfeu},
+      {0xcfu, 0xfau, 0xedu, 0xfeu}};
+  if ((bytes[0] == 'M' && bytes[1] == 'Z') || memcmp(bytes, elf, 4u) == 0) {
+    return 1;
+  }
+  for (size_t i = 0; i < 4u; ++i) {
+    if (memcmp(bytes, macho[i], 4u) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+GARC_Result garc_sevenz_locate_sfx(GARC_Archive * archive, uint64_t * out_offset) {
+  if (!sz_looks_executable(archive->peek, archive->peek_length)) {
+    return GARC_ERR_FORMAT;
+  }
+  GARC_Stream * stream = archive->stream;
+  uint64_t size = 0;
+  GARC_Result result = garc_stream_size(stream, &size);
+  if (result != GARC_OK) {
+    return GARC_ERR_FORMAT; // no size, no way to check a next header
+  }
+  const uint64_t start = archive->start_offset;
+  const uint64_t end = size - start < GARC_SEVENZ_SFX_SCAN
+      ? size : start + GARC_SEVENZ_SFX_SCAN;
+  uint8_t window[65536 + GARC_SEVENZ_START_SIZE];
+  uint64_t at = start;
+  while (at < end) {
+    size_t want = sizeof(window);
+    if ((uint64_t)want > size - at) {
+      want = (size_t)(size - at);
+    }
+    result = garc_stream_seek(stream, at);
+    if (result == GARC_OK) {
+      result = read_exact(stream, window, want);
+    }
+    if (result != GARC_OK) {
+      return result;
+    }
+    // Every position whose signature starts before the scan's end; the start
+    // header has to fit in what was read for it to be checked here.
+    for (size_t i = 0; i + GARC_SEVENZ_START_SIZE <= want; ++i) {
+      if (at + i >= end) {
+        break;
+      }
+      const uint8_t * header = window + i;
+      if (memcmp(header, SZ_SIGNATURE, GARC_SEVENZ_SIGNATURE_SIZE) != 0
+          || header[6] != 0u || at + i == start) {
+        continue;
+      }
+      // The same fields garc_sevenz_open() reads, read the same way.
+      Cur sc = {header, GARC_SEVENZ_START_SIZE, 8u};
+      uint32_t start_crc = 0;
+      uint64_t next_off = 0;
+      uint64_t next_size = 0;
+      (void)cur_u32(&sc, &start_crc);
+      (void)cur_u64(&sc, &next_off);
+      (void)cur_u64(&sc, &next_size);
+      if (sz_crc32(header + 12u, 20u) != start_crc) {
+        continue;
+      }
+      const uint64_t base = at + i + GARC_SEVENZ_START_SIZE;
+      if (next_off > size - base || next_size > size - base - next_off) {
+        continue;
+      }
+      *out_offset = at + i - start;
+      return GARC_OK;
+    }
+    if (want < sizeof(window)) {
+      break;
+    }
+    // Overlap by a start header, so a signature across the boundary is seen.
+    at += (uint64_t)(want - GARC_SEVENZ_START_SIZE + 1u);
+  }
+  return GARC_ERR_FORMAT;
+}
+
 GARC_Result garc_sevenz_open(GARC_Archive * archive) {
   const GARC_Allocator * a = archive->allocator;
   GARC_Stream * stream = archive->stream;
@@ -1581,7 +1666,8 @@ GARC_Result garc_sevenz_open(GARC_Archive * archive) {
   }
   archive->sevenz = z;
   z->open_folder = -1;
-  z->origin = archive->start_offset;
+  // A self-extractor's stub, if one was found, is in front of the archive.
+  z->origin = archive->start_offset + archive->sevenz_sfx;
   archive->peek_length = 0;
   archive->peek_consumed = 0;
   if (!garc_stream_is_seekable(stream)) {

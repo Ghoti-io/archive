@@ -251,6 +251,21 @@ GARC_API GARC_Result garc_skip_member(GARC_Archive * archive);
 GARC_API uint64_t garc_member_count(const GARC_Archive * archive);
 
 /**
+ * @brief How many bytes stand in front of the archive, inside the stream.
+ *
+ * A self-extracting stub, usually: an executable with the archive behind it.
+ * For a zip it is ::garc_zip_base_offset(). For a 7z it is the stub a 7-Zip
+ * self-extractor puts in front of the signature header, found by scanning the
+ * first 8 MiB of a file that starts like an executable (PE, ELF or Mach-O).
+ * 0 for every other format, and for an archive with nothing in front of it.
+ * Counted from where the stream was when ::garc_open() was called.
+ *
+ * @param archive The archive. NULL returns 0.
+ * @return The stub's length in bytes.
+ */
+GARC_API uint64_t garc_base_offset(const GARC_Archive * archive);
+
+/**
  * @brief The running total of declared member sizes.
  *
  * What ::GARC_Limits.max_total_bytes is compared against. This is the cap no

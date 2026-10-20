@@ -68,6 +68,7 @@
 // Public functions.
 #define garc_allocator_default GHOTIIO_ARCHIVE(garc_allocator_default)
 #define garc_archive_dump GHOTIIO_ARCHIVE(garc_archive_dump)
+#define garc_base_offset GHOTIIO_ARCHIVE(garc_base_offset)
 #define garc_close GHOTIIO_ARCHIVE(garc_close)
 #define garc_format GHOTIIO_ARCHIVE(garc_format)
 #define garc_find GHOTIIO_ARCHIVE(garc_find)

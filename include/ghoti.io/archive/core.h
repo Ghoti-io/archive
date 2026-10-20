@@ -81,12 +81,14 @@ typedef enum {
    * ::garc_writer_create() when a 7z, or a zip asked for
    * ::GARC_ZIP_SIZES_LOCAL, is given a sink that cannot patch. Not
    * ::GARC_ERR_UNSUPPORTED, which says *this library* does not implement
-   * something: each of these is implemented, and this stream cannot do it. The difference is
-   * the caller's next move - a feature this library lacks is a wait, and a
-   * stream that cannot seek is a different stream or a different approach.
+   * something: each of these is implemented, and this stream cannot do it.
+   * The difference is the caller's next move - a feature this library lacks is
+   * a wait, and a stream that cannot seek is a different stream or a different
+   * approach.
    *
-   * Every compressed archive is in this case and cannot leave it: a codec stream
-   * has no seek, so a `tar.gz` is walked with ::garc_next() or not at all.
+   * Every compressed archive is in this case for ::garc_find() and cannot leave
+   * it: a codec stream has no seek, so a `tar.gz` is walked with ::garc_next()
+   * or not at all.
    */
   GARC_ERR_NOT_SEEKABLE,
 

@@ -73,6 +73,27 @@ int garc_sevenz_identify(const uint8_t * bytes, size_t length);
 GARC_Result garc_sevenz_open(GARC_Archive * archive);
 
 /**
+ * Find a 7z behind a self-extracting stub.
+ *
+ * Only when the first bytes are an executable's (PE, ELF or Mach-O) - which is
+ * what a self-extractor is, and what keeps an arbitrary file from being
+ * scanned - and only within ::GARC_SEVENZ_SFX_SCAN bytes. A signature counts
+ * only when the start header after it checks: its CRC, a major version of 0,
+ * and a next header that lies inside the stream.
+ *
+ * @param archive The archive, whose stream can seek and whose first bytes are
+ *   in its peek buffer.
+ * @param out_offset Receives the signature's offset from the start of the
+ *   archive.
+ * @return ::GARC_OK, ::GARC_ERR_FORMAT when there is none, or the stream's
+ *   failure. The stream's position is unspecified after.
+ */
+GARC_Result garc_sevenz_locate_sfx(GARC_Archive * archive, uint64_t * out_offset);
+
+/** How far into a file the self-extractor scan looks for the signature. */
+#define GARC_SEVENZ_SFX_SCAN (8u * 1024u * 1024u)
+
+/**
  * Advance to the next member.
  *
  * @param archive The archive.

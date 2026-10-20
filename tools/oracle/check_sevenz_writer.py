@@ -251,16 +251,52 @@ def main(argv):
         compared += compare(failures, "bsdtar " + name, want, got,
             skip=("mtime",))
 
+    # A real self-extractor: 7-Zip's console module for Linux, from the pinned
+    # image, with the first archive behind it - which is what `7z a -sfx`
+    # writes. Both 7-Zip and this reader must find the archive behind the
+    # stub and read it as the intent says.
+    sfx_checked = 0
+    if archives:
+        source = os.path.join(work, archives[0])
+        sfx = os.path.join(work, "self-extracting.exe")
+        made = reference("sevenzip", ["sh", "-c",
+            'cat /usr/lib/7zip/7zCon.sfx "$0" > "$1"', source, sfx], work)
+        if made.returncode != 0 or not os.path.exists(sfx):
+            failures.append("could not make a self-extractor from %s: %s"
+                % (archives[0], made.stderr.decode("utf-8", "replace").strip()))
+        else:
+            want = members.get(archives[0], [])
+            ours = subprocess.run([probe, "read", sfx], capture_output=True,
+                text=True)
+            if ours.returncode != 0:
+                failures.append("self-extractor: our reader: %s"
+                    % ours.stderr.strip())
+            else:
+                got = [dict(row, archive=archives[0])
+                    for row in rows_from(ours.stdout)]
+                sfx_checked += compare(failures, "ours self-extractor", want, got)
+            tested = reference("sevenzip",
+                ["7z", "t", "-bso0", "-bsp0", sfx], work)
+            if tested.returncode != 0:
+                failures.append("self-extractor: 7z t exited %d: %s"
+                    % (tested.returncode,
+                        tested.stderr.decode("utf-8", "replace").strip()))
+
     if failures:
         sys.stderr.write("### check-sevenz-writer: the references disagree "
             "with the writer ###\n")
         for line in failures:
             sys.stderr.write("  " + line + "\n")
         return 1
+    if not sfx_checked:
+        sys.stderr.write("### check-sevenz-writer: the self-extractor step "
+            "compared nothing ###\n")
+        return 1
     print("check-sevenz-writer: %d archives, %d members each, all accepted "
         "by 7-Zip and all but %s by libarchive; %d fields compared against "
-        "the intent" % (len(archives), EXPECTED_MEMBERS, DEFLATE64_ARCHIVE,
-            compared))
+        "the intent, and %d more from %s behind 7-Zip's 7zCon.sfx"
+        % (len(archives), EXPECTED_MEMBERS, DEFLATE64_ARCHIVE, compared,
+            sfx_checked, archives[0]))
     return 0
 
 
