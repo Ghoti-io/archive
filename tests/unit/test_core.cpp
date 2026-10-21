@@ -38,7 +38,7 @@ TEST(Result, StringForAValueOutsideTheEnumIsTheUnknownArm) {
 }
 
 TEST(Result, EveryLimitStringNamesWhichLimit) {
-  // Six constants buy nothing if the message a caller prints is the same for
+  // Seven constants buy nothing if the message a caller prints is the same for
   // all of them.
   const GARC_Result limits[] = {
     GARC_ERR_LIMIT_MEMBERS,
@@ -46,6 +46,7 @@ TEST(Result, EveryLimitStringNamesWhichLimit) {
     GARC_ERR_LIMIT_TOTAL_BYTES,
     GARC_ERR_LIMIT_NAME_BYTES,
     GARC_ERR_LIMIT_EXTRA_BYTES,
+    GARC_ERR_LIMIT_KEY_ROUNDS,
     GARC_ERR_LIMIT_CODEC_BYTES,
   };
   for (GARC_Result result : limits) {
@@ -67,7 +68,7 @@ TEST(Result, IsErrorIsFalseForExactlyOkAndEnd) {
   }
 }
 
-TEST(Result, IsLimitIsTrueForExactlyTheSixLimitCodes) {
+TEST(Result, IsLimitIsTrueForExactlyTheSevenLimitCodes) {
   // The count is asserted rather than the membership, and it is what caught the
   // sixth code being added: a predicate that grew without this test being looked
   // at would have been a predicate nobody had decided about.
@@ -82,7 +83,7 @@ TEST(Result, IsLimitIsTrueForExactlyTheSixLimitCodes) {
           << garc_result_string(result) << " is a limit but not an error";
     }
   }
-  EXPECT_EQ(limit_count, 6);
+  EXPECT_EQ(limit_count, 7);
   EXPECT_FALSE(garc_result_is_limit(GARC_OK));
   EXPECT_FALSE(garc_result_is_limit(GARC_ERR_CORRUPT));
   EXPECT_FALSE(garc_result_is_limit(GARC_RESULT_COUNT));
@@ -100,6 +101,7 @@ TEST(Limits, DefaultMatchesTheNamedConstants) {
   EXPECT_EQ(limits.max_total_bytes, GARC_DEFAULT_MAX_TOTAL_BYTES);
   EXPECT_EQ(limits.max_name_bytes, GARC_DEFAULT_MAX_NAME_BYTES);
   EXPECT_EQ(limits.max_extra_bytes, GARC_DEFAULT_MAX_EXTRA_BYTES);
+  EXPECT_EQ(limits.max_key_rounds, GARC_DEFAULT_MAX_KEY_ROUNDS);
 }
 
 TEST(Limits, EveryDefaultIsBounded) {
@@ -114,6 +116,7 @@ TEST(Limits, EveryDefaultIsBounded) {
   EXPECT_NE(limits.max_total_bytes, 0u);
   EXPECT_NE(limits.max_name_bytes, 0u);
   EXPECT_NE(limits.max_extra_bytes, 0u);
+  EXPECT_NE(limits.max_key_rounds, 0u);
 }
 
 TEST(Limits, TotalIsAtLeastOneMemberWorth) {

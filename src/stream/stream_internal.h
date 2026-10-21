@@ -113,6 +113,30 @@ GARC_Result garc_stream_create_slice_with_allocator(GARC_Stream * inner,
     uint64_t length, const GARC_Allocator * allocator,
     GARC_Stream ** out_stream);
 
+/**
+ * @brief A slice that starts at an offset in a seekable stream and keeps its own
+ * position there.
+ *
+ * Several of these can share one @p inner and be read in any interleaving: each
+ * seeks @p inner back to where it left off before it reads, when @p inner is not
+ * already there. A 7z folder with several packed streams (BCJ2's four) reads
+ * them this way, all from the one archive stream. A plain slice cannot do this,
+ * because it reads from wherever @p inner happens to be.
+ *
+ * @param inner Where the bytes come from. Must be seekable for any read to
+ *   succeed once another reader has moved it.
+ * @param offset Where this view starts in @p inner.
+ * @param length How many bytes belong to the view.
+ * @param allocator Allocator for the stream and its state. NULL uses the
+ *   default.
+ * @param out_stream Receives the stream on success.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID, or ::GARC_ERR_OOM. A read returns
+ *   what the seek of @p inner returned when that fails.
+ */
+GARC_Result garc_stream_create_slice_at_with_allocator(GARC_Stream * inner,
+    uint64_t offset, uint64_t length, const GARC_Allocator * allocator,
+    GARC_Stream ** out_stream);
+
 #ifdef __cplusplus
 }
 #endif

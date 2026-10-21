@@ -89,7 +89,7 @@ struct Opened {
   GARC_Result open_stream() {
     GARC_Result result = garc_open(stream, nullptr, &archive);
     if (result == GARC_OK && garc_format(archive) == GARC_FORMAT_ZIP) {
-      result = garc_zip_set_password(
+      result = garc_set_password(
           archive, kCorpusPassword, std::strlen(kCorpusPassword));
     }
     return result;

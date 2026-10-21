@@ -148,6 +148,71 @@ GARC_API GARC_Result garc_open_with_allocator(GARC_Stream * stream,
 GARC_API GARC_Format garc_format(const GARC_Archive * archive);
 
 /**
+ * @brief Give the archive a password, for what is encrypted in it.
+ *
+ * Zip and 7z take one; any other format is ::GARC_ERR_INVALID. The password is
+ * copied and wiped when the archive is closed. It takes a length rather than
+ * a string, and an empty password is a legitimate argument, distinct from
+ * never having called this. Calling it again replaces the password, which is
+ * how a caller tries a second one.
+ *
+ * **Zip.** ZipCrypto is read rather than trusted, and WinZip AES is read. The
+ * traditional PKWARE cipher is keyed by three 32-bit words derived from these
+ * bytes at this call; AES derives per member, because each member has its own
+ * salt. ::garc_zip_member_encryption() says which scheme a member uses, and
+ * it can be asked before this is called. The metadata is readable without a
+ * password and is not affected by a wrong one, so this changes only what
+ * ::garc_read_member() can do with an encrypted member, and it may be called
+ * at any point in a walk. Three statuses can then come back from
+ * ::garc_read_member(), and they are three because the cipher makes them
+ * distinguishable to different degrees:
+ *
+ * - ::GARC_ERR_PASSWORD_REQUIRED - no password was set. Unambiguous.
+ * - ::GARC_ERR_PASSWORD_REJECTED - the encryption header's single check byte
+ *   disagreed, before any data was read. Catches 255 wrong passwords in 256; the
+ *   only other cause is a corrupt encryption header.
+ * - ::GARC_ERR_PASSWORD_OR_CORRUPT - ZipCrypto's CRC-32 disagreed after the
+ *   check byte agreed, a WinZip AES HMAC disagreed after the 2-byte verifier
+ *   agreed, or an encrypted LZMA member's codec header did not parse or ran
+ *   out. **A 16-bit verifier can pass for a wrong password, once in 65536**,
+ *   and ZipCrypto has no tag at all, so a wrong password and a damaged member
+ *   are the same observation. The status names both rather than guessing.
+ *   AE-2 does not treat a stored CRC of 0 as this failure; AE-1 still checks
+ *   the CRC, and a mismatch after a matching HMAC is damage to the plaintext
+ *   (::GARC_ERR_CORRUPT).
+ *
+ * **7z.** 7-Zip's AES is read: AES-256-CBC keyed by SHA-256 over the password
+ * as UTF-16LE, so @p password is taken as **UTF-8** and converted, and bytes
+ * that are not UTF-8 are ::GARC_ERR_INVALID. There is no check value of any
+ * kind, so a wrong password is seen only when what is behind the cipher
+ * fails to decode or a CRC-32 disagrees, and that is
+ * ::GARC_ERR_PASSWORD_OR_CORRUPT from ::garc_read_member(); the walk goes on.
+ * A member whose folder is encrypted and no password set is
+ * ::GARC_ERR_PASSWORD_REQUIRED from ::garc_read_member().
+ *
+ * **An encrypted 7z header** (7-Zip's `-mhe=on`) hides the names, so
+ * ::garc_open() succeeds and ::garc_next() is ::GARC_ERR_PASSWORD_REQUIRED
+ * until a password decodes the header. That happens in this call, which then
+ * returns what decoding it returned: ::GARC_ERR_PASSWORD_OR_CORRUPT for a
+ * wrong password, after which another may be tried. Each try costs a key
+ * derivation, 2^19 SHA-256 rounds as 7-Zip writes it.
+ *
+ * **Writing ZipCrypto is refused permanently**, and not for want of code: no
+ * option name makes shipping a cipher known to be broken honest. A password on
+ * a zip writer produces WinZip AES.
+ *
+ * @param archive The archive.
+ * @param password The password bytes. May be NULL only when @p length is 0.
+ * @param length Its length in bytes.
+ * @return ::GARC_OK; ::GARC_ERR_INVALID for a NULL archive, an archive that
+ *   is not a zip or a 7z, a NULL @p password with a non-zero @p length, or a
+ *   7z password that is not UTF-8; ::GARC_ERR_OOM; or, for a 7z whose header
+ *   is encrypted, what decoding the header returned.
+ */
+GARC_API GARC_Result garc_set_password(
+    GARC_Archive * archive, const void * password, size_t length);
+
+/**
  * @brief Step to the next member.
  *
  * Any of the current member's data that was not read is skipped. The member

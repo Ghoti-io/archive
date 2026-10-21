@@ -33,13 +33,16 @@
  * pays it lazily: nothing is decoded until a member's bytes, or a later member,
  * are asked for.
  *
- * **What is read.** Folders that are a straight chain of coders each taking one
- * stream and giving one: copy, LZMA, LZMA2, bzip2, deflate, delta and the BCJ
- * branch filters. The header itself may be encoded (7-Zip's default) and is
- * decoded with the same machinery. A coder this library has no codec for, a
- * coder with more than one input (BCJ2), and encryption are
- * ::GARC_ERR_UNSUPPORTED - on the member's *data*, not on the walk, so an
- * archive with one such folder is still an archive to list.
+ * **What is read.** A folder is a graph of coders, built from its bind pairs:
+ * copy, LZMA, LZMA2, bzip2, deflate, deflate64, delta and the BCJ branch
+ * filters, each one stream in and one out; BCJ2, four in
+ * (sevenz_bcj2.c); and 7-Zip's AES (sevenz_aes.c), with the password from
+ * ::garc_set_password(). The header itself may be encoded (7-Zip's default),
+ * encrypted too, and is decoded with the same machinery; an encrypted one with
+ * no password yet leaves the archive open with nothing to walk. A coder this
+ * library has no codec for is ::GARC_ERR_UNSUPPORTED, and an AES folder with
+ * no password ::GARC_ERR_PASSWORD_REQUIRED - on the member's *data*, not on the
+ * walk, so an archive with one such folder is still an archive to list.
  *
  * **What is trusted.** Nothing in the header. Every count is bounded by the
  * bytes left to hold it before anything is allocated for it; every offset is
@@ -64,6 +67,7 @@
 #include <ghoti.io/archive/codec.h>
 #include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/compress/options.h>
+#include <ghoti.io/security/secret.h>
 #include <ghoti.io/cutil/allocator.h>
 #include <stdint.h>
 #include <string.h>
@@ -99,6 +103,9 @@ static const uint8_t SZ_SIGNATURE[GARC_SEVENZ_SIGNATURE_SIZE]
 
 /** Most streams one coder may name, in either direction. */
 #define SZ_MAX_CODER_STREAMS 32u
+
+/** Most streams one folder's decoders can be: every coder, and every packed slice. */
+#define SZ_MAX_CHAIN (SZ_MAX_CODERS + 2u * SZ_MAX_CODER_STREAMS)
 
 /** CRC-32 of a buffer, finalized: the value 7z stores. */
 static uint32_t sz_crc32(const uint8_t * data, size_t length) {
@@ -356,7 +363,7 @@ typedef struct {
 
 /** The decoders open for one folder, from the packed stream up to the top. */
 typedef struct {
-  GARC_Stream * s[SZ_MAX_CODERS + 1u]; ///< The streams, packed slice first.
+  GARC_Stream * s[SZ_MAX_CHAIN];       ///< The streams, each after its inputs.
   size_t n;                            ///< How many of @ref s are in use.
   gcomp_options_t * o[SZ_MAX_CODERS];  ///< The options each decoder was given.
   size_t no;                           ///< How many of @ref o are in use.
@@ -384,6 +391,26 @@ struct GARC_SevenZ {
   int crc_active;      ///< Whether the current member's bytes are being checksummed.
   uint32_t expect_crc; ///< The CRC-32 the current member must finish with.
   GARC_Buffer link;    ///< The current symlink's target, which is its data.
+  int folder_encrypted; ///< Whether the open folder has an AES coder.
+  GARC_SevenZ_Password password; ///< The password, when @ref have_password.
+  int have_password;   ///< Whether ::garc_set_password() has been called.
+  /**
+   * The encrypted header, still encoded, when it is waiting for a password.
+   * The archive opened, but there is nothing to walk until the password
+   * decodes this; ::garc_sevenz_next() says ::GARC_ERR_PASSWORD_REQUIRED.
+   */
+  uint8_t * locked_header;
+  size_t locked_len;   ///< Bytes of @ref locked_header.
+  /**
+   * A folder whose decoding failed in a way that leaves its members readable
+   * by name and not by data (a wrong password), or -1. Its later members get
+   * @ref failed_result without being decoded again, which would otherwise cost
+   * a decode from the folder's start for every one of them. A new password
+   * clears it.
+   */
+  int failed_folder;
+  int header_encrypted; ///< Whether the header was behind an AES coder.
+  GARC_Result failed_result; ///< What @ref failed_folder's members are refused with.
 };
 
 static void * sz_calloc(const GARC_Allocator * a, uint64_t count, size_t size) {
@@ -755,6 +782,33 @@ static int folder_main_out(const Streams * s, const Folder * f, uint32_t * out) 
   return 0;
 }
 
+/** Whether a folder has an AES coder, which changes what a decode failure means. */
+static int folder_encrypted(const Streams * s, const Folder * f) {
+  for (uint32_t i = 0; i < f->ncoders; ++i) {
+    const Coder * c = &s->coders[f->coder0 + i];
+    if (c->id_len == 4u && c->id[0] == 0x06u && c->id[1] == 0xF1u
+        && c->id[2] == 0x07u && c->id[3] == 0x01u) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/**
+ * What a failure to decode an encrypted folder is reported as.
+ *
+ * AES in 7z has no check value and no tag: a wrong key is seen only when the
+ * coder behind it fails on the garbage, or a CRC-32 disagrees. That is the same
+ * observation as damaged ciphertext, so it gets the status that names both.
+ */
+static GARC_Result sz_decode_failure(int encrypted, GARC_Result result) {
+  if (encrypted && (result == GARC_ERR_CORRUPT
+          || result == GARC_ERR_LIMIT_CODEC_BYTES)) {
+    return GARC_ERR_PASSWORD_OR_CORRUPT;
+  }
+  return result;
+}
+
 static uint64_t folder_unpack_size(const Streams * s, const Folder * f) {
   uint32_t out = 0;
   if (!folder_main_out(s, f, &out)) {
@@ -990,7 +1044,9 @@ typedef enum {
   SZM_DEFLATE64,   ///< Raw deflate64.
   SZM_DELTA,       ///< The delta filter.
   SZM_BCJ,         ///< A branch filter; the architecture is returned beside it.
-  SZM_UNSUPPORTED  ///< Anything else: BCJ2, PPMd, encryption, an unknown id.
+  SZM_BCJ2,        ///< BCJ2: four inputs, one output.
+  SZM_AES,         ///< 7-Zip's AES-256 with its SHA-256 key derivation.
+  SZM_UNSUPPORTED  ///< Anything else: PPMd, another cipher, an unknown id.
 } Sz_Kind;
 
 /** Map a coder id to what this library does with it. */
@@ -1017,184 +1073,305 @@ static Sz_Kind coder_kind(const Coder * c, const char ** arch) {
     case 0x09u: case 0x03030805u: *arch = "sparc"; return SZM_BCJ;
     case 0x0Au: *arch = "arm64"; return SZM_BCJ;
     case 0x0Bu: *arch = "riscv"; return SZM_BCJ;
+    case 0x0303011Bu: return SZM_BCJ2;
+    case 0x06F10701u: return SZM_AES;
     default: return SZM_UNSUPPORTED;
   }
 }
 
+/** A password, as the folder builder takes it. */
+typedef GARC_SevenZ_Password Sz_Password;
+
+/** What building one folder's decoders needs, and what it has built so far. */
+typedef struct {
+  const GARC_Allocator * a;   ///< For every stream and option set.
+  GARC_Stream * stream;       ///< The archive, which the packed slices read.
+  uint64_t base;              ///< Offset of the end of the start header.
+  uint64_t stream_size;       ///< The archive's size, when @ref have_size.
+  int have_size;              ///< Whether the archive reported a size.
+  const Streams * s;          ///< The tables the folder is in.
+  const Folder * f;           ///< The folder.
+  Sz_Password * password;     ///< The password, or NULL when none was set.
+  Chain * chain;              ///< Where every stream built is kept.
+  uint32_t in_base[SZ_MAX_CODERS];  ///< Each coder's first in-stream index.
+  uint32_t out_base[SZ_MAX_CODERS]; ///< Each coder's first out-stream index.
+  uint8_t busy[SZ_MAX_CODERS];      ///< Coders being built: a cycle check.
+} Graph;
+
+/** Keep a stream in the chain, which destroys it; or destroy it at once. */
+static GARC_Result graph_keep(Graph * g, GARC_Stream * stream) {
+  if (g->chain->n >= SZ_MAX_CHAIN) {
+    garc_stream_destroy(stream);
+    return GARC_ERR_INTERNAL;
+  }
+  g->chain->s[g->chain->n++] = stream;
+  return GARC_OK;
+}
+
+static GARC_Result graph_out(Graph * g, uint32_t out, GARC_Stream ** result);
+
+/** The stream that feeds folder-wide in-stream @p in. */
+static GARC_Result graph_in(Graph * g, uint32_t in, GARC_Stream ** result) {
+  const Folder * f = g->f;
+  for (uint32_t b = 0; b < f->nbind; ++b) {
+    if (g->s->binds[f->bind0 + b].in_index == in) {
+      return graph_out(g, g->s->binds[f->bind0 + b].out_index, result);
+    }
+  }
+  for (uint32_t k = 0; k < f->npacked; ++k) {
+    if (g->s->packed[f->packed0 + k] != in) {
+      continue;
+    }
+    const uint32_t pack = f->pack0 + k;
+    if (pack >= g->s->num_pack) {
+      return GARC_ERR_CORRUPT;
+    }
+    uint64_t at = g->s->pack_pos;
+    if (g->s->pack_offsets[pack] > UINT64_MAX - at) {
+      return GARC_ERR_CORRUPT;
+    }
+    at += g->s->pack_offsets[pack];
+    const uint64_t size = g->s->pack_sizes[pack];
+    if (at > UINT64_MAX - g->base || size > UINT64_MAX - (g->base + at)) {
+      return GARC_ERR_CORRUPT;
+    }
+    const uint64_t start = g->base + at;
+    if (g->have_size && start + size > g->stream_size) {
+      return GARC_ERR_CORRUPT;
+    }
+    GARC_Stream * slice = NULL;
+    GARC_Result r = garc_stream_create_slice_at_with_allocator(
+        g->stream, start, size, g->a, &slice);
+    if (r != GARC_OK) {
+      return r;
+    }
+    TRY(graph_keep(g, slice));
+    *result = slice;
+    return GARC_OK;
+  }
+  return GARC_ERR_CORRUPT; /* neither bound nor packed */
+}
+
+/** A coder with one input and one output, over @p inner. */
+static GARC_Result graph_simple(Graph * g, const Coder * coder, Sz_Kind kind,
+    const char * arch, uint64_t out_size, GARC_Stream * inner,
+    GARC_Stream ** result) {
+  const uint8_t * props = g->s->props ? g->s->props + coder->props_off : NULL;
+  if (kind == SZM_COPY) {
+    *result = inner;
+    return GARC_OK;
+  }
+  if (kind == SZM_AES) {
+    GARC_Stream * next = NULL;
+    TRY(garc_sevenz_aes_stream_create(g->a, inner, props, coder->props_len,
+        g->password, out_size, &next));
+    TRY(graph_keep(g, next));
+    *result = next;
+    return GARC_OK;
+  }
+  if (g->chain->no >= SZ_MAX_CODERS) {
+    return GARC_ERR_INTERNAL;
+  }
+  gcomp_options_t * o = NULL;
+  if (gcomp_options_create(&o) != GCOMP_OK) {
+    return GARC_ERR_OOM;
+  }
+  g->chain->o[g->chain->no++] = o;
+  const char * method = NULL;
+  GARC_Result r = GARC_OK;
+  switch (kind) {
+    case SZM_LZMA:
+      method = "lzma";
+      r = wrap_lzma(coder, props, out_size, o);
+      break;
+    case SZM_LZMA2:
+      method = "lzma2";
+      if (coder->props_len != 1u || props[0] > 40u) {
+        r = GARC_ERR_CORRUPT;
+      }
+      break;
+    case SZM_BZIP2:
+      method = "bzip2";
+      break;
+    case SZM_DEFLATE:
+      method = "deflate";
+      break;
+    case SZM_DEFLATE64:
+      method = "deflate64";
+      break;
+    case SZM_DELTA:
+      method = "delta";
+      if (coder->props_len > 1u) {
+        r = GARC_ERR_CORRUPT;
+      }
+      else if (gcomp_options_set_int64(o, "delta.distance",
+                   coder->props_len ? (int64_t)props[0] + 1 : 1)
+          != GCOMP_OK) {
+        r = GARC_ERR_OOM;
+      }
+      break;
+    case SZM_BCJ: {
+      method = "bcj";
+      if (gcomp_options_set_string(o, "bcj.arch", arch) != GCOMP_OK) {
+        r = GARC_ERR_OOM;
+      }
+      else if (coder->props_len == 4u) {
+        const uint64_t pc = (uint64_t)props[0] | ((uint64_t)props[1] << 8)
+            | ((uint64_t)props[2] << 16) | ((uint64_t)props[3] << 24);
+        if (gcomp_options_set_uint64(o, "bcj.start_offset", pc) != GCOMP_OK) {
+          r = GARC_ERR_OOM;
+        }
+      }
+      else if (coder->props_len != 0u) {
+        r = GARC_ERR_UNSUPPORTED;
+      }
+      break;
+    }
+    default:
+      r = GARC_ERR_INTERNAL;
+      break;
+  }
+  TRY(r);
+  // The filters take no `limits.*` keys and do not need them: they write
+  // exactly what they read, so the stage beneath is already capped.
+  if (kind != SZM_DELTA && kind != SZM_BCJ
+      && gcomp_options_set_uint64(o, "limits.max_output_bytes", out_size)
+          != GCOMP_OK) {
+    return GARC_ERR_OOM;
+  }
+  GARC_Stream * next = NULL;
+  TRY(garc_stream_create_decompress_with_allocator(
+      inner, method, o, g->a, &next));
+  TRY(graph_keep(g, next));
+  *result = next;
+  return GARC_OK;
+}
+
+/** The stream that produces folder-wide out-stream @p out. */
+static GARC_Result graph_out(Graph * g, uint32_t out, GARC_Stream ** result) {
+  const Folder * f = g->f;
+  uint32_t ci = UINT32_MAX;
+  for (uint32_t i = 0; i < f->ncoders; ++i) {
+    const Coder * c = &g->s->coders[f->coder0 + i];
+    if (out >= g->out_base[i] && out - g->out_base[i] < c->num_out) {
+      ci = i;
+      break;
+    }
+  }
+  if (ci == UINT32_MAX || g->busy[ci]) {
+    return GARC_ERR_CORRUPT; /* no such stream, or a cycle */
+  }
+  g->busy[ci] = 1u;
+  const Coder * coder = &g->s->coders[f->coder0 + ci];
+  const char * arch = NULL;
+  const Sz_Kind kind = coder_kind(coder, &arch);
+  const uint64_t out_size = g->s->unpack[f->unpack0 + out];
+  if (kind == SZM_BCJ2) {
+    GARC_Stream * in[4] = {NULL, NULL, NULL, NULL};
+    for (uint32_t j = 0; j < 4u; ++j) {
+      TRY(graph_in(g, g->in_base[ci] + j, &in[j]));
+    }
+    if (coder->props_len != 0u) {
+      return GARC_ERR_UNSUPPORTED;
+    }
+    GARC_Stream * next = NULL;
+    TRY(garc_sevenz_bcj2_stream_create(g->a, in, out_size, &next));
+    TRY(graph_keep(g, next));
+    *result = next;
+    return GARC_OK;
+  }
+  GARC_Stream * inner = NULL;
+  TRY(graph_in(g, g->in_base[ci], &inner));
+  return graph_simple(g, coder, kind, arch, out_size, inner, result);
+}
+
 /**
- * Build the decoder chain for one folder.
+ * Build the decoders for one folder.
  *
- * Only a straight chain is built: every coder one stream in and one out, one
- * packed stream, each coder's output bound to the next coder's input. Anything
- * else (BCJ2's four inputs) is ::GARC_ERR_UNSUPPORTED, decided here and not at
- * parse time so that the archive stays listable.
+ * A folder is a graph: each coder's inputs are either packed streams or another
+ * coder's output (a bind pair), and exactly one output is left unbound, which
+ * is the folder's. This builds that graph from the unbound output down,
+ * opening a positioned slice of the archive for every packed stream, so that
+ * BCJ2's four inputs can be read in whatever order it asks for them.
+ *
+ * What is refused, and when. Everything about the folder that makes it
+ * unreadable by this library is decided before anything is built, so that an
+ * archive with such a folder is still an archive to list: a coder this library
+ * has no codec for, or one with a stream count its method does not have, is
+ * ::GARC_ERR_UNSUPPORTED; an AES coder with no password set is
+ * ::GARC_ERR_PASSWORD_REQUIRED. A graph that is not a graph - an in-stream both
+ * bound and packed or neither, an out-stream bound twice, a cycle - is
+ * ::GARC_ERR_CORRUPT.
  */
 static GARC_Result chain_open(const GARC_Allocator * a, GARC_Stream * stream,
     uint64_t origin, uint64_t stream_size, int have_size, const Streams * s,
-    uint32_t fi, Chain * chain) {
+    uint32_t fi, Sz_Password * password, Chain * chain) {
   const Folder * f = &s->folders[fi];
-  if (f->npacked != 1u || f->nbind + 1u != f->ncoders
-      || f->nout != f->ncoders) {
-    return GARC_ERR_UNSUPPORTED;
-  }
+  Graph g;
+  memset(&g, 0, sizeof(g));
+  uint32_t total_in = 0;
+  uint32_t total_out = 0;
+  int needs_password = 0;
   for (uint32_t i = 0; i < f->ncoders; ++i) {
     const Coder * coder = &s->coders[f->coder0 + i];
-    if (coder->num_in != 1u || coder->num_out != 1u) {
-      return GARC_ERR_UNSUPPORTED;
-    }
-  }
-  /* Validate every coder before opening anything, so an unsupported one
-     is reported without a decoder having been built. */
-  for (uint32_t i = 0; i < f->ncoders; ++i) {
-    const char * arch = NULL;
-    if (coder_kind(&s->coders[f->coder0 + i], &arch) == SZM_UNSUPPORTED) {
-      return GARC_ERR_UNSUPPORTED;
-    }
-  }
-
-  const uint32_t pack = f->pack0;
-  if (pack >= s->num_pack) {
-    return GARC_ERR_CORRUPT;
-  }
-  const uint64_t base = origin + GARC_SEVENZ_START_SIZE;
-  uint64_t at = s->pack_pos;
-  if (s->pack_offsets[pack] > UINT64_MAX - at) {
-    return GARC_ERR_CORRUPT;
-  }
-  at += s->pack_offsets[pack];
-  const uint64_t size = s->pack_sizes[pack];
-  if (at > UINT64_MAX - base || size > UINT64_MAX - (base + at)) {
-    return GARC_ERR_CORRUPT;
-  }
-  const uint64_t start = base + at;
-  if (have_size && start + size > stream_size) {
-    return GARC_ERR_CORRUPT;
-  }
-  GARC_Result result = garc_stream_seek(stream, start);
-  if (result != GARC_OK) {
-    return result;
-  }
-  memset(chain, 0, sizeof(*chain));
-  result = garc_stream_create_slice_with_allocator(
-      stream, size, a, &chain->s[0]);
-  if (result != GARC_OK) {
-    return result;
-  }
-  chain->n = 1u;
-  chain->top = chain->s[0];
-
-  /* Walk from the packed stream's consumer to the unbound output. */
-  uint32_t cur = s->packed[f->packed0];
-  for (uint32_t step = 0; step < f->ncoders; ++step) {
-    if (cur >= f->ncoders) {
-      result = GARC_ERR_CORRUPT;
-      break;
-    }
-    const Coder * coder = &s->coders[f->coder0 + cur];
+    g.in_base[i] = total_in;
+    g.out_base[i] = total_out;
+    total_in += coder->num_in;
+    total_out += coder->num_out;
     const char * arch = NULL;
     const Sz_Kind kind = coder_kind(coder, &arch);
-    const uint8_t * props = s->props ? s->props + coder->props_off : NULL;
-    const uint64_t out_size = s->unpack[f->unpack0 + cur];
-    if (kind != SZM_COPY) {
-      gcomp_options_t * o = NULL;
-      if (gcomp_options_create(&o) != GCOMP_OK) {
-        result = GARC_ERR_OOM;
-        break;
-      }
-      chain->o[chain->no++] = o;
-      const char * method = NULL;
-      result = GARC_OK;
-      switch (kind) {
-        case SZM_LZMA:
-          method = "lzma";
-          result = wrap_lzma(coder, props, out_size, o);
-          break;
-        case SZM_LZMA2:
-          method = "lzma2";
-          if (coder->props_len != 1u || props[0] > 40u) {
-            result = GARC_ERR_CORRUPT;
-          }
-          break;
-        case SZM_BZIP2:
-          method = "bzip2";
-          break;
-        case SZM_DEFLATE:
-          method = "deflate";
-          break;
-        case SZM_DEFLATE64:
-          method = "deflate64";
-          break;
-        case SZM_DELTA:
-          method = "delta";
-          if (coder->props_len > 1u) {
-            result = GARC_ERR_CORRUPT;
-          }
-          else if (gcomp_options_set_int64(o, "delta.distance",
-                       coder->props_len ? (int64_t)props[0] + 1 : 1)
-              != GCOMP_OK) {
-            result = GARC_ERR_OOM;
-          }
-          break;
-        case SZM_BCJ: {
-          method = "bcj";
-          if (gcomp_options_set_string(o, "bcj.arch", arch) != GCOMP_OK) {
-            result = GARC_ERR_OOM;
-          }
-          else if (coder->props_len == 4u) {
-            const uint64_t pc = (uint64_t)props[0] | ((uint64_t)props[1] << 8)
-                | ((uint64_t)props[2] << 16) | ((uint64_t)props[3] << 24);
-            if (gcomp_options_set_uint64(o, "bcj.start_offset", pc)
-                != GCOMP_OK) {
-              result = GARC_ERR_OOM;
-            }
-          }
-          else if (coder->props_len != 0u) {
-            result = GARC_ERR_UNSUPPORTED;
-          }
-          break;
-        }
-        default:
-          result = GARC_ERR_INTERNAL;
-          break;
-      }
-      if (result != GARC_OK) {
-        break;
-      }
-      // The filters take no `limits.*` keys and do not need them: they write
-      // exactly what they read, so the stage beneath is already capped.
-      if (kind != SZM_DELTA && kind != SZM_BCJ
-          && gcomp_options_set_uint64(o, "limits.max_output_bytes", out_size)
-              != GCOMP_OK) {
-        result = GARC_ERR_OOM;
-        break;
-      }
-      GARC_Stream * next = NULL;
-      result = garc_stream_create_decompress_with_allocator(
-          chain->top, method, o, a, &next);
-      if (result != GARC_OK) {
-        break;
-      }
-      chain->s[chain->n++] = next;
-      chain->top = next;
+    const uint32_t want_in = kind == SZM_BCJ2 ? 4u : 1u;
+    if (kind == SZM_UNSUPPORTED || coder->num_in != want_in
+        || coder->num_out != 1u) {
+      return GARC_ERR_UNSUPPORTED;
     }
-    /* The coder consuming this one's output, if any. */
-    uint32_t following = UINT32_MAX;
-    for (uint32_t b = 0; b < f->nbind; ++b) {
-      if (s->binds[f->bind0 + b].out_index == cur) {
-        following = s->binds[f->bind0 + b].in_index;
-      }
-    }
-    if (following == UINT32_MAX) {
-      if (step + 1u != f->ncoders) {
-        result = GARC_ERR_CORRUPT;
-      }
-      break;
-    }
-    cur = following;
-    if (step + 1u == f->ncoders) {
-      result = GARC_ERR_CORRUPT; /* a cycle */
+    if (kind == SZM_AES) {
+      needs_password = 1;
     }
   }
+  if (total_out != f->nout || f->nbind + f->npacked != total_in) {
+    return GARC_ERR_CORRUPT;
+  }
+  /* Every in-stream fed exactly once, every out-stream consumed at most once. */
+  for (uint32_t in = 0; in < total_in; ++in) {
+    uint32_t feeds = 0;
+    for (uint32_t b = 0; b < f->nbind; ++b) {
+      feeds += s->binds[f->bind0 + b].in_index == in;
+    }
+    for (uint32_t k = 0; k < f->npacked; ++k) {
+      feeds += s->packed[f->packed0 + k] == in;
+    }
+    if (feeds != 1u) {
+      return GARC_ERR_CORRUPT;
+    }
+  }
+  for (uint32_t b = 0; b < f->nbind; ++b) {
+    for (uint32_t b2 = b + 1u; b2 < f->nbind; ++b2) {
+      if (s->binds[f->bind0 + b].out_index
+          == s->binds[f->bind0 + b2].out_index) {
+        return GARC_ERR_CORRUPT;
+      }
+    }
+  }
+  uint32_t top = 0;
+  if (!folder_main_out(s, f, &top)) {
+    return GARC_ERR_CORRUPT;
+  }
+  if (needs_password && !password) {
+    return GARC_ERR_PASSWORD_REQUIRED;
+  }
+
+  memset(chain, 0, sizeof(*chain));
+  g.a = a;
+  g.stream = stream;
+  g.base = origin + GARC_SEVENZ_START_SIZE;
+  g.stream_size = stream_size;
+  g.have_size = have_size;
+  g.s = s;
+  g.f = f;
+  g.password = password;
+  g.chain = chain;
+  GARC_Result result = graph_out(&g, top, &chain->top);
   if (result != GARC_OK) {
     chain_destroy(chain);
   }
@@ -1204,7 +1381,8 @@ static GARC_Result chain_open(const GARC_Allocator * a, GARC_Stream * stream,
 /** Decode a folder wholly into memory: used for an encoded header. */
 static GARC_Result folder_to_memory(const GARC_Allocator * a,
     GARC_Stream * stream, uint64_t origin, uint64_t stream_size, int have_size,
-    const Streams * s, uint32_t fi, uint8_t ** out, size_t * out_len) {
+    const Streams * s, uint32_t fi, Sz_Password * password, uint8_t ** out,
+    size_t * out_len) {
   const Folder * f = &s->folders[fi];
   const uint64_t size = folder_unpack_size(s, f);
   if (size > SZ_MAX_HEADER) {
@@ -1212,7 +1390,7 @@ static GARC_Result folder_to_memory(const GARC_Allocator * a,
   }
   Chain chain;
   GARC_Result result = chain_open(
-      a, stream, origin, stream_size, have_size, s, fi, &chain);
+      a, stream, origin, stream_size, have_size, s, fi, password, &chain);
   if (result != GARC_OK) {
     return result;
   }
@@ -1241,7 +1419,7 @@ static GARC_Result folder_to_memory(const GARC_Allocator * a,
   }
   if (result != GARC_OK) {
     gcu_allocator_free(a, buf);
-    return result;
+    return sz_decode_failure(folder_encrypted(s, f), result);
   }
   *out = buf;
   *out_len = (size_t)size;
@@ -1656,6 +1834,9 @@ GARC_Result garc_sevenz_locate_sfx(GARC_Archive * archive, uint64_t * out_offset
   return GARC_ERR_FORMAT;
 }
 
+static GARC_Result header_decode(GARC_Archive * archive, struct GARC_SevenZ * z,
+    uint8_t * buf, size_t len);
+
 GARC_Result garc_sevenz_open(GARC_Archive * archive) {
   const GARC_Allocator * a = archive->allocator;
   GARC_Stream * stream = archive->stream;
@@ -1666,6 +1847,7 @@ GARC_Result garc_sevenz_open(GARC_Archive * archive) {
   }
   archive->sevenz = z;
   z->open_folder = -1;
+  z->failed_folder = -1;
   // A self-extractor's stub, if one was found, is in front of the archive.
   z->origin = archive->start_offset + archive->sevenz_sfx;
   archive->peek_length = 0;
@@ -1727,7 +1909,27 @@ GARC_Result garc_sevenz_open(GARC_Archive * archive) {
   if (result == GARC_OK && sz_crc32(buf, len) != next_crc) {
     result = GARC_ERR_CORRUPT;
   }
+  if (result != GARC_OK) {
+    gcu_allocator_free(a, buf);
+    return result;
+  }
+  return header_decode(archive, z, buf, len);
+}
 
+/**
+ * Decode and parse a header, taking ownership of @p buf.
+ *
+ * An encoded header is decoded and looked at again, up to
+ * ::SZ_MAX_HEADER_DEPTH times, until a plain one is found and parsed. An
+ * encoded header behind an AES coder with no password set is not a failure:
+ * the archive is kept open with that header as ::GARC_SevenZ.locked_header,
+ * and ::garc_set_password() comes back here with it.
+ */
+static GARC_Result header_decode(GARC_Archive * archive, struct GARC_SevenZ * z,
+    uint8_t * buf, size_t len) {
+  const GARC_Allocator * a = archive->allocator;
+  GARC_Stream * stream = archive->stream;
+  GARC_Result result = GARC_OK;
   for (unsigned depth = 0; result == GARC_OK; ++depth) {
     Cur c = {buf, len, 0};
     uint8_t id = 0;
@@ -1754,11 +1956,21 @@ GARC_Result garc_sevenz_open(GARC_Archive * archive) {
     if (result == GARC_OK && !enc.num_folders) {
       result = GARC_ERR_CORRUPT;
     }
+    if (result == GARC_OK && folder_encrypted(&enc, &enc.folders[0])) {
+      z->header_encrypted = 1;
+    }
     if (result == GARC_OK) {
       result = folder_to_memory(a, stream, z->origin, z->stream_size,
-          z->have_size, &enc, 0, &decoded, &decoded_len);
+          z->have_size, &enc, 0, z->have_password ? &z->password : NULL,
+          &decoded, &decoded_len);
     }
     streams_free(a, &enc);
+    if (result == GARC_ERR_PASSWORD_REQUIRED && !z->locked_header) {
+      /* Listable once a password is set; nothing to walk until then. */
+      z->locked_header = buf;
+      z->locked_len = len;
+      return GARC_OK;
+    }
     gcu_allocator_free(a, buf);
     buf = decoded;
     len = decoded_len;
@@ -1820,6 +2032,25 @@ static GARC_Result discard(struct GARC_SevenZ * z, uint64_t n) {
   return GARC_OK;
 }
 
+/**
+ * Decide what a failure while decoding the open folder means.
+ *
+ * In an encrypted folder a decode failure is ::GARC_ERR_PASSWORD_OR_CORRUPT
+ * and does not end the walk: the folder is closed, remembered as failed, and
+ * ::GARC_OK returned so that the caller refuses the member's data and moves
+ * on. Anything else is returned as it was, as it always has been.
+ */
+static GARC_Result folder_failed(struct GARC_SevenZ * z, GARC_Result result) {
+  const GARC_Result meant = sz_decode_failure(z->folder_encrypted, result);
+  if (meant != GARC_ERR_PASSWORD_OR_CORRUPT) {
+    return result;
+  }
+  z->failed_folder = z->open_folder;
+  z->failed_result = meant;
+  close_folder(z);
+  return GARC_OK;
+}
+
 static void fill_time(GARC_Member * m, uint64_t ticks) {
   const uint64_t seconds = ticks / 10000000u;
   m->mtime_seconds = (int64_t)seconds - SZ_EPOCH_GAP;
@@ -1832,6 +2063,11 @@ GARC_Result garc_sevenz_next(GARC_Archive * archive) {
   const GARC_Allocator * a = archive->allocator;
   GARC_Member * m = &archive->member;
 
+  if (z->locked_header) {
+    /* The header is encrypted, and no password has decoded it. */
+    return GARC_ERR_PASSWORD_REQUIRED;
+  }
+
   /* Whatever the caller left unread of the last member is consumed so the
      folder's cursor is where the next member starts. */
   if (archive->data_remaining && z->open_folder >= 0) {
@@ -1839,7 +2075,10 @@ GARC_Result garc_sevenz_next(GARC_Archive * archive) {
     archive->data_remaining = 0;
     z->crc_active = 0;
     if (result != GARC_OK) {
-      return result;
+      result = folder_failed(z, result);
+      if (result != GARC_OK) {
+        return result;
+      }
     }
   }
   z->crc_active = 0;
@@ -1910,23 +2149,45 @@ GARC_Result garc_sevenz_next(GARC_Archive * archive) {
     if (z->folder_cursor >= z->main.num_folders) {
       return GARC_ERR_CORRUPT;
     }
-    if (z->open_folder != (int)z->folder_cursor) {
+    if (z->open_folder != (int)z->folder_cursor
+        && z->failed_folder == (int)z->folder_cursor) {
+      archive->data_refusal = z->failed_result;
+    }
+    else if (z->open_folder != (int)z->folder_cursor) {
       close_folder(z);
       const Folder * f = &z->main.folders[z->folder_cursor];
       z->folder_size = folder_unpack_size(&z->main, f);
       result = chain_open(a, archive->stream, z->origin, z->stream_size,
-          z->have_size, &z->main, z->folder_cursor, &z->chain);
-      if (result == GARC_ERR_UNSUPPORTED) {
+          z->have_size, &z->main, z->folder_cursor,
+          z->have_password ? &z->password : NULL, &z->chain);
+      if (result == GARC_ERR_UNSUPPORTED
+          || result == GARC_ERR_PASSWORD_REQUIRED) {
         /* The metadata is good; the data is not readable. */
-        archive->data_refusal = GARC_ERR_UNSUPPORTED;
+        archive->data_refusal = result;
         result = GARC_OK;
       }
       else if (result != GARC_OK) {
-        return result;
+        return sz_decode_failure(folder_encrypted(&z->main, f), result);
       }
       else {
         z->open_folder = (int)z->folder_cursor;
         z->folder_pos = 0;
+        z->folder_encrypted = folder_encrypted(&z->main, f);
+        /* A member that is not the folder's first, reached with the folder
+           closed - after a password was set mid-folder - starts past the
+           members before it. */
+        uint64_t skip = 0;
+        for (uint64_t k = f->sub0; k < file->sub; ++k) {
+          skip += z->main.sub_sizes[k];
+        }
+        result = discard(z, skip);
+        if (result != GARC_OK) {
+          result = folder_failed(z, result);
+          if (result != GARC_OK) {
+            return result;
+          }
+          archive->data_refusal = z->failed_result;
+        }
       }
     }
   }
@@ -1947,22 +2208,34 @@ GARC_Result garc_sevenz_next(GARC_Archive * archive) {
         size_t got = 0;
         result = folder_read(z, z->link.bytes + have, (size_t)size - have, &got);
         if (result != GARC_OK) {
-          return result;
+          break;
         }
         have += got;
       }
-      z->link.length = have;
-      z->link.bytes[have] = '\0';
-      if (z->main.sub_has_crc[file->sub]
+      int crc_ok = result == GARC_OK;
+      if (crc_ok && z->main.sub_has_crc[file->sub]
           && sz_crc32((const uint8_t *)z->link.bytes, have)
               != z->main.sub_crc[file->sub]) {
-        return GARC_ERR_CORRUPT;
+        result = GARC_ERR_CORRUPT;
+        crc_ok = 0;
       }
-      m->link_target = z->link.bytes;
-      m->link_target_length = have;
-      /* Consumed: there is nothing left to read for this member. */
-      m->size = 0;
-      size = 0;
+      if (!crc_ok) {
+        /* A wrong password reads as a target that fails its CRC-32. */
+        result = folder_failed(z, result);
+        if (result != GARC_OK) {
+          return result;
+        }
+        archive->data_refusal = z->failed_result;
+      }
+      else {
+        z->link.length = have;
+        z->link.bytes[have] = '\0';
+        m->link_target = z->link.bytes;
+        m->link_target_length = have;
+        /* Consumed: there is nothing left to read for this member. */
+        m->size = 0;
+        size = 0;
+      }
     }
   }
 
@@ -1985,6 +2258,22 @@ GARC_Result garc_sevenz_next(GARC_Archive * archive) {
   return GARC_OK;
 }
 
+/**
+ * A failure reading the current member's data, as the caller sees it.
+ *
+ * In an encrypted folder it is ::GARC_ERR_PASSWORD_OR_CORRUPT, and the folder
+ * is remembered as failed so that the members after this one are refused
+ * without being decoded again.
+ */
+static GARC_Result sz_read_failure(struct GARC_SevenZ * z, GARC_Result result) {
+  const GARC_Result meant = sz_decode_failure(z->folder_encrypted, result);
+  if (meant == GARC_ERR_PASSWORD_OR_CORRUPT && z->open_folder >= 0) {
+    z->failed_folder = z->open_folder;
+    z->failed_result = meant;
+  }
+  return meant;
+}
+
 GARC_Result garc_sevenz_read(GARC_Archive * archive, void * buffer,
     size_t capacity, size_t * out_read) {
   struct GARC_SevenZ * z = archive->sevenz;
@@ -1993,7 +2282,7 @@ GARC_Result garc_sevenz_read(GARC_Archive * archive, void * buffer,
     if (z->crc_active) {
       z->crc_active = 0;
       if (gcomp_crc32_finalize(z->crc) != z->expect_crc) {
-        return GARC_ERR_CORRUPT;
+        return sz_read_failure(z, GARC_ERR_CORRUPT);
       }
     }
     return GARC_OK;
@@ -2008,7 +2297,7 @@ GARC_Result garc_sevenz_read(GARC_Archive * archive, void * buffer,
   size_t got = 0;
   GARC_Result result = folder_read(z, buffer, want, &got);
   if (result != GARC_OK) {
-    return result;
+    return sz_read_failure(z, result);
   }
   if (z->crc_active) {
     z->crc = gcomp_crc32_update(z->crc, (const uint8_t *)buffer, got);
@@ -2024,6 +2313,15 @@ GARC_Result garc_sevenz_skip(GARC_Archive * archive) {
      which discards what is left. */
   z->crc_active = 0;
   return GARC_OK;
+}
+
+/** Wipe and free a password and its key. */
+static void password_wipe(const GARC_Allocator * a, GARC_SevenZ_Password * p) {
+  if (p->utf16) {
+    gsec_wipe(p->utf16, p->utf16_len);
+    gcu_allocator_free(a, p->utf16);
+  }
+  gsec_wipe(p, sizeof(*p));
 }
 
 void garc_sevenz_rewind(GARC_Archive * archive) {
@@ -2044,12 +2342,112 @@ void garc_sevenz_release(GARC_Archive * archive) {
     return;
   }
   chain_destroy(&z->chain);
+  password_wipe(a, &z->password);
+  gcu_allocator_free(a, z->locked_header);
   streams_free(a, &z->main);
   gcu_allocator_free(a, z->files);
   gcu_allocator_free(a, z->names);
   garc_buffer_free(a, &z->link);
   gcu_allocator_free(a, z);
   archive->sevenz = NULL;
+}
+
+int garc_sevenz_member_encrypted(const GARC_Archive * archive) {
+  const struct GARC_SevenZ * z = archive->sevenz;
+  if (!z) {
+    return 0;
+  }
+  if (z->header_encrypted || z->locked_header) {
+    return 1;
+  }
+  if (!z->next_file || z->next_file > z->num_files) {
+    return 0;
+  }
+  const File * file = &z->files[z->next_file - 1u];
+  if (file->flags & SZF_EMPTY_STREAM) {
+    return 0;
+  }
+  for (uint32_t i = 0; i < z->main.num_folders; ++i) {
+    const Folder * f = &z->main.folders[i];
+    if (file->sub >= f->sub0 && file->sub < f->sub0 + f->nsub) {
+      return folder_encrypted(&z->main, f);
+    }
+  }
+  return 0;
+}
+
+GARC_Result garc_sevenz_set_password(
+    GARC_Archive * archive, const void * password, size_t length) {
+  struct GARC_SevenZ * z = archive->sevenz;
+  const GARC_Allocator * a = archive->allocator;
+  if (!z) {
+    return GARC_ERR_INVALID;
+  }
+  /* UTF-8 to UTF-16LE: at most two code units, four bytes, per input byte. */
+  const uint8_t * in = (const uint8_t *)password;
+  if (length > SIZE_MAX / 4u - 1u) {
+    return GARC_ERR_INVALID;
+  }
+  uint8_t * utf16 = (uint8_t *)gcu_allocator_malloc(a, length * 4u + 1u);
+  if (!utf16) {
+    return GARC_ERR_OOM;
+  }
+  size_t n = 0;
+  for (size_t i = 0; i < length;) {
+    uint32_t cp = 0;
+    const size_t used = garc_sevenz_utf8_decode(in + i, length - i, &cp);
+    if (!used) {
+      gsec_wipe(utf16, length * 4u + 1u);
+      gcu_allocator_free(a, utf16);
+      return GARC_ERR_INVALID;
+    }
+    i += used;
+    if (cp >= 0x10000u) {
+      const uint32_t v = cp - 0x10000u;
+      const uint32_t hi = 0xD800u | (v >> 10);
+      const uint32_t lo = 0xDC00u | (v & 0x3FFu);
+      utf16[n++] = (uint8_t)hi;
+      utf16[n++] = (uint8_t)(hi >> 8);
+      utf16[n++] = (uint8_t)lo;
+      utf16[n++] = (uint8_t)(lo >> 8);
+    }
+    else {
+      utf16[n++] = (uint8_t)cp;
+      utf16[n++] = (uint8_t)(cp >> 8);
+    }
+  }
+  password_wipe(a, &z->password);
+  z->password.utf16 = utf16;
+  z->password.utf16_len = n;
+  z->password.rounds_cap = archive->limits.max_key_rounds;
+  z->have_password = 1;
+  /* A different password may read what the last one could not. */
+  z->failed_folder = -1;
+  if (!z->locked_header) {
+    return GARC_OK;
+  }
+  uint8_t * copy = (uint8_t *)gcu_allocator_malloc(a, z->locked_len);
+  if (!copy) {
+    return GARC_ERR_OOM;
+  }
+  memcpy(copy, z->locked_header, z->locked_len);
+  GARC_Result result = header_decode(archive, z, copy, z->locked_len);
+  if (result != GARC_OK) {
+    /* Keep the locked header for the next password; drop what parsed. */
+    streams_free(a, &z->main);
+    memset(&z->main, 0, sizeof(z->main));
+    gcu_allocator_free(a, z->files);
+    gcu_allocator_free(a, z->names);
+    z->files = NULL;
+    z->names = NULL;
+    z->num_files = 0;
+    z->names_len = 0;
+    return result;
+  }
+  gcu_allocator_free(a, z->locked_header);
+  z->locked_header = NULL;
+  z->locked_len = 0;
+  return GARC_OK;
 }
 
 void garc_sevenz_counts(
@@ -2100,6 +2498,11 @@ GARC_Result garc_sevenz_carry(const GARC_Archive * archive,
     return GARC_ERR_INVALID;
   }
   const struct GARC_SevenZ * z = archive->sevenz;
+  if (z->locked_header || z->header_encrypted) {
+    /* An append writes a plain header, which would publish the names the
+       archive's own header encrypted. */
+    return GARC_ERR_UNSUPPORTED;
+  }
   const Streams * s = &z->main;
   const GARC_Allocator * a = allocator;
   GARC_SevenZ_Carry * c

@@ -556,6 +556,13 @@ GARC_Result garc_fs_update_keep(GARC_Fs_Update * update) {
   }
   const uint32_t flags = garc_format(update->archive) == GARC_FORMAT_ZIP
       ? GARC_COPY_RAW : 0u;
+  // A 7z member is decoded and written again, and this writer does not
+  // encrypt: keeping an encrypted one would write it back in the clear, and
+  // keeping anything from behind an encrypted header would publish its name.
+  if (garc_format(update->archive) == GARC_FORMAT_SEVENZ
+      && garc_sevenz_member_encrypted(update->archive)) {
+    return GARC_ERR_UNSUPPORTED;
+  }
   return garc_writer_copy_member(update->writer, update->archive, NULL, flags);
 }
 

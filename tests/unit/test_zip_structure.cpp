@@ -1410,7 +1410,7 @@ TEST(ZipStructure, AReadFailureAtEveryStageIsReportedAsItself) {
         // read, and the cipher's read, seek and allocation arms would be in the
         // population without ever being reached - the failure this file's shapes()
         // comment is about, in a new costume.
-        garc_zip_set_password(archive, kPassword, sizeof(kPassword) - 1u);
+        garc_set_password(archive, kPassword, sizeof(kPassword) - 1u);
         const GARC_Member * member = nullptr;
         GARC_Result result;
         while ((result = garc_next(archive, &member)) == GARC_OK) {
@@ -1465,7 +1465,7 @@ GARC_Result sweep_walk(const std::vector<uint8_t> & bytes, size_t cap,
   GARC_Archive * archive = nullptr;
   GARC_Result result = garc_open(stream, nullptr, &archive);
   if (result == GARC_OK) {
-    garc_zip_set_password(archive, kPassword, sizeof(kPassword) - 1u);
+    garc_set_password(archive, kPassword, sizeof(kPassword) - 1u);
   }
   const GARC_Member * member = nullptr;
   while (result == GARC_OK && (result = garc_next(archive, &member)) == GARC_OK) {
@@ -1545,7 +1545,7 @@ TEST(ZipStructure, ASeekFailureAtEveryStageIsReportedAsItself) {
       GARC_Archive * archive = nullptr;
       const GARC_Result opened = garc_open(stream, nullptr, &archive);
       if (opened == GARC_OK) {
-        garc_zip_set_password(archive, kPassword, sizeof(kPassword) - 1u);
+        garc_set_password(archive, kPassword, sizeof(kPassword) - 1u);
         const GARC_Member * member = nullptr;
         GARC_Result result;
         while ((result = garc_next(archive, &member)) == GARC_OK) {
@@ -1906,7 +1906,7 @@ TEST(ZipStructure, AFailedAllocationIsReportedRatherThanCrashed) {
     const GARC_Result opened = garc_open_with_allocator(stream, nullptr,
         allocator.get(), &archive);
     if (opened == GARC_OK) {
-      garc_zip_set_password(archive, kPassword, sizeof(kPassword) - 1u);
+      garc_set_password(archive, kPassword, sizeof(kPassword) - 1u);
       const GARC_Member * member = nullptr;
       while (garc_next(archive, &member) == GARC_OK) {
         // Walking on whatever budget is left; the point is that a failure is a
@@ -1940,7 +1940,7 @@ TEST(ZipCrypto, ACheckByteFromTheCrcIsAccepted) {
       CheckByte::FromCrc);
   Built built(builder.build());
   ASSERT_EQ(built.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+  ASSERT_EQ(garc_set_password(built.archive(), kPassword,
                 sizeof(kPassword) - 1u),
       GARC_OK);
   const GARC_Member * member = nullptr;
@@ -1966,7 +1966,7 @@ TEST(ZipCrypto, TheDosTimeConventionNeedsTheDataDescriptorBit) {
       crc, CheckByte::FromDosTime);
   Built accepted(with.build());
   ASSERT_EQ(accepted.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(accepted.archive(), kPassword,
+  ASSERT_EQ(garc_set_password(accepted.archive(), kPassword,
                 sizeof(kPassword) - 1u),
       GARC_OK);
   const GARC_Member * member = nullptr;
@@ -1986,7 +1986,7 @@ TEST(ZipCrypto, TheDosTimeConventionNeedsTheDataDescriptorBit) {
   without.last().flags = 0x0001u; // Bit 3 cleared, everything else identical.
   Built refused(without.build());
   ASSERT_EQ(refused.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(refused.archive(), kPassword,
+  ASSERT_EQ(garc_set_password(refused.archive(), kPassword,
                 sizeof(kPassword) - 1u),
       GARC_OK);
   ASSERT_EQ(garc_next(refused.archive(), &member), GARC_OK);
@@ -2008,7 +2008,7 @@ TEST(ZipCrypto, AWrongCheckByteIsRejectedWithTheRightPassword) {
       CheckByte::Wrong);
   Built built(builder.build());
   ASSERT_EQ(built.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+  ASSERT_EQ(garc_set_password(built.archive(), kPassword,
                 sizeof(kPassword) - 1u),
       GARC_OK);
   const GARC_Member * member = nullptr;
@@ -2047,7 +2047,7 @@ TEST(ZipCrypto, AWrongCrcUnderARightCheckByteCannotBeAttributed) {
       static_cast<uint32_t>(plain.size()), lie, CheckByte::FromCrc);
   Built encrypted(sealed.build());
   ASSERT_EQ(encrypted.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(encrypted.archive(), kPassword,
+  ASSERT_EQ(garc_set_password(encrypted.archive(), kPassword,
                 sizeof(kPassword) - 1u),
       GARC_OK);
   ASSERT_EQ(garc_next(encrypted.archive(), &member), GARC_OK);
@@ -2070,7 +2070,7 @@ TEST(ZipCrypto, AMemberTooShortForItsEncryptionHeaderIsCorrupt) {
   builder.last().central_size = 4u;
   Built built(builder.build());
   ASSERT_EQ(built.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+  ASSERT_EQ(garc_set_password(built.archive(), kPassword,
                 sizeof(kPassword) - 1u),
       GARC_OK);
   EXPECT_EQ(built.walk(), GARC_ERR_CORRUPT);
@@ -2090,7 +2090,7 @@ TEST(ZipCrypto, AStoredMemberWhoseSizesDisagreeAboutTheHeaderIsCorrupt) {
   builder.last().central_compressed_size = static_cast<uint32_t>(plain.size());
   Built built(builder.build());
   ASSERT_EQ(built.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+  ASSERT_EQ(garc_set_password(built.archive(), kPassword,
                 sizeof(kPassword) - 1u),
       GARC_OK);
   EXPECT_EQ(built.walk(), GARC_ERR_CORRUPT);
@@ -2145,7 +2145,7 @@ TEST(ZipCrypto, TheWalkDoesNotDependOnThePassword) {
       Built built(bytes);
       ASSERT_EQ(built.open_result(), GARC_OK);
       if (password) {
-        ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+        ASSERT_EQ(garc_set_password(built.archive(), kPassword,
                       sizeof(kPassword) - 1u),
             GARC_OK);
       }
@@ -2178,7 +2178,7 @@ TEST(ZipCrypto, AnLzmaHeaderFailureAfterDecryptDoesNotStopTheWalk) {
     Built built(bytes);
     ASSERT_EQ(built.open_result(), GARC_OK);
     if (with_password) {
-      ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+      ASSERT_EQ(garc_set_password(built.archive(), kPassword,
                     sizeof(kPassword) - 1u),
           GARC_OK);
     }
@@ -2190,7 +2190,7 @@ TEST(ZipCrypto, AnLzmaHeaderFailureAfterDecryptDoesNotStopTheWalk) {
 
   Built with(bytes);
   ASSERT_EQ(with.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(with.archive(), kPassword,
+  ASSERT_EQ(garc_set_password(with.archive(), kPassword,
                 sizeof(kPassword) - 1u),
       GARC_OK);
   const GARC_Member * member = nullptr;
@@ -2304,7 +2304,7 @@ GARC_Result walk_with_hole(const std::vector<uint8_t> & bytes, size_t hole,
     return opened;
   }
   if (password) {
-    const GARC_Result set = garc_zip_set_password(
+    const GARC_Result set = garc_set_password(
         archive, kPassword, sizeof(kPassword) - 1u);
     if (set != GARC_OK) {
       garc_close(archive);
@@ -2486,7 +2486,7 @@ TEST(ZipCrypto, SkippingAnEncryptedMemberLeavesTheWalkIntact) {
       CheckByte::FromCrc);
   Built built(builder.build());
   ASSERT_EQ(built.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(built.archive(), kPassword,
+  ASSERT_EQ(garc_set_password(built.archive(), kPassword,
                 sizeof(kPassword) - 1u),
       GARC_OK);
   const GARC_Member * member = nullptr;

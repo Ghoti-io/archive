@@ -52,9 +52,9 @@ extern "C" {
  * A single code for every cap cannot distinguish an absent cap from a
  * defeated one, and cannot tell a test which cap fired - which makes the
  * limits untestable in exactly the way `notes/compress` records under
- * "absent cap and defeated cap return the same code". The cost is six
+ * "absent cap and defeated cap return the same code". The cost is seven
  * constants where the convention has one; the benefit is that a test can
- * assert *which*. Five of the six are ::GARC_Limits fields and the sixth,
+ * assert *which*. Six of the seven are ::GARC_Limits fields and the seventh,
  * ::GARC_ERR_LIMIT_CODEC_BYTES, is a cap held by `compress` - which is exactly
  * the case a shared code would have made indistinguishable, since raising a
  * cap in the wrong library changes nothing.
@@ -97,6 +97,7 @@ typedef enum {
   GARC_ERR_LIMIT_TOTAL_BYTES,  ///< ::GARC_Limits.max_total_bytes exceeded.
   GARC_ERR_LIMIT_NAME_BYTES,   ///< ::GARC_Limits.max_name_bytes exceeded.
   GARC_ERR_LIMIT_EXTRA_BYTES,  ///< ::GARC_Limits.max_extra_bytes exceeded.
+  GARC_ERR_LIMIT_KEY_ROUNDS,   ///< ::GARC_Limits.max_key_rounds exceeded.
   /**
    * A cap in the *codec's* options stopped a decompressing stream.
    *
@@ -118,7 +119,7 @@ typedef enum {
    * ::garc_read_member() and never from ::garc_next(): the member's name, size,
    * time and mode are readable and only its bytes are not.
    *
-   * See ::garc_zip_set_password().
+   * See ::garc_set_password().
    */
   GARC_ERR_PASSWORD_REQUIRED,
   /**
@@ -208,8 +209,8 @@ GARC_API int garc_result_is_error(GARC_Result result);
 /**
  * @brief Whether a result names one of the ::GARC_Limits caps.
  *
- * True for the six `GARC_ERR_LIMIT_*` codes and false for everything else.
- * Five of them name a ::GARC_Limits field and ::GARC_ERR_LIMIT_CODEC_BYTES
+ * True for the seven `GARC_ERR_LIMIT_*` codes and false for everything else.
+ * Six of them name a ::GARC_Limits field and ::GARC_ERR_LIMIT_CODEC_BYTES
  * names one in the codec's options, which is the same question to a caller
  * asking "was I stopped by a cap I could raise" and a different one to a caller
  * asking *which* - so this is for the first, and tests name the constant.
@@ -290,6 +291,16 @@ GARC_API int garc_result_is_limit(GARC_Result result);
  */
 #define GARC_DEFAULT_MAX_EXTRA_BYTES ((size_t)65536u)
 
+/**
+ * Default ::GARC_Limits.max_key_rounds: 2^26 SHA-256 rounds per archive.
+ *
+ * A 7z AES key costs 2^P rounds of its derivation, P being the archive's
+ * choice from 0 to 24. 7-Zip writes 19 and one salt for everything, so a whole
+ * archive is one key of 2^19; this allows 128 of those, or four at the most a
+ * 7z can ask, a few seconds of one core.
+ */
+#define GARC_DEFAULT_MAX_KEY_ROUNDS ((uint64_t)1u << 26)
+
 /** @} */
 
 /**
@@ -327,6 +338,21 @@ typedef struct GARC_Limits {
    * same argument @ref max_total_bytes makes against @ref max_member_bytes.
    */
   size_t max_extra_bytes;
+  /**
+   * Cap on the work spent deriving 7z AES keys for one archive, in rounds of
+   * 7-Zip's SHA-256 derivation.
+   *
+   * Each key a 7z asks for costs 2^P rounds, and P is the archive's to choose,
+   * up to 24 - about a second. A key is derived once per password, cycle power
+   * and salt and then reused, so this counts only new derivations; but an
+   * archive of many folders each with a salt of its own can ask for a new one
+   * every time, and without a cap that is a second of CPU per member that a
+   * hostile archive gets to spend. ::GARC_ERR_LIMIT_KEY_ROUNDS when a
+   * derivation would pass it. The count starts again when
+   * ::garc_set_password() is called. Zip's keys are not counted: WinZip AES
+   * fixes its own cost at 1000 rounds. Zero is no cap, as for the others.
+   */
+  uint64_t max_key_rounds;
 } GARC_Limits;
 
 /**

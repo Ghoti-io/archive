@@ -97,14 +97,22 @@ needs to know whether a password could ever help.
 **Reads 7z.** The header is at the end of the file, so a 7z needs a stream that
 seeks and is `GARC_ERR_NOT_SEEKABLE` on a pipe. The header is read whole (at most
 64 MiB), checked against its CRC, and decoded first when it is encoded, which is
-7-Zip's default. Folders that are a straight chain of coders are read: copy,
-LZMA, LZMA2, bzip2, deflate, deflate64, delta, and the x86, PowerPC, IA-64, ARM, ARM
-Thumb, SPARC, ARM64 and RISC-V branch filters, all through `compress`. **A solid
+7-Zip's default. A folder is a graph of coders and is read as one, whatever its
+bind pairs say: copy, LZMA, LZMA2, bzip2, deflate, deflate64, delta, and the x86,
+PowerPC, IA-64, ARM, ARM Thumb, SPARC, ARM64 and RISC-V branch filters, all
+through `compress`; **BCJ2**, whose four packed streams are read at once from the
+one archive stream; and **7-Zip's AES**, given a password with
+`garc_set_password()`. A header encrypted with `-mhe=on` opens, and the walk
+waits with `GARC_ERR_PASSWORD_REQUIRED` until a password decodes it. AES has no
+check value, so a wrong password is `GARC_ERR_PASSWORD_OR_CORRUPT` when what is
+behind the cipher fails, and the walk goes on. Key derivation costs 2^P rounds of
+SHA-256 at the archive's choice of P, up to 24, so `GARC_Limits.max_key_rounds`
+caps the work one archive can ask for. **A solid
 archive is one folder**, so reaching a later member means decoding the earlier
 ones and discarding them; that is paid when you advance, not up front. Every
 file's CRC-32 is checked when its last byte is read. What is refused, with
-`GARC_ERR_UNSUPPORTED` on the member's *data* and not on the walk, is BCJ2 (four
-input streams), PPMd, and encryption. Names are UTF-16 in the format
+`GARC_ERR_UNSUPPORTED` on the member's *data* and not on the walk, is PPMd and a
+coder id this library does not know. Names are UTF-16 in the format
 and are the one place this library converts text: they are reported as UTF-8,
 with a lone surrogate becoming U+FFFD. A time is a FILETIME and is reported with
 `GARC_TIME_FILETIME`; a Unix mode is read from the attribute word's high half
@@ -149,7 +157,7 @@ check-arcpio-writer` hands the writers' output to libarchive, tests the cpio wit
 **ZipCrypto is read and will never be written.** The traditional PKWARE cipher
 needs no cryptography library at all - it is three words mixed with CRC-32, which
 `compress` already has - and it is broken, which is a reason to read what exists in
-the world rather than a reason to refuse it. `garc_zip_set_password()` derives
+the world rather than a reason to refuse it. `garc_set_password()` derives
 those keys and also keeps the password, because a WinZip AES member's salt is not
 known until that member is reached. A wrong ZipCrypto password gets **three
 statuses and not one**: none supplied, rejected by the encryption header's single

@@ -62,7 +62,7 @@ std::vector<Entry> read_all(const std::string & path) {
     return found;
   }
   if (garc_format(archive) == GARC_FORMAT_ZIP) {
-    garc_zip_set_password(archive, "ghoti-password", 14);
+    garc_set_password(archive, "ghoti-password", 14);
   }
   const GARC_Member * member = nullptr;
   GARC_Result result;
@@ -534,14 +534,18 @@ TEST_F(FsUpdate, AppendingInPlaceToASevenZipWritesAfterItsPackedStreams) {
 
 TEST_F(FsUpdate, AppendingInPlaceToEverySevenZipFixtureKeepsWhatItHad) {
   // Archives 7-Zip wrote: encoded headers, folders of several coders (BCJ,
-  // BCJ2's four streams, delta), every method, a symlink. Their folders are
-  // carried into the new header as they were, so each reads as it did, its
-  // refusals included, with the new member after them.
+  // BCJ2's four streams, delta), every method, a symlink, and AES - the data
+  // encrypted, the header not - whose folders are carried without the
+  // password. Their folders are carried into the new header as they were, so
+  // each reads as it did, its refusals included, with the new member after
+  // them.
   size_t fixtures = 0;
   for (const char * name : {"arm64.7z", "arm.7z", "armt.7z", "basic.7z", "bcj2.7z",
-           "bcj.7z", "bzip2.7z", "copy.7z", "deflate64.7z", "deflate.7z", "delta.7z",
-           "ia64.7z", "lzma.7z", "nonsolid.7z", "plainhdr.7z", "ppc.7z", "riscv.7z",
-           "sparc.7z", "symlink.7z"}) {
+           "bcj2-copy.7z", "bcj2-mf.7z", "bcj.7z", "bzip2.7z", "copy.7z",
+           "deflate64.7z", "deflate.7z", "delta.7z", "ia64.7z", "lzma.7z",
+           "nonsolid.7z", "plainhdr.7z", "ppc.7z", "riscv.7z", "sparc.7z",
+           "symlink.7z", "aes.7z", "aes-nonsolid.7z", "aes-copy.7z",
+           "aes-bcj2.7z"}) {
     SCOPED_TRACE(name);
     const std::string source = read_file(std::string(GARC_TEST_DATA) + "/sevenz/" + name);
     ASSERT_FALSE(source.empty());
@@ -572,7 +576,53 @@ TEST_F(FsUpdate, AppendingInPlaceToEverySevenZipFixtureKeepsWhatItHad) {
     gcu_file_remove(at("x.7z").c_str());
     ++fixtures;
   }
-  EXPECT_EQ(fixtures, 19u);
+  EXPECT_EQ(fixtures, 25u);
+}
+
+TEST_F(FsUpdate, AnEncryptedSevenZipIsNeverWrittenBackInTheClear) {
+  // In place, a 7z whose header is encrypted is refused: the new header would
+  // be plain and name what the old one hid. Rewritten, a member is decoded and
+  // written again and this writer does not encrypt, so keeping an encrypted
+  // one is refused even when the caller has given the password.
+  for (const char * name : {"aes-header.7z", "aes.7z"}) {
+    SCOPED_TRACE(name);
+    const std::string source
+        = read_file(std::string(GARC_TEST_DATA) + "/sevenz/" + name);
+    ASSERT_FALSE(source.empty());
+    GARC_Sink * sink = nullptr;
+    ASSERT_EQ(garc_fs_sink_create(at("e.7z").c_str(), nullptr, nullptr,
+                  GARC_FS_NO_SYNC, &sink), GARC_OK);
+    ASSERT_EQ(garc_sink_write(sink, source.data(), source.size()), GARC_OK);
+    ASSERT_EQ(garc_sink_finish(sink), GARC_OK);
+    garc_sink_destroy(sink);
+
+    GARC_Fs_Update * update = nullptr;
+    if (std::string(name) == "aes-header.7z") {
+      EXPECT_EQ(garc_fs_update_begin(at("e.7z").c_str(), nullptr, nullptr,
+                    GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+          GARC_ERR_UNSUPPORTED);
+      EXPECT_EQ(update, nullptr);
+    }
+    ASSERT_EQ(garc_fs_update_begin(at("e.7z").c_str(), nullptr, nullptr,
+                  GARC_FS_NO_SYNC, &update),
+        GARC_OK);
+    const std::string password = "ghoti-p\xC3\xA4ss-\xF0\x9F\x98\x80";
+    GARC_Archive * archive = garc_fs_update_archive(update);
+    ASSERT_EQ(garc_set_password(archive, password.data(), password.size()),
+        GARC_OK);
+    const GARC_Member * member = nullptr;
+    size_t refused = 0;
+    while (garc_next(archive, &member) == GARC_OK) {
+      if (member->size) {
+        EXPECT_EQ(garc_fs_update_keep(update), GARC_ERR_UNSUPPORTED);
+        ++refused;
+      }
+    }
+    EXPECT_GT(refused, 0u);
+    garc_fs_update_destroy(update);
+    EXPECT_EQ(read_file(at("e.7z")), source);
+    gcu_file_remove(at("e.7z").c_str());
+  }
 }
 
 TEST_F(FsUpdate, AppendingInPlaceToAnEmptySevenZipGivesItAHeader) {

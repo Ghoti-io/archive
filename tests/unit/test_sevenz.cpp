@@ -26,7 +26,9 @@
 #include <gtest/gtest.h>
 
 #include "failing_allocator.h"
+#include "sevenz/sevenz_internal.h"
 #include "sevenz_builder.h"
+#include "sevenz_coders.h"
 #include "tar_manifest.h"
 #include "test_helpers.h"
 #include "portable.h"
@@ -82,6 +84,103 @@ std::vector<uint8_t> fixture(const std::string & name) {
   std::vector<uint8_t> bytes = read_fixture(data_path(name));
   EXPECT_FALSE(bytes.empty()) << "missing corpus file " << name;
   return bytes;
+}
+
+/** The password of the hand-built AES archives. */
+const std::string kBuiltPassword = "built-\xF0\x9F\x98\x80";
+
+/** x86-ish bytes: plenty of E8, E9 and 0F 8x, with small displacements. */
+std::string x86ish(uint32_t seed, size_t size) {
+  std::string out;
+  uint32_t x = seed;
+  auto next = [&x]() {
+    x = x * 1103515245u + 12345u;
+    return x >> 16;
+  };
+  while (out.size() < size) {
+    const uint32_t r = next() % 100u;
+    if (r < 6u) {
+      out.push_back(static_cast<char>(r < 3u ? 0xE8 : 0xE9));
+      const uint32_t rel = next() % 0x3000u;
+      for (unsigned k = 0; k < 4u; ++k) {
+        out.push_back(static_cast<char>((rel >> (8u * k)) & 0xFFu));
+      }
+    }
+    else if (r < 8u) {
+      out.push_back(0x0F);
+      out.push_back(static_cast<char>(0x80 + next() % 16u));
+    }
+    else {
+      out.push_back(static_cast<char>(next() & 0xFFu));
+    }
+  }
+  out.resize(size);
+  return out;
+}
+
+/** An AES-then-copy folder over @p plain, cycle power 0, a salt and a short IV. */
+std::string built_aes(const std::string & plain, const std::string & password) {
+  using namespace garctest;
+  const std::string salt("\x11\x22", 2);
+  const std::string iv("\x01\x02\x03", 3);
+  std::string iv16 = iv;
+  iv16.resize(16, '\0');
+  const std::string sealed
+      = sz_aes_encrypt(sz_aes_key(password, 0, salt), iv16, plain);
+  SzFolder f;
+  f.coders.push_back({sz_aes_id(), 1, sz_aes_props(0, salt, iv)});
+  f.coders.push_back({std::string(1, '\0'), 1, ""});
+  f.binds = {{1, 0}};
+  f.packed = {0};
+  f.unpack = {plain.size(), plain.size()};
+  return sz_folder_archive({sealed}, f, "secret.txt", plain);
+}
+
+/**
+ * BCJ2 with an AES coder in front of each of its four streams, which is the
+ * shape 7-Zip writes for `-mf=BCJ2` with a password; the header encrypted too
+ * when @p header is set.
+ */
+std::string built_aes_bcj2(const std::string & plain, bool header) {
+  using namespace garctest;
+  const Bcj2Streams b = bcj2_encode(plain, bcj2_seven_zip_rule);
+  const std::string key = sz_aes_key(kBuiltPassword, 0, "");
+  SzFolder f;
+  std::vector<std::string> packs;
+  const std::string * streams[4] = {&b.main, &b.call, &b.jump, &b.rc};
+  for (unsigned i = 0; i < 4u; ++i) {
+    const std::string iv(4, static_cast<char>('a' + i));
+    std::string iv16 = iv;
+    iv16.resize(16, '\0');
+    packs.push_back(sz_aes_encrypt(key, iv16, *streams[i]));
+    f.coders.push_back({sz_aes_id(), 1, sz_aes_props(0, "", iv)});
+    f.unpack.push_back(streams[i]->size());
+  }
+  f.coders.push_back({sz_bcj2_id(), 4, ""});
+  f.binds = {{4, 0}, {5, 1}, {6, 2}, {7, 3}};
+  f.packed = {0, 1, 2, 3};
+  f.unpack.push_back(plain.size());
+  return header ? sz_folder_archive(packs, f, "prog.bin", plain, key,
+                      std::string("\x5A", 1))
+                : sz_folder_archive(packs, f, "prog.bin", plain);
+}
+
+/** A fixture by name, or one of the hand-built archives the sweeps run over. */
+std::vector<uint8_t> sweep_input(const std::string & name) {
+  std::string built;
+  if (name == "built:aes") {
+    built = built_aes(std::string(3000, 'q') + "tail", kBuiltPassword);
+  }
+  else if (name == "built:aes-header") {
+    built = built_aes_bcj2(x86ish(5, 4000), true);
+  }
+  else if (name == "built:aes-bcj2") {
+    built = built_aes_bcj2(x86ish(6, 6000), false);
+  }
+  else {
+    return read_fixture(data_path(name));
+  }
+  return std::vector<uint8_t>(built.begin(), built.end());
 }
 
 /** Read a member to its end, keeping the status of the call that ends it. */
@@ -170,7 +269,14 @@ std::vector<Row> manifest() {
 
 const char * const kReadable[] = {"basic.7z", "copy.7z", "lzma.7z", "bzip2.7z",
     "deflate.7z", "deflate64.7z", "nonsolid.7z", "plainhdr.7z", "delta.7z", "bcj.7z",
-    "arm64.7z"};
+    "arm64.7z", "bcj2.7z", "bcj2-copy.7z", "bcj2-mf.7z"};
+
+/** The password of every AES fixture, as UTF-8: make_sevenz_corpus.py's PASSWORD. */
+const std::string kPassword = "ghoti-p\xC3\xA4ss-\xF0\x9F\x98\x80";
+
+/** The AES fixtures that hold the whole tree. */
+const char * const kEncrypted[] = {"aes.7z", "aes-header.7z", "aes-nonsolid.7z",
+    "aes-copy.7z", "aes-bcj2.7z"};
 
 } // namespace
 
@@ -258,30 +364,6 @@ TEST(SevenZ, ASymlinkIsASymlinkWithItsTarget) {
   EXPECT_EQ(seen["link-to-hello"].type, GARC_MEMBER_SYMLINK);
   EXPECT_EQ(seen["link-to-hello"].link, "hello.txt");
   EXPECT_EQ(seen["link-to-hello"].mode & 0170000u, 0120000u);
-}
-
-TEST(SevenZ, BcjTwoIsRefusedOnTheDataAndNotOnTheWalk) {
-  Opened opened(fixture("bcj2.7z"));
-  ASSERT_EQ(opened.open_result(), GARC_OK);
-  const GARC_Member * member = nullptr;
-  size_t unreadable = 0;
-  size_t listed = 0;
-  GARC_Result result;
-  while ((result = garc_next(opened.archive(), &member)) == GARC_OK) {
-    ++listed;
-    GARC_Result status = GARC_OK;
-    read_member(opened.archive(), &status);
-    if (member->size) {
-      EXPECT_EQ(status, GARC_ERR_UNSUPPORTED) << member->name;
-      ++unreadable;
-    }
-    else {
-      EXPECT_EQ(status, GARC_OK) << member->name;
-    }
-  }
-  EXPECT_EQ(result, GARC_END);
-  EXPECT_EQ(listed, 12u);
-  EXPECT_GT(unreadable, 0u);
 }
 
 TEST(SevenZ, ASolidArchiveSkipsToALaterMemberWithoutReadingTheEarlierOnes) {
@@ -428,7 +510,8 @@ namespace {
  * Returns the first failure anywhere, or GARC_OK; what was read in @p seen.
  */
 GARC_Result sweep_walk(const std::vector<uint8_t> & bytes, size_t cap,
-    size_t fail_after, size_t * reads, std::string * seen) {
+    size_t fail_after, size_t * reads, std::string * seen,
+    const std::string * password = nullptr) {
   BufferSource source(bytes.data(), bytes.size(), true, true);
   source.cap_reads(cap);
   if (fail_after != SIZE_MAX) {
@@ -440,6 +523,9 @@ GARC_Result sweep_walk(const std::vector<uint8_t> & bytes, size_t cap,
   }
   GARC_Archive * archive = nullptr;
   GARC_Result result = garc_open(stream, nullptr, &archive);
+  if (result == GARC_OK && password) {
+    result = garc_set_password(archive, password->data(), password->size());
+  }
   const GARC_Member * member = nullptr;
   while (result == GARC_OK && (result = garc_next(archive, &member)) == GARC_OK) {
     seen->append(member->name, member->name_length);
@@ -467,27 +553,38 @@ TEST(SevenZ, EveryReadFailureOfAWalkIsReportedAsTheFailure) {
   // clean walk makes, failed in turn, ends the walk with the stream's own
   // status - never with a verdict on bytes that were not read, and never with
   // a walk that went on as if they had been.
+  //
+  // The encrypted ones are walked with the password, and among them is an
+  // encrypted header (decoded inside garc_set_password()) and BCJ2 behind four
+  // AES coders, whose four packed streams are read interleaved through
+  // positioned slices of one archive stream.
   size_t points = 0;
   for (const char * name : {"basic.7z", "copy.7z", "nonsolid.7z", "plainhdr.7z",
-           "bzip2.7z", "deflate.7z", "delta.7z", "bcj.7z", "symlink.7z"}) {
-    const std::vector<uint8_t> bytes = read_fixture(data_path(name));
+           "bzip2.7z", "deflate.7z", "delta.7z", "bcj.7z", "symlink.7z",
+           "bcj2.7z", "bcj2-copy.7z", "built:aes", "built:aes-header",
+           "built:aes-bcj2"}) {
+    const std::vector<uint8_t> bytes = sweep_input(name);
     ASSERT_FALSE(bytes.empty()) << name;
+    const bool encrypted = std::string(name).rfind("built:aes", 0) == 0;
+    const std::string * password = encrypted ? &kBuiltPassword : nullptr;
     for (const size_t cap : {size_t(0), size_t(512)}) {
       SCOPED_TRACE(std::string(name) + " in reads of " + std::to_string(cap));
       size_t reads = 0;
       std::string want;
-      ASSERT_EQ(GARC_OK, sweep_walk(bytes, cap, SIZE_MAX, &reads, &want));
+      ASSERT_EQ(GARC_OK,
+          sweep_walk(bytes, cap, SIZE_MAX, &reads, &want, password));
       for (size_t k = 0; k < reads; ++k) {
         size_t unused = 0;
         std::string got;
-        EXPECT_EQ(GARC_ERR_IO, sweep_walk(bytes, cap, k, &unused, &got))
+        EXPECT_EQ(GARC_ERR_IO,
+            sweep_walk(bytes, cap, k, &unused, &got, password))
             << "failing read " << k << " of " << reads;
         ++points;
       }
     }
   }
-  // 530 when this was written.
-  EXPECT_GT(points, 500u) << points;
+  // 530 before BCJ2 and AES were added.
+  EXPECT_GT(points, 600u) << points;
 }
 
 TEST(SevenZ, EveryTruncationOfAnArchiveIsRefusedAtOpen) {
@@ -916,9 +1013,11 @@ TEST(SevenZSweep, EveryByteOfABuiltHeaderEditedIsAnswered) {
 
 TEST(SevenZSweep, EveryAllocationFailureInOpenAndWalkIsAnswered) {
   for (const char * name : {"basic.7z", "plainhdr.7z", "symlink.7z",
-           "nonsolid.7z", "bcj.7z", "delta.7z", "copy.7z"}) {
+           "nonsolid.7z", "bcj.7z", "delta.7z", "copy.7z", "bcj2-copy.7z",
+           "built:aes", "built:aes-header", "built:aes-bcj2"}) {
     SCOPED_TRACE(name);
-    const std::vector<uint8_t> bytes = fixture(name);
+    const std::vector<uint8_t> bytes = sweep_input(name);
+    const bool encrypted = std::string(name).rfind("built:aes", 0) == 0;
     bool finished = false;
     for (size_t budget = 0; budget < 4000u && !finished; ++budget) {
       garctest::FailingAllocator allocator(budget);
@@ -928,6 +1027,10 @@ TEST(SevenZSweep, EveryAllocationFailureInOpenAndWalkIsAnswered) {
       GARC_Archive * archive = nullptr;
       GARC_Result result = garc_open_with_allocator(
           stream, nullptr, allocator.get(), &archive);
+      if (result == GARC_OK && encrypted) {
+        result = garc_set_password(
+            archive, kBuiltPassword.data(), kBuiltPassword.size());
+      }
       if (result == GARC_OK) {
         const GARC_Member * member = nullptr;
         while ((result = garc_next(archive, &member)) == GARC_OK) {
@@ -1030,6 +1133,544 @@ TEST(SevenZBuilt, ASymlinkLongerThanTheNameCapKeepsItsBytesAsData) {
   GARC_Result status = GARC_OK;
   EXPECT_EQ(read_member(opened.archive(), &status), std::string(40, 't'));
   EXPECT_EQ(status, GARC_OK);
+}
+
+//-----------------------------------------------------------------------------
+// BCJ2
+//-----------------------------------------------------------------------------
+
+namespace {
+
+/** Decode four BCJ2 streams through the reader's own coder, @p chunk at a time. */
+GARC_Result bcj2_decode(const garctest::Bcj2Streams & in, uint64_t out_size,
+    std::string * out, size_t chunk = 4096) {
+  const std::string * parts[4] = {&in.main, &in.call, &in.jump, &in.rc};
+  GARC_Stream * streams[4] = {nullptr, nullptr, nullptr, nullptr};
+  for (unsigned i = 0; i < 4u; ++i) {
+    if (garc_stream_create_memory(parts[i]->data(), parts[i]->size(),
+            &streams[i])
+        != GARC_OK) {
+      return GARC_ERR_OOM;
+    }
+  }
+  GARC_Stream * bcj2 = nullptr;
+  GARC_Result result = garc_sevenz_bcj2_stream_create(
+      garc_allocator_default(), streams, out_size, &bcj2);
+  std::vector<char> buffer(chunk);
+  while (result == GARC_OK) {
+    size_t got = 0;
+    result = garc_stream_read(bcj2, buffer.data(), buffer.size(), &got);
+    if (result != GARC_OK || !got) {
+      break;
+    }
+    out->append(buffer.data(), got);
+  }
+  garc_stream_destroy(bcj2);
+  for (GARC_Stream * stream : streams) {
+    garc_stream_destroy(stream);
+  }
+  return result;
+}
+
+bool convert_all(size_t, int32_t) { return true; }
+bool convert_none(size_t, int32_t) { return false; }
+bool convert_odd(size_t at, int32_t) { return (at & 1u) != 0; }
+
+} // namespace
+
+TEST(SevenZBcj2, TheCoderUndoesEveryChoiceOfWhichBranchesToConvert) {
+  // The only freedom a BCJ2 encoder has is which candidates to convert; the
+  // decoder must undo any choice. All, none, alternate, and 7-Zip's rule.
+  for (uint32_t seed : {1u, 2u, 3u}) {
+    const std::string plain = x86ish(seed, 20000);
+    for (auto rule : {convert_all, convert_none, convert_odd,
+             garctest::bcj2_seven_zip_rule}) {
+      const garctest::Bcj2Streams s = garctest::bcj2_encode(plain, rule);
+      for (size_t chunk : {size_t(1), size_t(7), size_t(65536)}) {
+        std::string out;
+        EXPECT_EQ(bcj2_decode(s, plain.size(), &out, chunk), GARC_OK);
+        EXPECT_EQ(out, plain) << "seed " << seed << " chunk " << chunk;
+      }
+    }
+  }
+}
+
+TEST(SevenZBcj2, WithNoCandidatesTheRangeCoderIsFiveZeroBytes) {
+  const std::string plain = "no branches in here at all";
+  const garctest::Bcj2Streams s = garctest::bcj2_encode(plain, convert_all);
+  EXPECT_EQ(s.rc, std::string(5, '\0'));
+  EXPECT_TRUE(s.call.empty());
+  EXPECT_TRUE(s.jump.empty());
+  std::string out;
+  EXPECT_EQ(bcj2_decode(s, plain.size(), &out), GARC_OK);
+  EXPECT_EQ(out, plain);
+}
+
+TEST(SevenZBcj2, ATrailingCandidateStillHasItsBitDecoded) {
+  // An E8 as the last byte, and one with three bytes after it: neither can be
+  // converted, both have a 0 bit, and a decoder that skipped it would leave
+  // range-coder state behind and fail the end checks.
+  for (const std::string & plain : {std::string("abc\xE8", 4),
+           std::string("abc\xE8\x01\x02\x03", 7), std::string("\xE9", 1)}) {
+    const garctest::Bcj2Streams s = garctest::bcj2_encode(plain, convert_all);
+    std::string out;
+    EXPECT_EQ(bcj2_decode(s, plain.size(), &out), GARC_OK);
+    EXPECT_EQ(out, plain);
+  }
+}
+
+TEST(SevenZBcj2, AConvertedDisplacementEndingInZeroFMakesTheNext8xACandidate) {
+  // 7-Zip's limit keeps a converted displacement's top byte away from 0F, so
+  // its own archives never have this; the decoder must still treat a 0F that
+  // a conversion wrote as the first half of a 0F 8x.
+  std::string plain("\x90\xE8", 2);
+  plain += std::string("\x00\x00\x00\x0F", 4); // displacement 0x0F000000
+  plain += std::string("\x85\x10\x00\x00\x00", 5); // 8x, then its displacement
+  plain += std::string(32, '\x90');
+  const garctest::Bcj2Streams s = garctest::bcj2_encode(plain, convert_all);
+  ASSERT_EQ(s.call.size(), 4u);
+  ASSERT_EQ(s.jump.size(), 4u) << "the 85 after a written 0F was not converted";
+  std::string out;
+  EXPECT_EQ(bcj2_decode(s, plain.size(), &out), GARC_OK);
+  EXPECT_EQ(out, plain);
+}
+
+TEST(SevenZBcj2, AnythingLeftOverOrMissingIsCorrupt) {
+  const std::string plain = x86ish(9, 3000);
+  const garctest::Bcj2Streams good
+      = garctest::bcj2_encode(plain, garctest::bcj2_seven_zip_rule);
+  ASSERT_FALSE(good.call.empty());
+  ASSERT_FALSE(good.jump.empty());
+  {
+    std::string out;
+    ASSERT_EQ(bcj2_decode(good, plain.size(), &out), GARC_OK);
+  }
+  struct Case {
+    const char * what;
+    garctest::Bcj2Streams s;
+    uint64_t size;
+  };
+  std::vector<Case> cases;
+  auto with = [&](const char * what, auto edit, uint64_t size) {
+    garctest::Bcj2Streams s = good;
+    edit(s);
+    cases.push_back({what, s, size});
+  };
+  with("first range byte not zero",
+      [](garctest::Bcj2Streams & s) { s.rc[0] = 1; }, plain.size());
+  with("code all ones",
+      [](garctest::Bcj2Streams & s) { s.rc.replace(0, 5, "\x00\xFF\xFF\xFF\xFF", 5); },
+      plain.size());
+  with("a range byte too many",
+      [](garctest::Bcj2Streams & s) { s.rc.push_back(0); }, plain.size());
+  with("a range byte too few",
+      [](garctest::Bcj2Streams & s) { s.rc.pop_back(); }, plain.size());
+  with("the last range byte changed",
+      [](garctest::Bcj2Streams & s) { s.rc.back() ^= 0x01; }, plain.size());
+  with("a call short",
+      [](garctest::Bcj2Streams & s) { s.call.resize(s.call.size() - 4); },
+      plain.size());
+  with("a call too many",
+      [](garctest::Bcj2Streams & s) { s.call += std::string(4, '\0'); },
+      plain.size());
+  with("a jump too many",
+      [](garctest::Bcj2Streams & s) { s.jump += std::string(4, '\0'); },
+      plain.size());
+  with("main too long",
+      [](garctest::Bcj2Streams & s) { s.main.push_back('x'); }, plain.size());
+  with("declared size short", [](garctest::Bcj2Streams &) {}, plain.size() - 1);
+  with("declared size long", [](garctest::Bcj2Streams &) {}, plain.size() + 1);
+  with("no range coder at all",
+      [](garctest::Bcj2Streams & s) { s.rc.clear(); }, plain.size());
+  for (const Case & c : cases) {
+    std::string out;
+    EXPECT_EQ(bcj2_decode(c.s, c.size, &out), GARC_ERR_CORRUPT) << c.what;
+  }
+}
+
+TEST(SevenZBcj2, The7ZipRuleReproducesTheFourStreams7ZipWrote) {
+  // bcj2-copy.7z puts BCJ2's four streams behind Copy coders, so they sit raw
+  // in the pack area: MAIN, then the range coder, then CALL, then JUMP. The
+  // folder decodes to the files in order. Encoding that with 7-Zip's rule must
+  // give 7-Zip's bytes, which checks this file's encoder - and so the reading
+  // of the description that the decoder shares with it - against 7-Zip. It
+  // is also how the rule's per-file target limit, which the description left
+  // open, was found: without it the streams part 222 bytes into program.bin.
+  const std::vector<uint8_t> bytes = fixture("bcj2-copy.7z");
+  Opened opened(bytes);
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  std::string folder;
+  std::vector<std::pair<size_t, size_t>> files;
+  const GARC_Member * member = nullptr;
+  while (garc_next(opened.archive(), &member) == GARC_OK) {
+    GARC_Result status = GARC_OK;
+    const size_t start = folder.size();
+    folder += read_member(opened.archive(), &status);
+    ASSERT_EQ(status, GARC_OK);
+    if (folder.size() > start) {
+      files.push_back({start, folder.size() - start});
+    }
+  }
+  const garctest::Bcj2Streams s
+      = garctest::bcj2_encode(folder, garctest::bcj2_seven_zip_files(files));
+  EXPECT_FALSE(s.call.empty());
+  const std::string packed = s.main + s.rc + s.call + s.jump;
+  ASSERT_GE(bytes.size(), 32u + packed.size());
+  EXPECT_TRUE(std::equal(packed.begin(), packed.end(),
+      reinterpret_cast<const char *>(bytes.data()) + 32))
+      << "the encoder does not reproduce 7-Zip's BCJ2 streams";
+}
+
+//-----------------------------------------------------------------------------
+// AES
+//-----------------------------------------------------------------------------
+
+namespace {
+
+/** Walk with @p password set first (none when NULL). */
+GARC_Result walk_with(const std::vector<uint8_t> & bytes,
+    const std::string * password, std::map<std::string, Seen> * seen) {
+  Opened opened(bytes);
+  if (opened.open_result() != GARC_OK) {
+    return opened.open_result();
+  }
+  if (password) {
+    const GARC_Result set = garc_set_password(
+        opened.archive(), password->data(), password->size());
+    if (set != GARC_OK) {
+      return set;
+    }
+  }
+  return walk(opened.archive(), seen);
+}
+
+/** Check a walk against the manifest, every file's data with @p want_status. */
+void expect_manifest(const std::map<std::string, Seen> & seen,
+    GARC_Result want_status) {
+  const std::vector<Row> rows = manifest();
+  ASSERT_EQ(seen.size(), rows.size());
+  for (const Row & row : rows) {
+    SCOPED_TRACE(row.name);
+    ASSERT_EQ(seen.count(row.name), 1u);
+    const Seen & got = seen.at(row.name);
+    EXPECT_EQ(got.size, row.size);
+    if (row.type != "file") {
+      continue;
+    }
+    if (!row.size) {
+      EXPECT_EQ(got.status, GARC_OK);
+      continue;
+    }
+    EXPECT_EQ(got.status, want_status);
+    if (want_status == GARC_OK) {
+      EXPECT_EQ(garctest::sz_crc(got.data), row.crc);
+    }
+  }
+}
+
+} // namespace
+
+TEST(SevenZAes, EveryEncryptedArchiveHoldsWhatWasArchived) {
+  for (const char * name : kEncrypted) {
+    SCOPED_TRACE(name);
+    std::map<std::string, Seen> seen;
+    ASSERT_EQ(walk_with(fixture(name), &kPassword, &seen), GARC_END);
+    expect_manifest(seen, GARC_OK);
+  }
+}
+
+TEST(SevenZAes, WithoutAPasswordTheNamesAreReadAndTheDataIsNot) {
+  for (const char * name : {"aes.7z", "aes-nonsolid.7z", "aes-bcj2.7z"}) {
+    SCOPED_TRACE(name);
+    std::map<std::string, Seen> seen;
+    ASSERT_EQ(walk_with(fixture(name), nullptr, &seen), GARC_END);
+    expect_manifest(seen, GARC_ERR_PASSWORD_REQUIRED);
+  }
+}
+
+TEST(SevenZAes, AWrongPasswordIsPasswordOrCorruptAndTheWalkGoesOn) {
+  // No check value exists: LZMA2 fails on the garbage, the copy coder's bytes
+  // fail their CRC-32, and BCJ2's end checks fail. All three are one status.
+  const std::string wrong = "not the password";
+  for (const char * name : {"aes.7z", "aes-nonsolid.7z", "aes-copy.7z",
+           "aes-bcj2.7z"}) {
+    SCOPED_TRACE(name);
+    std::map<std::string, Seen> seen;
+    ASSERT_EQ(walk_with(fixture(name), &wrong, &seen), GARC_END);
+    expect_manifest(seen, GARC_ERR_PASSWORD_OR_CORRUPT);
+  }
+}
+
+TEST(SevenZAes, AnEncryptedHeaderWaitsForThePassword) {
+  for (const char * name : {"aes-header.7z", "aes-header-one.7z"}) {
+    SCOPED_TRACE(name);
+    Opened opened(fixture(name));
+    ASSERT_EQ(opened.open_result(), GARC_OK);
+    const GARC_Member * member = nullptr;
+    EXPECT_EQ(garc_next(opened.archive(), &member), GARC_ERR_PASSWORD_REQUIRED);
+    EXPECT_EQ(garc_member_count(opened.archive()), 0u);
+    const std::string wrong = "wrong";
+    EXPECT_EQ(garc_set_password(opened.archive(), wrong.data(), wrong.size()),
+        GARC_ERR_PASSWORD_OR_CORRUPT);
+    EXPECT_EQ(garc_next(opened.archive(), &member), GARC_ERR_PASSWORD_REQUIRED);
+    ASSERT_EQ(garc_set_password(
+                  opened.archive(), kPassword.data(), kPassword.size()),
+        GARC_OK);
+    std::map<std::string, Seen> seen;
+    ASSERT_EQ(walk(opened.archive(), &seen), GARC_END);
+    if (std::string(name) == "aes-header.7z") {
+      expect_manifest(seen, GARC_OK);
+    }
+    else {
+      ASSERT_EQ(seen.size(), 1u);
+      EXPECT_EQ(seen["hello.txt"].data, "hello, archive\n");
+      EXPECT_EQ(seen["hello.txt"].status, GARC_OK);
+    }
+  }
+}
+
+TEST(SevenZAes, APasswordSetPartWayThroughASolidFolderReadsTheRest) {
+  // The folder is not opened for the members before the password, so the one
+  // after it starts the folder at a later member and has to skip to it.
+  Opened opened(fixture("aes.7z"));
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  size_t refused = 0;
+  while (refused < 2u && garc_next(opened.archive(), &member) == GARC_OK) {
+    GARC_Result status = GARC_OK;
+    read_member(opened.archive(), &status);
+    if (member->size) {
+      EXPECT_EQ(status, GARC_ERR_PASSWORD_REQUIRED);
+      ++refused;
+    }
+  }
+  ASSERT_EQ(refused, 2u);
+  ASSERT_EQ(garc_set_password(
+                opened.archive(), kPassword.data(), kPassword.size()),
+      GARC_OK);
+  std::map<std::string, Seen> rest;
+  ASSERT_EQ(walk(opened.archive(), &rest), GARC_END);
+  const std::vector<Row> rows = manifest();
+  size_t checked = 0;
+  for (const Row & row : rows) {
+    if (rest.count(row.name) && row.type == "file" && row.size) {
+      EXPECT_EQ(rest[row.name].status, GARC_OK) << row.name;
+      EXPECT_EQ(garctest::sz_crc(rest[row.name].data), row.crc) << row.name;
+      ++checked;
+    }
+  }
+  EXPECT_GT(checked, 2u);
+}
+
+TEST(SevenZAes, APasswordThatIsNotUtf8IsInvalid) {
+  Opened opened(fixture("aes.7z"));
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  for (const std::string & bad : {std::string("\xFF", 1), std::string("\xC3", 1),
+           std::string("\xED\xA0\x80", 3), std::string("\xC0\x80", 2)}) {
+    EXPECT_EQ(garc_set_password(opened.archive(), bad.data(), bad.size()),
+        GARC_ERR_INVALID);
+  }
+  EXPECT_EQ(garc_set_password(opened.archive(), nullptr, 1), GARC_ERR_INVALID);
+  EXPECT_EQ(garc_set_password(nullptr, "x", 1), GARC_ERR_INVALID);
+}
+
+TEST(SevenZAes, APasswordOnAFormatWithoutEncryptionIsInvalid) {
+  Opened opened(fixture("copy.7z"));
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  EXPECT_EQ(garc_set_password(opened.archive(), "x", 1), GARC_OK)
+      << "a 7z without encryption still takes one";
+  const std::string tar(1024, '\0');
+  Opened empty_tar(tar);
+  if (empty_tar.open_result() == GARC_OK) {
+    EXPECT_EQ(garc_set_password(empty_tar.archive(), "x", 1), GARC_ERR_INVALID);
+  }
+}
+
+namespace {
+
+/** One file behind an AES coder alone, with the properties given. */
+std::string aes_alone(const std::string & props, const std::string & sealed,
+    const std::string & plain) {
+  garctest::SzFolder f;
+  f.coders.push_back({garctest::sz_aes_id(), 1, props});
+  f.packed = {0};
+  f.unpack = {plain.size()};
+  return garctest::sz_folder_archive({sealed}, f, "f", plain);
+}
+
+/** The one file's status and data, with kBuiltPassword. */
+GARC_Result read_one(const std::string & archive, std::string * data) {
+  std::map<std::string, Seen> seen;
+  const std::vector<uint8_t> bytes(archive.begin(), archive.end());
+  const GARC_Result walked = walk_with(bytes, &kBuiltPassword, &seen);
+  if (walked != GARC_END) {
+    return walked;
+  }
+  if (seen.size() != 1u) {
+    return GARC_ERR_INTERNAL;
+  }
+  *data = seen.begin()->second.data;
+  return seen.begin()->second.status;
+}
+
+} // namespace
+
+TEST(SevenZAes, EveryPropertyLayout7ZipAcceptsDecrypts) {
+  using namespace garctest;
+  const std::string plain = "seven-zip's aes, by its properties\n";
+  struct Case {
+    const char * what;
+    unsigned power;
+    std::string salt, iv;
+    bool given;        // props as written, rather than built from the three
+    std::string props;
+  };
+  const std::vector<Case> cases = {
+      {"no properties at all: power 0, no salt, a zero IV", 0, "", "", true,
+          std::string()},
+      {"one byte: power only", 0, "", "", true, std::string(1, '\x00')},
+      {"power 0 with salt and IV", 0, "\x01\x02", "\x0A\x0B\x0C", false, ""},
+      {"a sixteen-byte salt and IV", 0, std::string(16, 's'),
+          std::string(16, 'i'), false, ""},
+      {"power 63, no hash: salt then password", 63, "salt", "iv", false, ""},
+      {"power 63 with a salt that leaves room for little of the password", 63,
+          std::string(16, 'S'), std::string(16, 'v'), false, ""},
+      {"a clear flag with a non-zero nibble still counts", 0, "\x77\x88",
+          "\x99", true, std::string("\x40\x20\x77\x88\x99", 5)},
+  };
+  for (const Case & c : cases) {
+    SCOPED_TRACE(c.what);
+    const std::string props
+        = c.given ? c.props : sz_aes_props(c.power, c.salt, c.iv);
+    std::string iv16 = c.iv;
+    iv16.resize(16, '\0');
+    const std::string sealed
+        = sz_aes_encrypt(sz_aes_key(kBuiltPassword, c.power, c.salt), iv16, plain);
+    std::string data;
+    EXPECT_EQ(read_one(aes_alone(props, sealed, plain), &data), GARC_OK);
+    EXPECT_EQ(data, plain);
+  }
+}
+
+TEST(SevenZAes, PropertiesAndPowers7ZipRefusesAreUnsupported) {
+  using namespace garctest;
+  const std::string plain = "x";
+  const std::string sealed = std::string(16, '\0');
+  for (const std::string & props : {std::string("\x19", 1), std::string("\x3E", 1),
+           sz_aes_props(25, "", std::string(16, 'i')),
+           sz_aes_props(62, "", std::string(16, 'i')),
+           std::string("\x05\x00", 2), std::string("\x40\x0F\x01\x02", 4),
+           sz_aes_props(0, "ab", "cd") + "x"}) {
+    std::string data;
+    EXPECT_EQ(read_one(aes_alone(props, sealed, plain), &data),
+        GARC_ERR_UNSUPPORTED);
+  }
+}
+
+TEST(SevenZAes, TheCiphertextMustCoverTheDataInWholeBlocks) {
+  using namespace garctest;
+  const std::string plain(38, 'p');
+  const std::string iv(16, 'v');
+  const std::string props = sz_aes_props(0, "", iv);
+  const std::string sealed
+      = sz_aes_encrypt(sz_aes_key(kBuiltPassword, 0, ""), iv, plain);
+  ASSERT_EQ(sealed.size(), 48u);
+  std::string data;
+  EXPECT_EQ(read_one(aes_alone(props, sealed, plain), &data), GARC_OK);
+  EXPECT_EQ(data, plain);
+  // A whole block more is accepted, as 7-Zip accepts it.
+  EXPECT_EQ(read_one(aes_alone(props, sealed + std::string(16, 'z'), plain), &data),
+      GARC_OK);
+  EXPECT_EQ(data, plain);
+  // A block short, part of a block short, or part of a block over are not.
+  for (size_t size : {size_t(32), size_t(40), size_t(47), size_t(49), size_t(56)}) {
+    std::string cut = (sealed + std::string(16, 'z')).substr(0, size);
+    EXPECT_EQ(read_one(aes_alone(props, cut, plain), &data),
+        GARC_ERR_PASSWORD_OR_CORRUPT)
+        << size;
+  }
+}
+
+TEST(SevenZAes, AnEmptyPasswordIsAPassword) {
+  using namespace garctest;
+  const std::string plain = "empty password";
+  const std::string iv(16, '1');
+  const std::string sealed = sz_aes_encrypt(sz_aes_key("", 0, ""), iv, plain);
+  const std::string archive = aes_alone(sz_aes_props(0, "", iv), sealed, plain);
+  const std::vector<uint8_t> bytes(archive.begin(), archive.end());
+  const std::string empty;
+  std::map<std::string, Seen> seen;
+  ASSERT_EQ(walk_with(bytes, &empty, &seen), GARC_END);
+  EXPECT_EQ(seen["f"].status, GARC_OK);
+  EXPECT_EQ(seen["f"].data, plain);
+  seen.clear();
+  ASSERT_EQ(walk_with(bytes, nullptr, &seen), GARC_END);
+  EXPECT_EQ(seen["f"].status, GARC_ERR_PASSWORD_REQUIRED);
+}
+
+TEST(SevenZAes, KeyDerivationStopsAtItsCapAndCountsOnlyNewKeys) {
+  // Power 10 is 1024 rounds. A cap of 1023 refuses the first key; 1024 allows
+  // it; and reading the member twice (a rewind) does not derive it twice.
+  using namespace garctest;
+  const std::string plain = "capped";
+  const std::string iv(16, 'c');
+  const std::string sealed
+      = sz_aes_encrypt(sz_aes_key(kBuiltPassword, 10, "s"), iv, plain);
+  const std::string archive = aes_alone(sz_aes_props(10, "s", iv), sealed, plain);
+  for (uint64_t cap : {uint64_t(1023), uint64_t(1024), uint64_t(0)}) {
+    SCOPED_TRACE(cap);
+    GARC_Limits limits;
+    garc_limits_default(&limits);
+    limits.max_key_rounds = cap;
+    Opened opened(archive, &limits);
+    ASSERT_EQ(opened.open_result(), GARC_OK);
+    ASSERT_EQ(garc_set_password(opened.archive(), kBuiltPassword.data(),
+                  kBuiltPassword.size()),
+        GARC_OK);
+    for (int pass = 0; pass < 2; ++pass) {
+      const GARC_Member * member = nullptr;
+      if (pass) {
+        ASSERT_EQ(garc_find(opened.archive(), "f", 1, &member), GARC_OK);
+      }
+      else {
+        const GARC_Result next = garc_next(opened.archive(), &member);
+        if (cap == 1023u) {
+          EXPECT_EQ(next, GARC_ERR_LIMIT_KEY_ROUNDS);
+          break;
+        }
+        ASSERT_EQ(next, GARC_OK);
+      }
+      GARC_Result status = GARC_OK;
+      EXPECT_EQ(read_member(opened.archive(), &status), plain);
+      EXPECT_EQ(status, GARC_OK);
+    }
+  }
+}
+
+TEST(SevenZAes, BuiltArchivesWithTheHeaderAndBcj2EncryptedRead) {
+  for (bool header : {false, true}) {
+    SCOPED_TRACE(header ? "header encrypted" : "header plain");
+    const std::string plain = x86ish(header ? 21u : 22u, 9000);
+    const std::string archive = built_aes_bcj2(plain, header);
+    std::string data;
+    EXPECT_EQ(read_one(archive, &data), GARC_OK);
+    EXPECT_TRUE(data == plain) << data.size() << " bytes of " << plain.size();
+  }
+}
+
+TEST(SevenZAes, AnAppendToAnArchiveWhoseHeaderIsEncryptedIsRefused) {
+  // The append writes a plain header, which would publish the names the
+  // archive encrypted. Without a password the tables are not even known.
+  Opened opened(fixture("aes-header.7z"));
+  ASSERT_EQ(opened.open_result(), GARC_OK);
+  GARC_SevenZ_Carry * carry = nullptr;
+  EXPECT_EQ(garc_sevenz_carry(opened.archive(), garc_allocator_default(), &carry),
+      GARC_ERR_UNSUPPORTED);
+  ASSERT_EQ(garc_set_password(opened.archive(), kPassword.data(), kPassword.size()),
+      GARC_OK);
+  EXPECT_EQ(garc_sevenz_carry(opened.archive(), garc_allocator_default(), &carry),
+      GARC_ERR_UNSUPPORTED);
+  EXPECT_EQ(carry, nullptr);
 }
 
 int main(int argc, char ** argv) {

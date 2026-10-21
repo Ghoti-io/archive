@@ -1994,14 +1994,8 @@ uint32_t garc_zip_member_external_attributes(const GARC_Archive * archive) {
   return zip ? zip->external_attributes : 0u;
 }
 
-GARC_Result garc_zip_set_password(
+GARC_Result garc_zip_password_set(
     GARC_Archive * archive, const void * password, size_t length) {
-  if (!archive || archive->format != GARC_FORMAT_ZIP) {
-    return GARC_ERR_INVALID;
-  }
-  if (!password && length) {
-    return GARC_ERR_INVALID;
-  }
   GARC_Zip_State * zip = &archive->zip;
   uint8_t * copy = NULL;
   if (length) {

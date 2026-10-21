@@ -44,7 +44,7 @@
  * Three things about the shape of this file, each of which could have gone the
  * other way:
  *
- * **The keys are derived at ::garc_zip_set_password().** The three words after
+ * **The keys are derived at ::garc_set_password().** The three words after
  * the password has been mixed in are all any ZipCrypto member needs. The
  * password itself is kept beside them, because a WinZip AES member has its own
  * salt and cannot be derived until that salt is read; that copy lives in the

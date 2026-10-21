@@ -105,7 +105,7 @@
  * a password would help.
  *
  * **A password is set on the archive. ZipCrypto is read and never written.
- * WinZip AES is read and written.** ::garc_zip_set_password() decrypts the
+ * WinZip AES is read and written.** ::garc_set_password() decrypts the
  * traditional PKWARE cipher, which is broken - about a dozen known plaintext
  * bytes recover its keys - and is still what a great many archives in the
  * world use. The same call keeps the password, because each WinZip AES member
@@ -339,59 +339,6 @@ GARC_API uint32_t garc_zip_member_external_attributes(
  */
 GARC_API GARC_Zip_Encryption garc_zip_member_encryption(
     const GARC_Archive * archive);
-
-/**
- * @brief Give the archive a password, for members that are encrypted.
- *
- * **ZipCrypto is read rather than trusted, and WinZip AES is read.** The
- * traditional PKWARE cipher is keyed by three 32-bit words derived from these
- * bytes at this call. AES cannot be: each member has its own salt, so the
- * password is copied and wiped when the archive is closed. It takes a length
- * rather than a string, and an empty password is a legitimate argument,
- * distinct from never having called this. ::garc_zip_member_encryption() says
- * which scheme a member uses, and it can be asked before this is called.
- *
- * **The metadata is readable without a password and is not affected by a wrong
- * one.** So this changes nothing about walking the archive; it changes only what
- * ::garc_read_member() can do with an encrypted member, and it may be called at
- * any point in a walk. Calling it again replaces the password, which is how a
- * caller tries a second one after ::GARC_ERR_PASSWORD_REJECTED.
- *
- * Three statuses can then come back from ::garc_read_member(), and they are three
- * because the cipher makes them distinguishable to different degrees:
- *
- * - ::GARC_ERR_PASSWORD_REQUIRED - no password was set. Unambiguous.
- * - ::GARC_ERR_PASSWORD_REJECTED - the encryption header's single check byte
- *   disagreed, before any data was read. Catches 255 wrong passwords in 256; the
- *   only other cause is a corrupt encryption header.
- * - ::GARC_ERR_PASSWORD_OR_CORRUPT - ZipCrypto's CRC-32 disagreed after the
- *   check byte agreed, a WinZip AES HMAC disagreed after the 2-byte verifier
- *   agreed, or an encrypted LZMA member's codec header did not parse or ran
- *   out. The header is read from the decrypting stream, so a wrong password
- *   that slipped the check byte, a damaged header, and a stream that ends
- *   inside a header the sizes said was there are the same observation, and
- *   it is answered from ::garc_read_member() so the walk continues. An I/O
- *   error while reading the header still fails the walk, and that read
- *   happens only after a password has been accepted.
- *   **A 16-bit verifier can pass for a wrong password, once in 65536**, and
- *   ZipCrypto has no tag at all, so a wrong password and a damaged member are
- *   the same observation. The status names both rather than guessing. AE-2
- *   does not treat a stored CRC of 0 as this failure; AE-1 still checks the
- *   CRC, and a mismatch after a matching HMAC is damage to the plaintext
- *   (::GARC_ERR_CORRUPT).
- *
- * **Writing ZipCrypto is refused permanently**, and not for want of code: no
- * option name makes shipping a cipher known to be broken honest. A password on
- * a zip writer produces WinZip AES.
- *
- * @param archive The archive.
- * @param password The password bytes. May be NULL only when @p length is 0.
- * @param length Its length in bytes.
- * @return ::GARC_OK, or ::GARC_ERR_INVALID for a NULL archive, an archive that
- *   is not a zip, or a NULL @p password with a non-zero @p length.
- */
-GARC_API GARC_Result garc_zip_set_password(
-    GARC_Archive * archive, const void * password, size_t length);
 
 /**
  * @brief How many bytes of extra field the central directory gave this member.

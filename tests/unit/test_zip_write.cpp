@@ -199,7 +199,7 @@ public:
       return;
     }
     if (password) {
-      if (garc_zip_set_password(archive_, password, password_length)
+      if (garc_set_password(archive_, password, password_length)
           != GARC_OK) {
         return;
       }
@@ -2339,7 +2339,7 @@ TEST(ZipWrite, AShortAesFramingIsCorruptBeforeThePasswordIsAsked) {
     GARC_Archive * archive = nullptr;
     ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
     if (with_password) {
-      ASSERT_EQ(garc_zip_set_password(archive, kAesPassword,
+      ASSERT_EQ(garc_set_password(archive, kAesPassword,
                     std::strlen(kAesPassword)),
           GARC_OK);
     }
@@ -2397,7 +2397,7 @@ void expect_aes_read_unsupported(
   GARC_Archive * archive = nullptr;
   ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
   if (password) {
-    ASSERT_EQ(garc_zip_set_password(
+    ASSERT_EQ(garc_set_password(
                   archive, kAesPassword, std::strlen(kAesPassword)),
         GARC_OK);
   }

@@ -299,6 +299,8 @@ typedef struct {
   const GARC_Allocator * allocator; ///< For this state.
   GARC_Stream * inner;              ///< Borrowed.
   uint64_t remaining;               ///< Bytes of the view not yet read.
+  int positioned;                   ///< Whether @ref at is kept and sought.
+  uint64_t at;                      ///< The next byte's offset in `inner`.
 } Stream_Slice;
 
 static GARC_Result stream_slice_read(
@@ -315,12 +317,21 @@ static GARC_Result stream_slice_read(
   if ((uint64_t)want > slice->remaining) {
     want = (size_t)slice->remaining;
   }
+  // A positioned slice shares `inner` with others read in turn (a 7z folder's
+  // packed streams), so it puts `inner` back where this view left off.
+  if (slice->positioned && slice->inner->pos != slice->at) {
+    GARC_Result sought = garc_stream_seek(slice->inner, slice->at);
+    if (sought != GARC_OK) {
+      return sought;
+    }
+  }
   size_t got = 0;
   GARC_Result result = garc_stream_read(slice->inner, buffer, want, &got);
   if (result != GARC_OK) {
     return result;
   }
   slice->remaining -= (uint64_t)got;
+  slice->at += (uint64_t)got;
   *out_read = got;
   return GARC_OK;
 }
@@ -332,8 +343,8 @@ static void stream_slice_destroy(GARC_Stream * stream) {
   gcu_allocator_free(slice->allocator, slice);
 }
 
-GARC_Result garc_stream_create_slice_with_allocator(GARC_Stream * inner,
-    uint64_t length, const GARC_Allocator * allocator,
+static GARC_Result slice_create(GARC_Stream * inner, int positioned,
+    uint64_t offset, uint64_t length, const GARC_Allocator * allocator,
     GARC_Stream ** out_stream) {
   if (!inner || !out_stream) {
     return GARC_ERR_INVALID;
@@ -350,6 +361,8 @@ GARC_Result garc_stream_create_slice_with_allocator(GARC_Stream * inner,
   slice->allocator = allocator;
   slice->inner = inner;
   slice->remaining = length;
+  slice->positioned = positioned;
+  slice->at = offset;
 
   GARC_Stream_Callbacks callbacks;
   memset(&callbacks, 0, sizeof(callbacks));
@@ -367,6 +380,18 @@ GARC_Result garc_stream_create_slice_with_allocator(GARC_Stream * inner,
 
   *out_stream = stream;
   return GARC_OK;
+}
+
+GARC_Result garc_stream_create_slice_with_allocator(GARC_Stream * inner,
+    uint64_t length, const GARC_Allocator * allocator,
+    GARC_Stream ** out_stream) {
+  return slice_create(inner, 0, 0, length, allocator, out_stream);
+}
+
+GARC_Result garc_stream_create_slice_at_with_allocator(GARC_Stream * inner,
+    uint64_t offset, uint64_t length, const GARC_Allocator * allocator,
+    GARC_Stream ** out_stream) {
+  return slice_create(inner, 1, offset, length, allocator, out_stream);
 }
 
 void garc_stream_destroy(GARC_Stream * stream) {

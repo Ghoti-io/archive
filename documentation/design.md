@@ -629,7 +629,8 @@ never written. WinZip AES is read and written, and `security` is a dependency of
 this library for that, with no feature gate. "Unsupported" alone cannot tell a
 caller which they are looking at, nor whether a password could ever help. A
 member's metadata is in the clear in both schemes, at every password strength -
-zip cannot hide which files exist, and 7z's encrypted header can. AES wraps the
+zip cannot hide which files exist, and 7z's encrypted header can (7z's AES is
+read; see the 7z section). AES wraps the
 compressed bytes. `compress` is unchanged.
 
 That a member's *metadata* is readable and its *data* is not is an **ordinary
@@ -640,7 +641,7 @@ unreadable kind must not read as a successful end of data.
 
 #### ZipCrypto, and why a wrong password needs three statuses
 
-`garc_zip_set_password()` decrypts the traditional PKWARE cipher. **The whole
+`garc_set_password()` decrypts the traditional PKWARE cipher. **The whole
 cipher is CRC-32**, which is why it needed no cryptography library and landed with
 the rest of zip rather than behind `security`: three 32-bit words are mixed with
 each plaintext byte, and two of the three steps are one table lookup of the CRC-32
@@ -655,7 +656,7 @@ because no option name makes shipping a cipher we know is broken honest.
 
 Three decisions worth arguing about:
 
-**ZipCrypto's keys are derived at `garc_zip_set_password()`, and the password is
+**ZipCrypto's keys are derived at `garc_set_password()`, and the password is
 kept beside them.** Every ZipCrypto member starts from the same three words, so
 those are stored at the call. An AES member has its own salt, which is not known
 until the member is reached, so the password bytes are copied and wiped on
@@ -782,21 +783,48 @@ CRC-32. Each decoder runs under `limits.max_output_bytes` equal to the size the
 header declared for it. The filters take no `limits.*` keys and need none.
 
 **What is refused, and where.** The coder graph is checked when a folder is
-opened, not when the header is parsed, so an archive containing a BCJ2 folder can
-still be listed: the metadata is good and the data is not readable, which the zip
-reader already treats as an ordinary state (`data_refusal`). BCJ2 is refused
-because it is four streams through a range coder whose definition lives in code
-rather than in a published specification; this library does not port other
-implementations' source.
+opened, not when the header is parsed, so an archive containing a folder this
+library cannot decode can still be listed: the metadata is good and the data is
+not readable, which the zip reader already treats as an ordinary state
+(`data_refusal`). What is refused that way is PPMd and an unknown coder id; an
+AES folder with no password set is `GARC_ERR_PASSWORD_REQUIRED` the same way.
 
-**7z encryption is refused for the same reason.** The coder id is recognised
-nowhere and is `GARC_ERR_UNSUPPORTED` like any other; the key derivation (a
-SHA-256 iterated a stated number of times over the salt, the password and a
-counter) and the AES-CBC framing are defined by the reference implementation's
-source, and the only way to learn them would be to read it. That is a decision
-for the maintainer, not a default: the choice made on 2026-10-15 was to leave
-BCJ2 and AES refused. `security` already has AES-CBC and SHA-256, so the cost of
-revisiting it is the specification, not the primitives.
+**A folder is built as a graph.** Each coder's inputs are packed streams or other
+coders' outputs, by the bind pairs; exactly one output is left unbound. The
+reader builds from that output down, and gives every packed stream a slice of
+the archive stream that keeps its own position and seeks back to it before each
+read, so that BCJ2's four packed streams - MAIN, CALL, JUMP and the range coder,
+asked for in whatever order its decoding needs them - can all be read from one
+stream. A graph that is not one (an input fed twice or not at all, an output
+consumed twice, a cycle) is corrupt.
+
+**BCJ2 and 7-Zip's AES came from a describer, not from a specification.**
+Neither has a published one; 7-Zip's public-domain LZMA SDK is their only
+definition, and this library does not port other implementations. On 2026-10-21
+Corey made an exception for these two coders, in a form that keeps the rule's
+point: a separate describer read the SDK and wrote prose with no code in it
+(kept in the workspace, `notes/archive/`), and the code here was written from
+that and from 7-Zip's behaviour by someone who has not read the source. The
+corpus is 7-Zip's archives, and a test-side BCJ2 encoder written from the same
+description reproduces 7-Zip's four streams byte for byte - which is also how
+one thing the description had left open, a per-file limit on which branches
+7-Zip converts, was settled.
+
+**7z AES, in short.** AES-256-CBC, the key SHA-256 over 2^P copies of salt,
+UTF-16LE password and a counter, the plaintext zero-padded to a block and cut to
+the folder's unpack size. There is no check value, so a wrong password is
+whatever the coder behind the cipher does with garbage - LZMA failing, a CRC-32
+disagreeing - and that is `GARC_ERR_PASSWORD_OR_CORRUPT`, from the read and not
+the walk. A folder that failed that way is remembered, so the members after it
+are refused without decoding the folder from its start again. An encrypted
+header leaves the archive open with nothing to walk, and `garc_set_password()`
+decodes it. P is the archive's to choose up to 24, about a second of one core,
+so the work is capped per archive by `GARC_Limits.max_key_rounds`; a key is
+derived once per salt and power and reused, so 7-Zip's own archives, which use
+one, cost one derivation. **Nothing here writes 7z AES**, so an in-place append
+to an archive whose header is encrypted, and a rewrite that would keep an
+encrypted member, are both refused rather than writing in the clear what the
+archive kept secret.
 
 **Names are the one conversion.** Elsewhere a name is the bytes the container
 carried. 7z stores UTF-16LE, so the reader converts to UTF-8 and says so with

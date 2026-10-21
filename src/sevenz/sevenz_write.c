@@ -316,8 +316,7 @@ static GARC_Result szw_close_folder(GARC_Writer * writer) {
   return GARC_OK;
 }
 
-/** Decode one UTF-8 sequence; returns its length or 0 when malformed. */
-static size_t szw_utf8(const uint8_t * p, size_t left, uint32_t * cp) {
+size_t garc_sevenz_utf8_decode(const uint8_t * p, size_t left, uint32_t * cp) {
   if (!left) {
     return 0;
   }
@@ -366,7 +365,7 @@ GARC_Result garc_sevenz_write_member(
   /* Every byte must be text before anything is written. */
   for (size_t at = 0; at < member->name_length;) {
     uint32_t cp = 0;
-    const size_t n = szw_utf8((const uint8_t *)member->name + at,
+    const size_t n = garc_sevenz_utf8_decode((const uint8_t *)member->name + at,
         member->name_length - at, &cp);
     if (!n) {
       return GARC_ERR_INVALID;
@@ -644,7 +643,7 @@ static void put_name(GARC_Buffer * b, const GARC_Allocator * a,
     const uint8_t * name, size_t length, GARC_Result * status) {
   for (size_t at = 0; at < length;) {
     uint32_t cp = 0;
-    at += szw_utf8(name + at, length - at, &cp);
+    at += garc_sevenz_utf8_decode(name + at, length - at, &cp);
     if (cp >= 0x10000u) {
       const uint32_t v = cp - 0x10000u;
       const uint16_t hi = (uint16_t)(0xD800u + (v >> 10));

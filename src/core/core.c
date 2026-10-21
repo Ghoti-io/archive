@@ -50,7 +50,7 @@ const char * garc_result_string(GARC_Result result) {
       return "Internal error";
     case GARC_ERR_NOT_SEEKABLE:
       return "The source cannot seek, and this needs to";
-    // Each cap says which cap. A shared string would undo half of what six
+    // Each cap says which cap. A shared string would undo half of what seven
     // separate constants buy, since a message is what a caller prints.
     case GARC_ERR_LIMIT_MEMBERS:
       return "Limit exceeded: too many members";
@@ -62,6 +62,8 @@ const char * garc_result_string(GARC_Result result) {
       return "Limit exceeded: member name too long";
     case GARC_ERR_LIMIT_EXTRA_BYTES:
       return "Limit exceeded: member extra fields too large";
+    case GARC_ERR_LIMIT_KEY_ROUNDS:
+      return "Limit exceeded: too much work deriving encryption keys";
     // Says whose cap, not just which, because this is the one that is not ours:
     // a caller who reads "limit exceeded" and goes looking through GARC_Limits
     // for the field to raise will not find it.
@@ -103,6 +105,7 @@ int garc_result_is_limit(GARC_Result result) {
     case GARC_ERR_LIMIT_TOTAL_BYTES:
     case GARC_ERR_LIMIT_NAME_BYTES:
     case GARC_ERR_LIMIT_EXTRA_BYTES:
+    case GARC_ERR_LIMIT_KEY_ROUNDS:
     case GARC_ERR_LIMIT_CODEC_BYTES:
       return 1;
     default:
@@ -125,5 +128,6 @@ void garc_limits_default(GARC_Limits * limits) {
     .max_total_bytes = GARC_DEFAULT_MAX_TOTAL_BYTES,
     .max_name_bytes = GARC_DEFAULT_MAX_NAME_BYTES,
     .max_extra_bytes = GARC_DEFAULT_MAX_EXTRA_BYTES,
+    .max_key_rounds = GARC_DEFAULT_MAX_KEY_ROUNDS,
   };
 }

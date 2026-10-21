@@ -204,9 +204,11 @@ typedef struct GARC_Fs_Update GARC_Fs_Update;
  * recompressed, an encrypted one needs no password, and a method this library
  * cannot write survives. A compressed tar is written back through the codec it
  * was read through. A kept 7z member is decoded and encoded again, because 7z's
- * members share their compressed streams; one this library cannot decode (BCJ2,
- * encrypted) is refused by ::garc_fs_update_keep() before anything is written,
- * and the caller decides.
+ * members share their compressed streams; one this library cannot decode, and
+ * one that is encrypted or was listed in an encrypted header - this writer does
+ * not encrypt, so keeping it would write it in the clear, even when the caller
+ * has given the archive its password - is refused by ::garc_fs_update_keep()
+ * before anything is written, and the caller decides.
  *
  * **With ::GARC_FS_IN_PLACE**, for an uncompressed tar, a zip or a 7z, nothing
  * is rewritten and ::garc_fs_update_archive() is NULL. For a tar the writer starts

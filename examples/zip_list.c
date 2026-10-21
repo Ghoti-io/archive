@@ -117,7 +117,7 @@ int main(int argc, char ** argv) {
     // Set once, for the archive. Every member's keys start from the same three
     // words, so there is nothing per-member to do - and the library forgets these
     // bytes as soon as it has derived them.
-    result = garc_zip_set_password(archive, argv[2], strlen(argv[2]));
+    result = garc_set_password(archive, argv[2], strlen(argv[2]));
     if (result != GARC_OK) {
       fprintf(stderr, "password: %s\n", garc_result_string(result));
       garc_close(archive);

@@ -195,7 +195,7 @@
 #define garc_zip_member_version_made_by                                        \
   GHOTIIO_ARCHIVE(garc_zip_member_version_made_by)
 #define garc_zip_method_string GHOTIIO_ARCHIVE(garc_zip_method_string)
-#define garc_zip_set_password GHOTIIO_ARCHIVE(garc_zip_set_password)
+#define garc_set_password GHOTIIO_ARCHIVE(garc_set_password)
 #define garc_zip_sizes_string GHOTIIO_ARCHIVE(garc_zip_sizes_string)
 
 // Internal names. Hidden by -fvisibility=hidden and so unable to collide, but

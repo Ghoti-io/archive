@@ -320,6 +320,21 @@ GARC_Format garc_format(const GARC_Archive * archive) {
   return archive ? archive->format : GARC_FORMAT_UNKNOWN;
 }
 
+GARC_Result garc_set_password(
+    GARC_Archive * archive, const void * password, size_t length) {
+  if (!archive || (!password && length)) {
+    return GARC_ERR_INVALID;
+  }
+  switch (archive->format) {
+    case GARC_FORMAT_ZIP:
+      return garc_zip_password_set(archive, password, length);
+    case GARC_FORMAT_SEVENZ:
+      return garc_sevenz_set_password(archive, password, length);
+    default:
+      return GARC_ERR_INVALID;
+  }
+}
+
 GARC_Result garc_reader_account(GARC_Archive * archive) {
   const GARC_Limits * limits = &archive->limits;
   const GARC_Member * member = &archive->member;

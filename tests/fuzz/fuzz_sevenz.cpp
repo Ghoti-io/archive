@@ -65,7 +65,10 @@ bool documented(GARC_Result result) {
     case GARC_ERR_LIMIT_TOTAL_BYTES:
     case GARC_ERR_LIMIT_NAME_BYTES:
     case GARC_ERR_LIMIT_EXTRA_BYTES:
+    case GARC_ERR_LIMIT_KEY_ROUNDS:
     case GARC_ERR_LIMIT_CODEC_BYTES:
+    case GARC_ERR_PASSWORD_REQUIRED:
+    case GARC_ERR_PASSWORD_OR_CORRUPT:
       return true;
     default:
       return false;
@@ -73,7 +76,7 @@ bool documented(GARC_Result result) {
 }
 
 bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
-    const GARC_Allocator * allocator, bool read_data) {
+    const GARC_Allocator * allocator, bool read_data, bool password) {
   GARC_Stream * stream = nullptr;
   if (garc_stream_create_memory(body, body_size, &stream) != GARC_OK) {
     return false;
@@ -92,6 +95,13 @@ bool walk(const uint8_t * body, size_t body_size, const GARC_Limits & limits,
     garc_close(archive);
     garc_stream_destroy(stream);
     return false;
+  }
+  if (password) {
+    // The seeds' AES coders are keyed with this, so a mutation that keeps the
+    // key reaches the decoders behind the cipher, and one that does not
+    // reaches the wrong-password path. An encrypted header is decoded here.
+    const GARC_Result set = garc_set_password(archive, "fuzz", 4);
+    REQUIRE(documented(set), "set_password returned a status it does not document");
   }
 
   const GARC_Member * member = nullptr;
@@ -205,10 +215,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   const bool read_data = (options & 0x01u) != 0;
   const bool tight_caps = (options & 0x02u) != 0;
   const bool starve = (options & 0x04u) != 0;
+  const bool password = (options & 0x10u) != 0;
   const size_t fail_at = (options >> 5) & 0x07u;
 
   GARC_Limits limits;
   garc_limits_default(&limits);
+  // Every key an input asks for costs 2^P SHA-256 rounds, and P may be 24: a
+  // second an input. This keeps each to a few milliseconds, and makes the cap
+  // itself one of the things a mutation can hit.
+  limits.max_key_rounds = (uint64_t)1u << 12;
   if (tight_caps) {
     limits.max_members = 4;
     limits.max_member_bytes = 4096;
@@ -223,7 +238,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   garctest::FailingAllocator allocator(
       starve ? fail_at : static_cast<size_t>(-1));
   const bool opened = walk(
-      body.data(), body.size(), limits, allocator.get(), read_data);
+      body.data(), body.size(), limits, allocator.get(), read_data, password);
   allocator.stop_failing();
   if (opened) {
     REQUIRE(allocator.live() == 0u, "the walk leaked");

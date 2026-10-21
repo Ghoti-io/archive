@@ -145,6 +145,94 @@ void garc_sevenz_release(GARC_Archive * archive);
 void garc_sevenz_counts(
     const GARC_Archive * archive, uint64_t * out_folders, uint64_t * out_files);
 
+/**
+ * Decode one UTF-8 sequence, strictly: no overlong forms, no surrogates,
+ * nothing past U+10FFFF. Shared by the writer's names and the reader's
+ * passwords, which must agree on what UTF-8 is.
+ *
+ * @param p The bytes.
+ * @param left How many there are.
+ * @param cp Receives the code point.
+ * @return The sequence's length, or 0 when it is malformed or cut short.
+ */
+size_t garc_sevenz_utf8_decode(const uint8_t * p, size_t left, uint32_t * cp);
+
+/**
+ * The 7z half of ::garc_set_password(): convert the password to the UTF-16LE
+ * 7-Zip keys with, keep it, and decode the header if it was waiting for one.
+ *
+ * @param archive A 7z. The caller has checked it, and @p password against
+ *   @p length.
+ * @param password The password, UTF-8.
+ * @param length Its length in bytes.
+ * @return ::GARC_OK; ::GARC_ERR_INVALID for bytes that are not UTF-8;
+ *   ::GARC_ERR_OOM; or, when the header is encrypted and this password does
+ *   not decode it, what decoding it returned.
+ */
+GARC_Result garc_sevenz_set_password(
+    GARC_Archive * archive, const void * password, size_t length);
+
+/**
+ * Whether the current member is encrypted: its folder has an AES coder, or
+ * the header it was listed in was.
+ *
+ * @param archive A 7z, positioned on a member.
+ * @return Non-zero when it is.
+ */
+int garc_sevenz_member_encrypted(const GARC_Archive * archive);
+
+/**
+ * A password as 7-Zip keys with it, and the last key derived from it.
+ *
+ * Deriving a key costs 2^19 SHA-256 compressions by default, and a non-solid
+ * archive has one AES coder per folder, each normally with the same salt and
+ * cost; so the last key is kept and reused when they match.
+ */
+typedef struct {
+  uint8_t * utf16;      ///< The password in UTF-16LE, no terminator. Owned.
+  size_t utf16_len;     ///< Its length in bytes.
+  int have_key;         ///< Whether @ref key is valid for the fields below.
+  uint8_t power;        ///< The cycle power @ref key was derived with.
+  uint8_t salt[16];     ///< The salt it was derived with.
+  size_t salt_len;      ///< Bytes of @ref salt in use.
+  uint8_t key[32];      ///< The key.
+  uint64_t rounds_spent; ///< Derivation rounds spent since the password was set.
+  uint64_t rounds_cap;  ///< ::GARC_Limits.max_key_rounds; 0 is none.
+} GARC_SevenZ_Password;
+
+/**
+ * A stream that decrypts 7-Zip's AES coder.
+ *
+ * @param allocator For the stream and its state.
+ * @param inner The ciphertext. Borrowed.
+ * @param props The coder's property bytes.
+ * @param props_len Their length.
+ * @param password The password; its key cache is updated.
+ * @param out_size The plaintext's size, from the folder's unpack sizes.
+ * @param out_stream Receives the stream.
+ * @return ::GARC_OK, ::GARC_ERR_OOM, ::GARC_ERR_UNSUPPORTED for properties
+ *   this library does not decode, ::GARC_ERR_CORRUPT for properties that are
+ *   not 7-Zip's, or ::GARC_ERR_LIMIT_KEY_ROUNDS when deriving the key would
+ *   pass the password's cap.
+ */
+GARC_Result garc_sevenz_aes_stream_create(const GARC_Allocator * allocator,
+    GARC_Stream * inner, const uint8_t * props, size_t props_len,
+    GARC_SevenZ_Password * password, uint64_t out_size,
+    GARC_Stream ** out_stream);
+
+/**
+ * A stream that decodes BCJ2 from its four inputs.
+ *
+ * @param allocator For the stream and its state.
+ * @param in The main, call, jump and range-coder streams, in that order.
+ *   Borrowed.
+ * @param out_size The decoded size, from the folder's unpack sizes.
+ * @param out_stream Receives the stream.
+ * @return ::GARC_OK or ::GARC_ERR_OOM.
+ */
+GARC_Result garc_sevenz_bcj2_stream_create(const GARC_Allocator * allocator,
+    GARC_Stream * const in[4], uint64_t out_size, GARC_Stream ** out_stream);
+
 /** One coder of a carried folder, as the header lists it. */
 typedef struct {
   uint8_t id[8];      ///< The method id, most significant byte first.

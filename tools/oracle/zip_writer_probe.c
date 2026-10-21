@@ -499,7 +499,7 @@ static int read_one(const char * path) {
   const char * slash = strrchr(path, '/');
   const char * name = slash ? slash + 1 : path;
   if (strcmp(name, "aes.zip") == 0) {
-    result = garc_zip_set_password(
+    result = garc_set_password(
         archive, AES_PASSWORD, sizeof(AES_PASSWORD) - 1u);
     if (result != GARC_OK) {
       fprintf(stderr, "%s: password: %s\n", name, garc_result_string(result));

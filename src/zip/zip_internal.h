@@ -77,6 +77,19 @@ extern "C" {
 #define GARC_ZIP_EOCD_SEARCH_MAX (GARC_ZIP_EOCD_SIZE + 65535u)
 
 /**
+ * The zip half of ::garc_set_password(): copy the password, derive the
+ * ZipCrypto keys, and mark the archive as having one.
+ *
+ * @param archive A zip. The caller has checked it, and @p password against
+ *   @p length.
+ * @param password The password bytes.
+ * @param length Their length.
+ * @return ::GARC_OK, or ::GARC_ERR_OOM.
+ */
+GARC_Result garc_zip_password_set(
+    GARC_Archive * archive, const void * password, size_t length);
+
+/**
  * Read a 16-bit little-endian field.
  *
  * Shifts over bytes rather than a cast over memory: little-endian is a fact

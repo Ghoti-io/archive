@@ -32,12 +32,24 @@ Each archive is written to vary one thing the reader has to get right:
     as the file's data;
   - the other six branch filters (PowerPC, IA-64, ARM, ARM Thumb, SPARC,
     RISC-V), over one file each;
-  - BCJ2, which this library refuses, so that the refusal is tested against
-    an archive that really needs it.
+  - BCJ2: four packed streams, in the layout the `-m`/`-mb` switches give,
+    with Copy coders so that the four streams sit raw in the pack area, and
+    as `-mf=BCJ2` picks it;
+  - 7-Zip's AES: the data alone, the header too (`-mhe=on`, whose header is
+    AES and LZMA), a one-file archive with `-mhe=on` (whose header is AES
+    alone), non-solid (a folder per file, each its own coder), the copy
+    coder (so a wrong password reaches a CRC rather than a decoder), and
+    BCJ2, which puts an AES coder in front of each of its four streams. The
+    password has a character outside the BMP, because 7-Zip keys with
+    UTF-16 and that is where a surrogate pair is tested.
 
 **Determinism is the gate.** `-mmt=1` because the thread count would otherwise
 change the stream, every mtime fixed with `os.utime`, and the file order given
-by a sorted list rather than by readdir.
+by a sorted list rather than by readdir. The exception is AES: 7-Zip draws a
+random IV for every AES coder, by design, so those archives are listed in
+NOT_REPRODUCIBLE and get `-` for a digest. What covers their contents is the
+manifest, which is the source tree, and `listing.txt`, which is hashed and
+reads the same from every run because none of its fields is the IV.
 """
 
 import hashlib
@@ -55,6 +67,11 @@ HASHES = os.path.join(HERE, "containers", "CORPUS-SEVENZ")
 
 MTIME = 1000000000
 COMPRESSIBLE = b"the same line, over and over\n" * 400
+
+# The password of every AES fixture: an accent (two UTF-16 units' worth of
+# UTF-8 that is one unit) and U+1F600 (a surrogate pair). The unit tests carry
+# the same string.
+PASSWORD = "ghoti-p\u00e4ss-\U0001F600"
 
 
 def x86_like(seed, size):
@@ -125,8 +142,33 @@ ARCHIVES = [
     ("arm64.7z", ["-mf=ARM64"], "the ARM64 branch filter"),
     ("bcj2.7z", ["-m0=BCJ2", "-m1=LZMA", "-m2=LZMA:d20", "-m3=LZMA:d20",
         "-mb0:1", "-mb0s1:2", "-mb0s2:3"],
-        "BCJ2: four packed streams, which the reader refuses by name"),
+        "BCJ2: four packed streams, each of three behind its own LZMA"),
+    ("bcj2-copy.7z", ["-m0=BCJ2", "-m1=Copy", "-m2=Copy", "-m3=Copy",
+        "-mb0:1", "-mb0s1:2", "-mb0s2:3"],
+        "BCJ2 over Copy: its four streams raw, so BCJ2 is tested alone"),
+    ("bcj2-mf.7z", ["-mf=BCJ2"], "BCJ2 as -mf picks it: LZMA2 on the main stream"),
+    ("aes.7z", ["-p" + PASSWORD], "AES over LZMA2; the header is not encrypted"),
+    ("aes-header.7z", ["-p" + PASSWORD, "-mhe=on"],
+        "AES on the data and on the header, which is AES and then LZMA"),
+    ("aes-nonsolid.7z", ["-p" + PASSWORD, "-ms=off"],
+        "AES, a folder per file: one coder each, the same key"),
+    ("aes-copy.7z", ["-p" + PASSWORD, "-mx0"],
+        "AES over the copy coder: a wrong password is caught by a CRC-32"),
+    ("aes-bcj2.7z", ["-p" + PASSWORD, "-mf=BCJ2"],
+        "AES in front of each of BCJ2's four packed streams"),
 ]
+
+# Archives whose bytes are not a function of their inputs, and why. They still
+# have a row in CORPUS-SEVENZ, with `-` for the digest, so that one going
+# missing fails.
+NOT_REPRODUCIBLE = {
+    "aes.7z": "7-Zip draws a random IV for every AES coder",
+    "aes-header.7z": "a random IV for the data's coder and the header's",
+    "aes-header-one.7z": "a random IV for the data's coder and the header's",
+    "aes-nonsolid.7z": "a random IV for every folder's coder",
+    "aes-copy.7z": "a random IV for the AES coder",
+    "aes-bcj2.7z": "a random IV for each of the four AES coders",
+}
 
 
 # The branch filters beyond x86 and ARM64, each over program.bin alone: they exist
@@ -162,6 +204,12 @@ def generate(destination):
         run(["7z", "a", "-t7z", "-mmt=1", "-bso0", "-bsp0", "-y",
                 "-mf=" + flt, out, "program.bin"],
             cwd=tree, what=name)
+    # One file with -mhe=on: 7-Zip does not compress a header of fewer than two
+    # items, so the header's folder is AES alone.
+    run(["7z", "a", "-t7z", "-mmt=1", "-bso0", "-bsp0", "-y", "-p" + PASSWORD,
+            "-mhe=on", os.path.join(destination, "aes-header-one.7z"),
+            "hello.txt"],
+        cwd=tree, what="aes-header-one.7z")
     # Symlinks are stored as links only with -snl.
     run(["7z", "a", "-t7z", "-mmt=1", "-bso0", "-bsp0", "-y", "-snl",
             os.path.join(destination, "symlink.7z"), "hello.txt",
@@ -170,7 +218,8 @@ def generate(destination):
     manifest(destination, tree)
     for name in sorted(os.listdir(destination)):
         if name.endswith(".7z"):
-            run(["7z", "t", "-bso0", "-bsp0", os.path.join(destination, name)],
+            run(["7z", "t", "-bso0", "-bsp0", "-p" + PASSWORD,
+                    os.path.join(destination, name)],
                 what="7z t " + name)
     listing(destination)
     shutil.rmtree(tree)
@@ -208,7 +257,8 @@ def listing(destination):
             if not name.endswith(".7z"):
                 continue
             finished = run(["7z", "l", "-slt", "-bso1", "-bsp0",
-                os.path.join(destination, name)], what="7z l " + name)
+                "-p" + PASSWORD, os.path.join(destination, name)],
+                what="7z l " + name)
             handle.write("### %s\n" % name)
             for line in finished.stdout.splitlines():
                 if line.startswith(("Path = ", "Size = ", "Packed Size",
@@ -224,9 +274,13 @@ def hashes(destination):
     rows = []
     for name in sorted(os.listdir(destination)):
         path = os.path.join(destination, name)
-        if os.path.isfile(path):
-            rows.append("%s  %s" % (
-                hashlib.sha256(open(path, "rb").read()).hexdigest(), name))
+        if not os.path.isfile(path):
+            continue
+        if name in NOT_REPRODUCIBLE:
+            rows.append("-  %s" % name)
+            continue
+        rows.append("%s  %s" % (
+            hashlib.sha256(open(path, "rb").read()).hexdigest(), name))
     return rows
 
 

@@ -700,7 +700,7 @@ TEST(ZipCorpus, EveryDeflatedMemberInTheCorpusReadsAndItsCrcVerifies) {
     // strongest statement about the decrypt-then-inflate layering is that its
     // bytes pass the CRC the writer declared, and that is the statement this test
     // already makes about everything else.
-    ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+    ASSERT_EQ(garc_set_password(fixture.archive(), kCorpusPassword,
                   std::strlen(kCorpusPassword)),
         GARC_OK) << entry.first;
     const GARC_Member * member = nullptr;
@@ -1006,7 +1006,7 @@ TEST(ZipCrypto, EveryEncryptedMemberReadsWhatThreeProgramsDecrypt) {
   for (const ZipDecryptedRow & row : decrypted()) {
     Fixture fixture(row.archive);
     ASSERT_EQ(fixture.open_result(), GARC_OK) << row.archive;
-    ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+    ASSERT_EQ(garc_set_password(fixture.archive(), kCorpusPassword,
                   std::strlen(kCorpusPassword)),
         GARC_OK);
 
@@ -1056,7 +1056,7 @@ TEST(ZipCrypto, TheCheckByteComesFromTheDosTimeWhenThereIsADataDescriptor) {
   // CRC whose high byte is 0x51.
   Fixture fixture("infozip-crypto.zip");
   ASSERT_EQ(fixture.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+  ASSERT_EQ(garc_set_password(fixture.archive(), kCorpusPassword,
                 std::strlen(kCorpusPassword)),
       GARC_OK);
   const GARC_Member * member = nullptr;
@@ -1077,7 +1077,7 @@ TEST(ZipCrypto, AWrongPasswordIsRejectedBeforeAnyDataIsRead) {
   // returned before a single byte of the member is handed over.
   Fixture fixture("infozip-crypto.zip");
   ASSERT_EQ(fixture.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "wrong", 5u), GARC_OK);
+  ASSERT_EQ(garc_set_password(fixture.archive(), "wrong", 5u), GARC_OK);
 
   const GARC_Member * member = nullptr;
   // **The walk is unaffected.** A zip's metadata is in the clear whatever the
@@ -1105,7 +1105,7 @@ TEST(ZipCrypto, ASecondPasswordReplacesTheFirst) {
   // keys are derived per call and the encryption header is read per member.
   Fixture fixture("infozip-crypto.zip");
   ASSERT_EQ(fixture.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "wrong", 5u), GARC_OK);
+  ASSERT_EQ(garc_set_password(fixture.archive(), "wrong", 5u), GARC_OK);
   const GARC_Member * member = nullptr;
   ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
 
@@ -1114,7 +1114,7 @@ TEST(ZipCrypto, ASecondPasswordReplacesTheFirst) {
   ASSERT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
       GARC_ERR_PASSWORD_REJECTED);
 
-  ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+  ASSERT_EQ(garc_set_password(fixture.archive(), kCorpusPassword,
                 std::strlen(kCorpusPassword)),
       GARC_OK);
   // The refusal was decided when the member became current, so the member has to
@@ -1126,7 +1126,7 @@ TEST(ZipCrypto, ASecondPasswordReplacesTheFirst) {
 }
 
 TEST(ZipCrypto, AnEmptyPasswordIsAPasswordAndNotTheAbsenceOfOne) {
-  // The reason garc_zip_set_password() takes a length rather than a string, and
+  // The reason garc_set_password() takes a length rather than a string, and
   // the reason the state carries a flag beside the keys: "" is a password a writer
   // can have used, and it has to be distinguishable from never having been given
   // one. The two answers differ - GARC_ERR_PASSWORD_REJECTED against
@@ -1141,7 +1141,7 @@ TEST(ZipCrypto, AnEmptyPasswordIsAPasswordAndNotTheAbsenceOfOne) {
   EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
       GARC_ERR_PASSWORD_REQUIRED);
 
-  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "", 0u), GARC_OK);
+  ASSERT_EQ(garc_set_password(fixture.archive(), "", 0u), GARC_OK);
   ASSERT_EQ(garc_find(fixture.archive(), "hello.txt", 9u, &member), GARC_OK);
   EXPECT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
       GARC_ERR_PASSWORD_REJECTED);
@@ -1153,7 +1153,7 @@ TEST(ZipCrypto, APasswordSurvivesARewind) {
   // the cipher failing intermittently.
   Fixture fixture("infozip-crypto.zip");
   ASSERT_EQ(fixture.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+  ASSERT_EQ(garc_set_password(fixture.archive(), kCorpusPassword,
                 std::strlen(kCorpusPassword)),
       GARC_OK);
   const GARC_Member * member = nullptr;
@@ -1175,8 +1175,8 @@ TEST(ZipCrypto, APasswordIsRefusedOnAnArchiveThatIsNotAZip) {
   GARC_Archive * archive = nullptr;
   ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
   ASSERT_EQ(garc_format(archive), GARC_FORMAT_TAR);
-  EXPECT_EQ(garc_zip_set_password(archive, "x", 1u), GARC_ERR_INVALID);
-  EXPECT_EQ(garc_zip_set_password(nullptr, "x", 1u), GARC_ERR_INVALID);
+  EXPECT_EQ(garc_set_password(archive, "x", 1u), GARC_ERR_INVALID);
+  EXPECT_EQ(garc_set_password(nullptr, "x", 1u), GARC_ERR_INVALID);
   garc_close(archive);
   garc_stream_destroy(stream);
 }
@@ -1184,12 +1184,12 @@ TEST(ZipCrypto, APasswordIsRefusedOnAnArchiveThatIsNotAZip) {
 TEST(ZipCrypto, ANullPasswordWithALengthIsRefused) {
   Fixture fixture("infozip-crypto.zip");
   ASSERT_EQ(fixture.open_result(), GARC_OK);
-  EXPECT_EQ(garc_zip_set_password(fixture.archive(), nullptr, 4u),
+  EXPECT_EQ(garc_set_password(fixture.archive(), nullptr, 4u),
       GARC_ERR_INVALID);
   // And a NULL password of length zero is the empty password, not an error: the
   // two arms of that condition are separate lines in the implementation and this
   // is what stops one of them being written as the other.
-  EXPECT_EQ(garc_zip_set_password(fixture.archive(), nullptr, 0u), GARC_OK);
+  EXPECT_EQ(garc_set_password(fixture.archive(), nullptr, 0u), GARC_OK);
 }
 
 TEST(Zip, WinZipAesIsNamedAndItsRealMethodIsNotLost) {
@@ -1213,7 +1213,7 @@ TEST(Zip, WinZipAesIsNamedAndItsRealMethodIsNotLost) {
 TEST(Zip, AWrongPasswordOnWinZipAesIsRejectedAndTheWalkContinues) {
   Fixture fixture("sevenzip-aes.zip");
   ASSERT_EQ(fixture.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "not-the-password", 16u),
+  ASSERT_EQ(garc_set_password(fixture.archive(), "not-the-password", 16u),
       GARC_OK);
   const GARC_Member * member = nullptr;
   ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
@@ -1228,7 +1228,7 @@ TEST(Zip, AWrongPasswordOnWinZipAesIsRejectedAndTheWalkContinues) {
 TEST(Zip, ASecondAesPasswordReplacesTheFirst) {
   Fixture fixture("sevenzip-aes.zip");
   ASSERT_EQ(fixture.open_result(), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(fixture.archive(), "not-the-password", 16u),
+  ASSERT_EQ(garc_set_password(fixture.archive(), "not-the-password", 16u),
       GARC_OK);
   const GARC_Member * member = nullptr;
   ASSERT_EQ(garc_next(fixture.archive(), &member), GARC_OK);
@@ -1238,7 +1238,7 @@ TEST(Zip, ASecondAesPasswordReplacesTheFirst) {
   ASSERT_EQ(garc_read_member(fixture.archive(), buffer, sizeof(buffer), &got),
       GARC_ERR_PASSWORD_REJECTED);
 
-  ASSERT_EQ(garc_zip_set_password(fixture.archive(), kCorpusPassword,
+  ASSERT_EQ(garc_set_password(fixture.archive(), kCorpusPassword,
                 std::strlen(kCorpusPassword)),
       GARC_OK);
   ASSERT_EQ(garc_find(fixture.archive(), "hello.txt", 9u, &member), GARC_OK);
@@ -1255,7 +1255,7 @@ TEST(Zip, ASecondAesMemberDecryptsWithThePasswordAlreadySet) {
   ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
   GARC_Archive * archive = nullptr;
   ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
-  ASSERT_EQ(garc_zip_set_password(
+  ASSERT_EQ(garc_set_password(
                 archive, kCorpusPassword, std::strlen(kCorpusPassword)),
       GARC_OK);
 
@@ -2545,7 +2545,7 @@ TEST(Zip, StrongEncryptionIsRefusedByNameFromAFileAndFromAPipe) {
     ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
     GARC_Archive * archive = nullptr;
     ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
-    garc_zip_set_password(archive, "x", 1);
+    garc_set_password(archive, "x", 1);
     const GARC_Member * member = nullptr;
     ASSERT_EQ(garc_next(archive, &member), GARC_OK);
     char buffer[16];

@@ -294,20 +294,20 @@ typedef struct {
   /**
    * The three ZipCrypto key words, with the password already mixed in.
    *
-   * Derived at ::garc_zip_set_password() and wiped on release. ZipCrypto still
+   * Derived at ::garc_set_password() and wiped on release. ZipCrypto still
    * needs nothing else. WinZip AES cannot be derived at that call: each member
    * has its own salt, so the password is kept in @ref password until release.
    *
-   * Set by ::garc_zip_set_password() and deliberately untouched by
+   * Set by ::garc_set_password() and deliberately untouched by
    * ::garc_zip_rewind(): a password is a property of the archive, not of where
    * the walk is. An empty password is @ref have_password with
    * @ref password_length 0, which is not the same as never having called it.
    */
   uint32_t crypt_keys[3];
-  /** Whether ::garc_zip_set_password() has been called. */
+  /** Whether ::garc_set_password() has been called. */
   int have_password;
   /**
-   * The password bytes, copied at ::garc_zip_set_password() and wiped on release.
+   * The password bytes, copied at ::garc_set_password() and wiped on release.
    *
    * NULL when @ref password_length is 0. Untouched by ::garc_zip_rewind().
    */
