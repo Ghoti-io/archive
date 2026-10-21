@@ -125,28 +125,34 @@ def main(argv):
             continue
         checked += 1
 
-    # And this library's own split zip: packed from the same tree into 64 KiB
-    # volumes, tested by 7-Zip, and read back by name.
-    ours = os.path.join(out, "ours.zip")
-    written = subprocess.run([probe, "write", ours, source], capture_output=True,
-        text=True)
-    parts = sorted(n for n in os.listdir(out) if n.startswith("ours.z"))
-    if written.returncode != 0:
-        failures.append("ours.zip: %s" % written.stderr.strip())
-    elif len(parts) < 3:
-        failures.append("ours.zip: only %d volumes written (%s)" % (len(parts),
-            parts))
-    else:
+    # And this library's own split zips, in 64 KiB volumes, each tested by
+    # 7-Zip and read back by name: packed from the same tree, and Info-ZIP's
+    # split set copied raw, member by member, which moves its stored bytes
+    # into new volumes without decoding them.
+    for name, mode, origin in (("ours.zip", "write", source),
+            ("copied.zip", "copy", os.path.join(out, "split.zip"))):
+        ours = os.path.join(out, name)
+        stem = name[:-len("zip")]
+        written = subprocess.run([probe, mode, ours, origin], capture_output=True,
+            text=True)
+        parts = sorted(n for n in os.listdir(out) if n.startswith(stem + "z"))
+        if written.returncode != 0:
+            failures.append("%s: %s" % (name, written.stderr.strip()))
+            continue
+        if len(parts) < 3:
+            failures.append("%s: only %d volumes written (%s)" % (name,
+                len(parts), parts))
+            continue
         tested = subprocess.run(oracle_env.command("sevenzip",
             ["7z", "t", "-bso0", "-bsp0", ours], scratch=[work]),
             capture_output=True, stdin=subprocess.DEVNULL)
         if tested.returncode != 0:
-            failures.append("ours.zip: 7z t exited %d: %s" % (tested.returncode,
+            failures.append("%s: 7z t exited %d: %s" % (name, tested.returncode,
                 tested.stderr.decode("utf-8", "replace").strip()))
         read = subprocess.run([probe, ours], capture_output=True, text=True)
         got = sorted(line for line in read.stdout.splitlines() if line.strip())
         if read.returncode != 0 or got != want:
-            failures.append("ours.zip: read back %s%s" % (got, read.stderr.strip()))
+            failures.append("%s: read back %s%s" % (name, got, read.stderr.strip()))
         else:
             checked += 1
 
@@ -158,8 +164,8 @@ def main(argv):
         return 1
     print("check-volumes: %d split sets from zip -s, zip -fz -s, 7z -v, "
         "GNU tar -M (with and without labels) and this library's own split "
-        "zip (which 7-Zip tests), each read back to every file's size and "
-        "CRC-32" % checked)
+        "zips, packed and raw-copied (which 7-Zip tests), each read back to "
+        "every file's size and CRC-32" % checked)
     return 0
 
 

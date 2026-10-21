@@ -1498,12 +1498,6 @@ static size_t zip_extra_without_zip64(
 GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
     const char * name, size_t name_length) {
   GARC_Zip_Write_State * zip = &writer->zip;
-  if (zip_split(writer)) {
-    // The copy works out its offset and its zip64 fields before it writes,
-    // and a split archive only knows its offset after the header has found a
-    // volume. Copying through the codec works; this does not, yet.
-    return GARC_ERR_UNSUPPORTED;
-  }
   GARC_Zip_Raw_Entry e;
   GARC_Result result = garc_zip_raw_entry(source, &e);
   if (result != GARC_OK) {
@@ -1533,7 +1527,17 @@ GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
     return GARC_ERR_UNSUPPORTED;
   }
 
-  const uint64_t local_offset = garc_sink_tell(writer->sink);
+  // The header has to find its volume before its offset is known, and the
+  // offset decides whether it needs a zip64 field, which changes its length.
+  // So room is made for the longest it can be: the rebuilt extras are never
+  // more than 20 bytes longer than the source's.
+  result = zip_reserve(writer,
+      (uint64_t)GARC_ZIP_LOCAL_HEADER_SIZE + name_length + e.extra_length + 20u);
+  if (result != GARC_OK) {
+    return result;
+  }
+  const uint64_t local_offset = zip_here(writer);
+  const uint32_t local_disk = zip->disk;
   const int size_marker = e.size >= (uint64_t)ZIP_MARKER32;
   const int compressed_marker = e.compressed_size >= (uint64_t)ZIP_MARKER32;
   const int offset_marker = local_offset >= (uint64_t)ZIP_MARKER32;
@@ -1622,13 +1626,13 @@ GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
         : (zip64 ? ZIP_MARKER32 : (uint32_t)e.size));
     garc_zip_put16(header + 26u, (uint16_t)name_length);
     garc_zip_put16(header + 28u, (uint16_t)local_length);
-    result = garc_sink_write(writer->sink, header, sizeof(header));
+    result = zip_out(writer, header, sizeof(header));
   }
   if (result == GARC_OK) {
-    result = garc_sink_write(writer->sink, name, name_length);
+    result = zip_out(writer, name, name_length);
   }
   if (result == GARC_OK && local_length) {
-    result = garc_sink_write(writer->sink, local_extra, local_length);
+    result = zip_out(writer, local_extra, local_length);
   }
   // The data, byte for byte: compressed, and encrypted where it was.
   uint8_t chunk[16384];
@@ -1679,7 +1683,7 @@ GARC_Result garc_zip_write_raw(GARC_Writer * writer, GARC_Archive * source,
     garc_zip_put16(entry + 28u, (uint16_t)name_length);
     garc_zip_put16(entry + 30u, (uint16_t)central_length);
     garc_zip_put16(entry + 32u, e.comment_length);
-    garc_zip_put16(entry + 34u, 0u);
+    garc_zip_put16(entry + 34u, (uint16_t)local_disk);
     garc_zip_put16(entry + 36u, e.internal_attributes);
     garc_zip_put32(entry + 38u, e.external_attributes);
     garc_zip_put32(entry + 42u,

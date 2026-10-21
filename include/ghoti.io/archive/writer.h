@@ -485,7 +485,9 @@ GARC_API GARC_Result garc_writer_finish(GARC_Writer * writer);
  * Its compressed - and encrypted - bytes, CRC, method, times, attributes,
  * comment and extra fields, with nothing decompressed, recompressed,
  * decrypted or re-encrypted, so no password is needed and a method this
- * library cannot write (implode, PPMd) is carried unchanged. Only zip into zip.
+ * library cannot write (implode, PPMd) is carried unchanged. Only zip into zip,
+ * from a split set or into one (::GARC_Writer_Options.zip_volume_size): the
+ * header and descriptor are kept whole in one volume and the data runs across.
  */
 #define GARC_COPY_RAW ((uint32_t)1u << 0)
 

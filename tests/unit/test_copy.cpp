@@ -51,15 +51,41 @@ struct Opened {
   std::vector<uint8_t> bytes;
   GARC_Stream * stream = nullptr;
   GARC_Archive * archive = nullptr;
+  std::vector<std::vector<uint8_t>> parts;
+  std::vector<GARC_Stream *> part_streams;
   ~Opened() {
     garc_close(archive);
+    archive = nullptr;
     garc_stream_destroy(stream);
+    stream = nullptr;
+    for (GARC_Stream * part : part_streams) {
+      garc_stream_destroy(part);
+    }
   }
   GARC_Result open(std::vector<uint8_t> data) {
     bytes = std::move(data);
     if (garc_stream_create_memory(bytes.data(), bytes.size(), &stream) != GARC_OK) {
       return GARC_ERR_OOM;
     }
+    return open_stream();
+  }
+  /** The volumes of a split set, read as one archive. */
+  GARC_Result open_parts(std::vector<std::vector<uint8_t>> volumes) {
+    parts = std::move(volumes);
+    for (const auto & part : parts) {
+      GARC_Stream * one = nullptr;
+      if (garc_stream_create_memory(part.data(), part.size(), &one) != GARC_OK) {
+        return GARC_ERR_OOM;
+      }
+      part_streams.push_back(one);
+    }
+    if (garc_stream_create_concat(part_streams.data(), part_streams.size(), &stream)
+        != GARC_OK) {
+      return GARC_ERR_OOM;
+    }
+    return open_stream();
+  }
+  GARC_Result open_stream() {
     GARC_Result result = garc_open(stream, nullptr, &archive);
     if (result == GARC_OK && garc_format(archive) == GARC_FORMAT_ZIP) {
       result = garc_zip_set_password(
@@ -98,13 +124,8 @@ void read_data(GARC_Archive * archive, Read * read) {
 }
 
 /** Every member of an archive, read through. */
-std::vector<Read> read_all(const std::vector<uint8_t> & bytes, GARC_Result * opened) {
+std::vector<Read> read_opened(Opened & source) {
   std::vector<Read> out;
-  Opened source;
-  *opened = source.open(bytes);
-  if (*opened != GARC_OK) {
-    return out;
-  }
   const GARC_Member * member = nullptr;
   while (garc_next(source.archive, &member) == GARC_OK) {
     Read read = describe(source.archive, member);
@@ -119,6 +140,19 @@ std::vector<Read> read_all(const std::vector<uint8_t> & bytes, GARC_Result * ope
     out.push_back(read);
   }
   return out;
+}
+
+std::vector<Read> read_all(const std::vector<uint8_t> & bytes, GARC_Result * opened) {
+  Opened source;
+  *opened = source.open(bytes);
+  return *opened == GARC_OK ? read_opened(source) : std::vector<Read>{};
+}
+
+std::vector<Read> read_parts(
+    const std::vector<std::vector<uint8_t>> & parts, GARC_Result * opened) {
+  Opened source;
+  *opened = source.open_parts(parts);
+  return *opened == GARC_OK ? read_opened(source) : std::vector<Read>{};
 }
 
 std::vector<std::string> fixtures(const std::string & directory,
@@ -168,23 +202,53 @@ std::vector<std::string> every_fixture() {
 /** Copy every member of @p bytes into @p format; who was refused, and the output. */
 struct Copied {
   std::vector<uint8_t> bytes;
+  std::vector<std::vector<uint8_t>> parts; ///< The volumes, when split.
   std::vector<size_t> copied;   ///< Indexes into the source's members.
   std::vector<GARC_Result> refused;
   GARC_Result finished = GARC_OK;
 };
 
+/** A sink that keeps each volume of a split archive apart. */
+struct Volumes {
+  std::vector<std::vector<uint8_t>> parts{1};
+  static GARC_Result write(void * ctx, const void * bytes, size_t length) {
+    auto * self = static_cast<Volumes *>(ctx);
+    const auto * at = static_cast<const uint8_t *>(bytes);
+    self->parts.back().insert(self->parts.back().end(), at, at + length);
+    return GARC_OK;
+  }
+  static GARC_Result next(void * ctx) {
+    static_cast<Volumes *>(ctx)->parts.emplace_back();
+    return GARC_OK;
+  }
+};
+
+/** Copy every member; into volumes of @p volume bytes when it is not 0. */
 Copied copy_all(const std::vector<uint8_t> & bytes, GARC_Format format,
-    uint32_t flags) {
+    uint32_t flags, uint64_t volume = 0) {
   Copied out;
   Opened source;
   if (source.open(bytes) != GARC_OK) {
     out.finished = GARC_ERR_FORMAT;
     return out;
   }
+  Volumes volumes;
   GARC_Sink * sink = nullptr;
-  EXPECT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  if (volume) {
+    GARC_Sink_Callbacks callbacks{};
+    callbacks.ctx = &volumes;
+    callbacks.write = Volumes::write;
+    callbacks.next_volume = Volumes::next;
+    EXPECT_EQ(garc_sink_create_callback(&callbacks, &sink), GARC_OK);
+    options.zip_volume_size = volume;
+  }
+  else {
+    EXPECT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  }
   GARC_Writer * writer = nullptr;
-  EXPECT_EQ(garc_writer_create(sink, format, nullptr, &writer), GARC_OK);
+  EXPECT_EQ(garc_writer_create(sink, format, &options, &writer), GARC_OK);
   const GARC_Member * member = nullptr;
   size_t index = 0;
   while (garc_next(source.archive, &member) == GARC_OK) {
@@ -203,11 +267,16 @@ Copied copy_all(const std::vector<uint8_t> & bytes, GARC_Format format,
     ++index;
   }
   out.finished = garc_writer_finish(writer);
-  const void * data = nullptr;
-  size_t length = 0;
-  garc_sink_data(sink, &data, &length);
-  out.bytes.assign(static_cast<const uint8_t *>(data),
-      static_cast<const uint8_t *>(data) + length);
+  if (volume) {
+    out.parts = volumes.parts;
+  }
+  else {
+    const void * data = nullptr;
+    size_t length = 0;
+    garc_sink_data(sink, &data, &length);
+    out.bytes.assign(static_cast<const uint8_t *>(data),
+        static_cast<const uint8_t *>(data) + length);
+  }
   garc_writer_destroy(writer);
   garc_sink_destroy(sink);
   return out;
@@ -262,7 +331,10 @@ TEST(CopyMember, EveryFixtureCopiesIntoTarAndZipOrRefusesCleanly) {
   EXPECT_GT(refusals, 0u);
 }
 
-TEST(CopyMember, ARawZipCopyKeepsTheStoredBytesOfEveryMember) {
+namespace {
+
+/** Copy the zip corpus raw, whole or split at @p volume, and judge every member. */
+void raw_copy_corpus(uint64_t volume) {
   const std::vector<std::string> paths = fixtures("zip", ".zip");
   ASSERT_GT(paths.size(), 20u);
   size_t members = 0;
@@ -275,12 +347,20 @@ TEST(CopyMember, ARawZipCopyKeepsTheStoredBytesOfEveryMember) {
     if (opened != GARC_OK) {
       continue;
     }
-    const Copied copied = copy_all(bytes, GARC_FORMAT_ZIP, GARC_COPY_RAW);
+    const Copied copied = copy_all(bytes, GARC_FORMAT_ZIP, GARC_COPY_RAW, volume);
     ASSERT_EQ(copied.finished, GARC_OK);
     // Raw copies do not refuse for want of a codec or a password.
     EXPECT_TRUE(copied.refused.empty());
-    const std::vector<Read> after = read_all(copied.bytes, &opened);
+    const std::vector<Read> after = volume ? read_parts(copied.parts, &opened)
+                                           : read_all(copied.bytes, &opened);
     ASSERT_EQ(opened, GARC_OK);
+    if (volume) {
+      ASSERT_FALSE(copied.parts.empty());
+      EXPECT_EQ(0, std::memcmp(copied.parts[0].data(), "PK\x07\x08", 4));
+      for (const auto & part : copied.parts) {
+        EXPECT_LE(part.size(), volume);
+      }
+    }
     ASSERT_EQ(after.size(), before.size());
     for (size_t k = 0; k < after.size(); ++k) {
       const Read & was = before[k];
@@ -308,6 +388,127 @@ TEST(CopyMember, ARawZipCopyKeepsTheStoredBytesOfEveryMember) {
   // sevenzip-ppmd.zip is the case this exists for: a method with no codec here,
   // carried across unchanged.
   EXPECT_GT(unreadable, 0u);
+  // Few fixtures are large enough to cross a volume, which the test below
+  // makes up for.
+}
+
+/** A zip of members that fall across 64 KiB volumes, in a size discipline. */
+std::vector<uint8_t> spanning_source(GARC_Zip_Sizes sizes) {
+  GARC_Sink * sink = nullptr;
+  EXPECT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_method = GARC_ZIP_METHOD_STORED;
+  options.zip_sizes = sizes;
+  GARC_Writer * writer = nullptr;
+  EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer), GARC_OK);
+  uint32_t seed = 12345u;
+  auto noise = [&seed](size_t length) {
+    std::string out(length, '\0');
+    for (char & c : out) {
+      seed = seed * 1103515245u + 12345u;
+      c = static_cast<char>(seed >> 24);
+    }
+    return out;
+  };
+  auto add = [&](const std::string & name, GARC_Member_Type type,
+                 const std::string & data) {
+    GARC_Member member;
+    std::memset(&member, 0, sizeof(member));
+    member.name = name.c_str();
+    member.name_length = name.size();
+    member.type = type;
+    member.size = data.size();
+    ASSERT_EQ(garc_writer_add(writer, &member), GARC_OK) << name;
+    if (!data.empty()) {
+      ASSERT_EQ(garc_writer_write(writer, data.data(), data.size()), GARC_OK);
+    }
+  };
+  add("big.bin", GARC_MEMBER_FILE, noise(200000));
+  add("dir/", GARC_MEMBER_DIRECTORY, "");
+  for (int i = 0; i < 40; ++i) {
+    // Small members, so that headers fall near the volumes' ends.
+    add("dir/small-" + std::to_string(i) + ".bin", GARC_MEMBER_FILE,
+        noise(1500 + 97 * static_cast<size_t>(i)));
+  }
+  add("empty", GARC_MEMBER_FILE, "");
+  EXPECT_EQ(garc_writer_finish(writer), GARC_OK);
+  const void * data = nullptr;
+  size_t length = 0;
+  garc_sink_data(sink, &data, &length);
+  std::vector<uint8_t> out(static_cast<const uint8_t *>(data),
+      static_cast<const uint8_t *>(data) + length);
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  return out;
+}
+
+uint16_t le16(const std::vector<uint8_t> & bytes, size_t at) {
+  return static_cast<uint16_t>(bytes[at] | (bytes[at + 1] << 8));
+}
+
+} // namespace
+
+TEST(CopyMember, ARawZipCopyKeepsTheStoredBytesOfEveryMember) {
+  raw_copy_corpus(0);
+}
+
+TEST(CopyMember, ARawCopyIntoASplitWriterKeepsTheStoredBytesToo) {
+  // The smallest volume a split may have, so that members and headers fall
+  // across and against the volumes' ends.
+  raw_copy_corpus(65536);
+}
+
+TEST(CopyMember, ARawCopyIntoASplitWriterCrossesVolumesWholeRecordsAtATime) {
+  for (GARC_Zip_Sizes sizes : {GARC_ZIP_SIZES_LOCAL, GARC_ZIP_SIZES_DESCRIPTOR}) {
+    SCOPED_TRACE(sizes == GARC_ZIP_SIZES_LOCAL ? "sizes local" : "descriptors");
+    const std::vector<uint8_t> source = spanning_source(sizes);
+    GARC_Result opened = GARC_OK;
+    const std::vector<Read> before = read_all(source, &opened);
+    ASSERT_EQ(opened, GARC_OK);
+    ASSERT_EQ(before.size(), 43u);
+    const Copied copied = copy_all(source, GARC_FORMAT_ZIP, GARC_COPY_RAW, 65536);
+    ASSERT_EQ(copied.finished, GARC_OK);
+    EXPECT_TRUE(copied.refused.empty());
+    ASSERT_GE(copied.parts.size(), 4u);
+    EXPECT_EQ(0, std::memcmp(copied.parts[0].data(), "PK\x07\x08", 4));
+    for (size_t i = 0; i < copied.parts.size(); ++i) {
+      const std::vector<uint8_t> & part = copied.parts[i];
+      EXPECT_LE(part.size(), 65536u) << i;
+      // No local header cut across two volumes. Stored noise can hold a
+      // signature by chance, so only one whose name is in the source counts.
+      for (size_t at = 0; at + 30 <= part.size(); ++at) {
+        if (part[at] != 'P' || part[at + 1] != 'K' || part[at + 2] != 3
+            || part[at + 3] != 4) {
+          continue;
+        }
+        const size_t name_length = le16(part, at + 26);
+        const size_t end = at + 30u + name_length + le16(part, at + 28);
+        const bool known = at + 30u + name_length <= part.size()
+            && std::any_of(before.begin(), before.end(), [&](const Read & r) {
+                 return r.name.size() == name_length
+                     && std::memcmp(part.data() + at + 30, r.name.data(),
+                            name_length)
+                     == 0;
+               });
+        if (known) {
+          EXPECT_LE(end, part.size()) << "a local header cut at the end of volume " << i;
+        }
+      }
+    }
+    const std::vector<Read> after = read_parts(copied.parts, &opened);
+    ASSERT_EQ(opened, GARC_OK);
+    ASSERT_EQ(after.size(), before.size());
+    for (size_t k = 0; k < after.size(); ++k) {
+      SCOPED_TRACE(before[k].name);
+      EXPECT_EQ(after[k].name, before[k].name);
+      EXPECT_EQ(after[k].type, before[k].type);
+      EXPECT_EQ(after[k].zip_flags, before[k].zip_flags);
+      EXPECT_EQ(after[k].zip_crc, before[k].zip_crc);
+      EXPECT_EQ(after[k].result, GARC_OK);
+      EXPECT_TRUE(after[k].data == before[k].data);
+    }
+  }
 }
 
 TEST(CopyMember, ARawCopyCanRenameButNotTurnADirectoryIntoAFile) {

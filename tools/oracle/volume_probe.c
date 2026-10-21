@@ -28,6 +28,9 @@
  *   volume_probe write <name.zip> <dir>  pack @p dir as a zip split into
  *                                        64 KiB volumes, through
  *                                        garc_fs_sink_create_volumes()
+ *   volume_probe copy <name.zip> <from>  copy every member of the zip at
+ *                                        @p from, split or not, into the
+ *                                        same volumes with ::GARC_COPY_RAW
  *
  * One row per file member - `name`, `size`, `crc32` in hex - tab-separated, in
  * the archive's order. check_volumes.py compares them with the source files
@@ -43,8 +46,11 @@
 #include <ghoti.io/archive/fs.h>
 #include <ghoti.io/compress/crc32.h>
 
-/** Pack @p dir into a split zip at @p path, deflated, 64 KiB volumes. */
-static int write_split(const char * path, const char * dir) {
+/**
+ * Pack @p from into a split zip at @p path, deflated, 64 KiB volumes: a
+ * directory through garc_fs_pack(), or a zip copied raw member by member.
+ */
+static int write_split(const char * path, const char * from, int copy) {
   GARC_Sink * sink = NULL;
   GARC_Result result = garc_fs_sink_create_volumes(path, GARC_FS_NO_SYNC, &sink);
   GARC_Writer * writer = NULL;
@@ -55,8 +61,20 @@ static int write_split(const char * path, const char * dir) {
     options.zip_volume_size = 65536u;
     result = garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer);
   }
-  if (result == GARC_OK) {
-    result = garc_fs_pack(writer, dir, 0);
+  if (result == GARC_OK && !copy) {
+    result = garc_fs_pack(writer, from, 0);
+  }
+  if (result == GARC_OK && copy) {
+    GARC_Archive * source = NULL;
+    result = garc_fs_open(from, NULL, NULL, 0, &source);
+    const GARC_Member * member = NULL;
+    while (result == GARC_OK && (result = garc_next(source, &member)) == GARC_OK) {
+      result = garc_writer_copy_member(writer, source, NULL, GARC_COPY_RAW);
+    }
+    if (result == GARC_END) {
+      result = GARC_OK;
+    }
+    garc_close(source);
   }
   if (result == GARC_OK) {
     result = garc_writer_finish(writer);
@@ -75,11 +93,16 @@ static int write_split(const char * path, const char * dir) {
 
 int main(int argc, char ** argv) {
   if (argc == 4 && strcmp(argv[1], "write") == 0) {
-    return write_split(argv[2], argv[3]);
+    return write_split(argv[2], argv[3], 0);
+  }
+  if (argc == 4 && strcmp(argv[1], "copy") == 0) {
+    return write_split(argv[2], argv[3], 1);
   }
   if (argc != 2) {
-    fprintf(stderr, "usage: %s <path>\n       %s write <name.zip> <dir>\n",
-        argv[0], argv[0]);
+    fprintf(stderr,
+        "usage: %s <path>\n       %s write <name.zip> <dir>\n"
+        "       %s copy <name.zip> <from.zip>\n",
+        argv[0], argv[0], argv[0]);
     return 2;
   }
   GARC_Archive * archive = NULL;
