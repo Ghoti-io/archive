@@ -25,6 +25,9 @@
  *
  * Usage:
  *   volume_probe <path>                 read, as below
+ *   volume_probe -                      read standard input, a stream that
+ *                                        cannot seek: a split set's volumes
+ *                                        piped in order
  *   volume_probe write <name.zip> <dir>  pack @p dir as a zip split into
  *                                        64 KiB volumes, through
  *                                        garc_fs_sink_create_volumes()
@@ -91,6 +94,14 @@ static int write_split(const char * path, const char * from, int copy) {
   return 0;
 }
 
+/** Standard input as a stream that reads and does nothing else. */
+static GARC_Result stdin_read(void * ctx, void * buffer, size_t size,
+    size_t * out_read) {
+  (void)ctx;
+  *out_read = fread(buffer, 1, size, stdin);
+  return ferror(stdin) ? GARC_ERR_IO : GARC_OK;
+}
+
 int main(int argc, char ** argv) {
   if (argc == 4 && strcmp(argv[1], "write") == 0) {
     return write_split(argv[2], argv[3], 0);
@@ -106,9 +117,23 @@ int main(int argc, char ** argv) {
     return 2;
   }
   GARC_Archive * archive = NULL;
-  GARC_Result result = garc_fs_open(argv[1], NULL, NULL, 0, &archive);
+  GARC_Stream * piped = NULL;
+  GARC_Result result = GARC_OK;
+  if (strcmp(argv[1], "-") == 0) {
+    GARC_Stream_Callbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.read = stdin_read;
+    result = garc_stream_create_callback(&callbacks, &piped);
+    if (result == GARC_OK) {
+      result = garc_open(piped, NULL, &archive);
+    }
+  }
+  else {
+    result = garc_fs_open(argv[1], NULL, NULL, 0, &archive);
+  }
   if (result != GARC_OK) {
     fprintf(stderr, "%s: open: %s\n", argv[1], garc_result_string(result));
+    garc_stream_destroy(piped);
     return 1;
   }
   const GARC_Member * member = NULL;
@@ -130,12 +155,14 @@ int main(int argc, char ** argv) {
       fprintf(stderr, "%s: %.*s: %s\n", argv[1], (int)member->name_length,
           member->name, garc_result_string(result));
       garc_close(archive);
+      garc_stream_destroy(piped);
       return 1;
     }
     printf("%.*s\t%" PRIu64 "\t%08x\n", (int)member->name_length, member->name,
         size, (unsigned)gcomp_crc32_finalize(crc));
   }
   garc_close(archive);
+  garc_stream_destroy(piped);
   if (result != GARC_END) {
     fprintf(stderr, "%s: next: %s\n", argv[1], garc_result_string(result));
     return 1;

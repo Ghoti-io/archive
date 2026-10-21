@@ -156,6 +156,24 @@ def main(argv):
         else:
             checked += 1
 
+    # Every split zip again, its volumes piped in order as `cat` would give
+    # them: a stream that cannot seek and has no boundaries, read by its local
+    # headers with each disk's start worked out from its records.
+    piped = 0
+    for stem in ("split", "split64", "ours", "copied"):
+        parts = sorted(n for n in os.listdir(out) if n.startswith(stem + ".z"))
+        if not parts:
+            continue  # its writing failed, and said so above
+        joined = b"".join(open(os.path.join(out, n), "rb").read() for n in parts)
+        read = subprocess.run([probe, "-"], input=joined, capture_output=True)
+        got = sorted(line for line in read.stdout.decode("utf-8", "replace")
+            .splitlines() if line.strip())
+        if read.returncode != 0 or got != want:
+            failures.append("%s.zip from a pipe: read back %s %s" % (stem, got,
+                read.stderr.decode("utf-8", "replace").strip()))
+        else:
+            piped += 1
+
     if failures:
         sys.stderr.write("### check-volumes: a split archive did not read as "
             "it was written ###\n")
@@ -165,7 +183,8 @@ def main(argv):
     print("check-volumes: %d split sets from zip -s, zip -fz -s, 7z -v, "
         "GNU tar -M (with and without labels) and this library's own split "
         "zips, packed and raw-copied (which 7-Zip tests), each read back to "
-        "every file's size and CRC-32" % checked)
+        "every file's size and CRC-32; and %d of the split zips again from a "
+        "pipe" % (checked, piped))
     return 0
 
 

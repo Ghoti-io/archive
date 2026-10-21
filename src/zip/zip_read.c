@@ -66,6 +66,8 @@ static const uint8_t ZIP_SIG_EOCD[4] = {'P', 'K', 5, 6};
 static const uint8_t ZIP_SIG_ZIP64_EOCD[4] = {'P', 'K', 6, 6};
 /** Zip64 end of central directory locator. */
 static const uint8_t ZIP_SIG_ZIP64_LOCATOR[4] = {'P', 'K', 6, 7};
+/** The first four bytes of a split zip's first volume. */
+static const uint8_t ZIP_SIG_SPANNING[4] = {'P', 'K', 7, 8};
 
 /** The value a 32-bit field holds when the real one is in a zip64 extra. */
 #define ZIP_MARKER32 0xFFFFFFFFu
@@ -127,13 +129,16 @@ int garc_zip_identify(const uint8_t * bytes, size_t length) {
   }
   // A local header first, which is every ordinary zip; an end record, which is
   // an archive with no members; or a zip64 end record, which is what a writer
-  // that put no local headers in front of it would leave. A spanned-archive
-  // marker (`PK\x07\x08` as the first record) is deliberately not here: this
-  // library refuses multi-disk archives, and identifying one only to refuse it
-  // later would be worse than not claiming it.
+  // that put no local headers in front of it would leave. And the first volume
+  // of a split zip, whose spanning signature `PK\x07\x08` comes before its
+  // first local header: alone it is a descriptor's signature, so both are
+  // asked for. A seekable stream would find the set from its end anyway; a
+  // pipe has only these bytes.
   return memcmp(bytes, ZIP_SIG_LOCAL, 4) == 0
       || memcmp(bytes, ZIP_SIG_EOCD, 4) == 0
-      || memcmp(bytes, ZIP_SIG_ZIP64_EOCD, 4) == 0;
+      || memcmp(bytes, ZIP_SIG_ZIP64_EOCD, 4) == 0
+      || (length >= 8u && memcmp(bytes, ZIP_SIG_SPANNING, 4) == 0
+          && memcmp(bytes + 4, ZIP_SIG_LOCAL, 4) == 0);
 }
 
 GARC_Result garc_zip_locate_eocd(
@@ -2087,6 +2092,10 @@ GARC_Result garc_zip_raw_read(
 // that reaches the directory, which is the walk's verdict - two readers seeing
 // two archives in one file is the attack this closes. fuzz_zip compares the two
 // walks of every input, and each of those checks was added for a case it found.
+//
+// A split zip's volumes piped in order read the same way, its offsets counting
+// from volumes the pipe cannot see the edges of: zs_place() works out where
+// each disk began from the records on it, and holds them to one answer.
 
 /** What the walk saw of one member, to check against the directory. */
 typedef struct {
@@ -2362,6 +2371,51 @@ static GARC_Result zs_finish_member(GARC_Archive * archive) {
  * only as good as this check: an end record left unchecked would let an archive
  * whose seekable reading is refused be read to the end from a pipe.
  */
+/**
+ * Where the disks of a split zip begin, as far as a pipe can tell.
+ *
+ * A split zip's offsets count from the start of the volume they are in, and a
+ * pipe of its volumes in order has no boundaries to give. What it does have is
+ * every record's position in the whole and the offset its volume gave it, so
+ * each record says where its volume began. Those have to agree: one start for
+ * each disk, and a later disk starting after everything an earlier one held.
+ * A zip on one disk is the case where every start is 0, which is the check
+ * that its offsets are its positions.
+ */
+typedef struct {
+  uint32_t disk; ///< The disk the last record placed was on.
+  uint64_t base; ///< Where that disk began in the stream.
+  uint64_t last; ///< Where the last record placed began.
+} Zs_Disks;
+
+/**
+ * Place a record at @p at, which its volume calls @p offset, on @p disk.
+ *
+ * @return ::GARC_OK, or ::GARC_ERR_CORRUPT for a disk out of order or a start
+ *   another record contradicts.
+ */
+static GARC_Result zs_place(
+    Zs_Disks * disks, uint32_t disk, uint64_t at, uint64_t offset) {
+  if (offset > at || at < disks->last) {
+    return GARC_ERR_CORRUPT;
+  }
+  const uint64_t base = at - offset;
+  if (disk == disks->disk) {
+    if (base != disks->base) {
+      return GARC_ERR_CORRUPT;
+    }
+  }
+  else if (disk < disks->disk || base <= disks->last) {
+    // An earlier disk after a later one, or a volume that would begin before
+    // a record the one before it holds.
+    return GARC_ERR_CORRUPT;
+  }
+  disks->disk = disk;
+  disks->base = base;
+  disks->last = at;
+  return GARC_OK;
+}
+
 static GARC_Result zs_check_directory(GARC_Archive * archive) {
   GARC_Zip_State * zip = &archive->zip;
   size_t seen = 0;
@@ -2372,7 +2426,14 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
   uint64_t z64_size = 0;
   uint64_t z64_offset = 0;
   uint64_t z64_at = 0;
+  uint32_t z64_disk = 0;
+  uint32_t z64_central_disk = 0;
+  uint64_t z64_here = 0;
   int have_locator = 0;
+  uint32_t locator_disk = 0;
+  uint64_t locator_offset = 0;
+  uint32_t locator_disks = 0;
+  Zs_Disks disks = {0u, 0u, 0u};
   for (;;) {
     const uint64_t at = zip->position;
     uint8_t sig[4];
@@ -2440,14 +2501,20 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
       const uint16_t central_aes_method = central_aes ? extra.aes_real_method : 0u;
       const uint16_t central_aes_version = central_aes ? extra.aes_version : 0u;
       const uint8_t central_aes_strength = central_aes ? extra.aes_strength : 0u;
-      if (garc_zip_le16(entry + 34u) != 0u) {
-        return GARC_ERR_UNSUPPORTED; // on another disk, as garc_zip_open() says
+      // The disk the member starts on, from zip64's field when the 16-bit
+      // one holds the marker, as garc_zip_next() reads it.
+      uint32_t member_disk = garc_zip_le16(entry + 34u);
+      if (member_disk == ZIP_MARKER16) {
+        member_disk = extra.have_zip64_disk ? extra.zip64_disk : 0u;
+      }
+      if (zs_place(&disks, member_disk, record.offset, offset) != GARC_OK) {
+        return GARC_ERR_CORRUPT;
       }
       if (record.name_length != name_length
           || (name_length
               && memcmp(zip->s_names.bytes + record.name_at, zip->name.bytes,
                      name_length) != 0)
-          || record.offset != offset || record.method != garc_zip_le16(entry + 10u)
+          || record.method != garc_zip_le16(entry + 10u)
           || record.crc != garc_zip_le32(entry + 16u)
           || record.compressed != compressed || record.size != size
           || record.encryption != central_encryption
@@ -2475,13 +2542,10 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
           || declared - (GARC_ZIP_ZIP64_EOCD_SIZE - 12u) > ZIP_MARKER16) {
         return GARC_ERR_CORRUPT;
       }
-      const uint32_t disk = garc_zip_le32(record + 16u);
-      const uint32_t central_disk = garc_zip_le32(record + 20u);
-      const uint64_t entries_here = garc_zip_le64(record + 24u);
+      z64_disk = garc_zip_le32(record + 16u);
+      z64_central_disk = garc_zip_le32(record + 20u);
+      z64_here = garc_zip_le64(record + 24u);
       z64_entries = garc_zip_le64(record + 32u);
-      if (disk != 0u || central_disk != 0u || entries_here != z64_entries) {
-        return GARC_ERR_UNSUPPORTED;
-      }
       z64_size = garc_zip_le64(record + 40u);
       z64_offset = garc_zip_le64(record + 48u);
       result = zs_discard(archive, declared - (GARC_ZIP_ZIP64_EOCD_SIZE - 12u));
@@ -2503,12 +2567,10 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
       if (result != GARC_OK) {
         return result;
       }
-      if (garc_zip_le32(locator + 4u) != 0u || garc_zip_le32(locator + 16u) > 1u) {
-        return GARC_ERR_UNSUPPORTED;
-      }
-      if (garc_zip_le64(locator + 8u) != z64_at) {
-        return GARC_ERR_CORRUPT;
-      }
+      // Checked with the end record, which says how many disks there are.
+      locator_disk = garc_zip_le32(locator + 4u);
+      locator_offset = garc_zip_le64(locator + 8u);
+      locator_disks = garc_zip_le32(locator + 16u);
       have_locator = 1;
       continue;
     }
@@ -2525,19 +2587,27 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
       if (result != GARC_OK) {
         return result;
       }
-      const uint16_t disk = garc_zip_le16(eocd + 4u);
-      const uint16_t central_disk = garc_zip_le16(eocd + 6u);
-      const uint16_t entries_here = garc_zip_le16(eocd + 8u);
+      const uint16_t disk16 = garc_zip_le16(eocd + 4u);
+      const uint16_t central_disk16 = garc_zip_le16(eocd + 6u);
+      const uint16_t here16 = garc_zip_le16(eocd + 8u);
       const uint16_t entries_total = garc_zip_le16(eocd + 10u);
-      if (disk != 0u || central_disk != 0u || entries_here != entries_total) {
-        return GARC_ERR_UNSUPPORTED;
-      }
+      uint32_t disk = disk16;
+      uint32_t central_disk = central_disk16;
+      uint64_t entries_here = here16;
       uint64_t entries = entries_total;
       uint64_t central_size = garc_zip_le32(eocd + 12u);
       uint64_t central_offset = garc_zip_le32(eocd + 16u);
       if (have_zip64) {
         // As garc_zip_open() reads it: the zip64 record's values are the
-        // archive's whenever it is there, marker or not.
+        // archive's whenever it is there, marker or not. A 16-bit field that
+        // says something else than the marker or the record is two answers.
+        if ((disk16 != ZIP_MARKER16 && disk16 != z64_disk)
+            || (central_disk16 != ZIP_MARKER16 && central_disk16 != z64_central_disk)) {
+          return GARC_ERR_CORRUPT;
+        }
+        disk = z64_disk;
+        central_disk = z64_central_disk;
+        entries_here = z64_here;
         entries = z64_entries;
         central_size = z64_size;
         central_offset = z64_offset;
@@ -2546,11 +2616,48 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
           || central_offset == ZIP_MARKER32) {
         return GARC_ERR_CORRUPT; // "ask zip64" with no zip64 record
       }
+      // The 16-bit fields, as garc_zip_open() reads them before it looks for
+      // zip64: any disk, or two counts that differ, is a split set, and a set
+      // that turns out to be one disk is refused there for having no parts.
+      // So it is here, zip64 or not: otherwise a pipe would read to the end
+      // an archive whose end record the seekable reader cannot believe.
+      if (disk == 0u
+          && (disk16 != 0u || central_disk16 != 0u || here16 != entries_total)) {
+        return GARC_ERR_CORRUPT;
+      }
+      if (here16 != ZIP_MARKER16 && entries_total != ZIP_MARKER16
+          && here16 > entries_total) {
+        return GARC_ERR_CORRUPT;
+      }
       if (seen != zip->record_count || entries != (uint64_t)seen) {
         return GARC_ERR_CORRUPT; // a member the directory does not list
       }
-      if (central_size != central_end - central_start
-          || central_offset != central_start) {
+      if (central_size != central_end - central_start) {
+        return GARC_ERR_CORRUPT;
+      }
+      // The disks: the directory where its disk and offset say, the zip64
+      // record where the locator says, all on or before the last disk, and
+      // every entry counted on the last one when the directory is all there.
+      // A directory begun on an earlier disk has its first entry there, so
+      // the last disk cannot hold all of them.
+      if (central_disk > disk || entries_here > entries
+          || (central_disk == disk && entries_here != entries)
+          || (central_disk < disk && entries && entries_here == entries)
+          || zs_place(&disks, central_disk, central_start, central_offset)
+              != GARC_OK) {
+        return GARC_ERR_CORRUPT;
+      }
+      // A locator on a zip of one disk may count it as 1 or 0, as the
+      // seekable reader allows.
+      if (have_zip64
+          && (disk == UINT32_MAX
+              || (locator_disks != disk + 1u && (disk || locator_disks))
+              || locator_disk > disk
+              || zs_place(&disks, locator_disk, z64_at, locator_offset)
+                  != GARC_OK)) {
+        return GARC_ERR_CORRUPT;
+      }
+      if (disks.disk > disk) {
         return GARC_ERR_CORRUPT;
       }
       // The comment is kept, as garc_zip_open() keeps it. And the archive
@@ -2596,6 +2703,18 @@ GARC_Result garc_zip_stream_next(GARC_Archive * archive) {
   result = zs_read_exact(archive, header, 4u);
   if (result != GARC_OK) {
     return result;
+  }
+  if (zip->position == 4u && memcmp(header, ZIP_SIG_SPANNING, 4) == 0) {
+    // A split zip's first volume starts with this, and its first local
+    // header follows. Offsets on that volume count it, as they count from
+    // the volume's start.
+    result = zs_read_exact(archive, header, 4u);
+    if (result != GARC_OK) {
+      return result;
+    }
+    if (memcmp(header, ZIP_SIG_LOCAL, 4) != 0) {
+      return GARC_ERR_CORRUPT;
+    }
   }
   if (memcmp(header, ZIP_SIG_CENTRAL, 4) == 0
       || memcmp(header, ZIP_SIG_EOCD, 4) == 0

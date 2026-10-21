@@ -73,9 +73,14 @@
  * start of the part ("disk") they are in, so it is read from a concatenation of
  * every part in order - ::garc_stream_create_concat(), or ::garc_fs_open() on
  * its `.zip` - and the disk fields of every entry and end record are honoured,
- * zip64's included. Any other stream holding a part of one is
+ * zip64's included. Any other seekable stream holding a part of one is
  * ::GARC_ERR_UNSUPPORTED, as is a set whose end record names more disks than
- * the stream has parts.
+ * the stream has parts. **From a pipe**, a split zip is its volumes in order,
+ * as `cat` gives them: there are no boundaries to read, so where each disk
+ * began is worked out from its records - each one's place in the stream less
+ * the offset its volume gave it - and they must agree, one start per disk and
+ * every disk after the last, or the walk ends ::GARC_ERR_CORRUPT. The pipe's
+ * other limits hold, the descriptor rules above among them.
  *
  * **A zip must end where the stream ends.** The scan for the end record starts
  * at the end and goes back at most 65,557 bytes, which is the largest a record

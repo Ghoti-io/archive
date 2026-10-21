@@ -1928,12 +1928,13 @@ TEST(Zip, AnEndRecordThatDisagreesWithTheWalkIsRefusedOnAPipe) {
   };
   const Case cases[] = {
       {"control", 0, 0, false, GARC_END},
-      {"entries on this disk", 8, 2, false, GARC_ERR_UNSUPPORTED},
-      {"entries in all", 10, 2, false, GARC_ERR_UNSUPPORTED},
+      {"entries on this disk", 8, 2, false, GARC_ERR_CORRUPT},
+      {"entries in all", 10, 2, false, GARC_ERR_CORRUPT},
       {"both counts", 0, 0, false, GARC_ERR_CORRUPT},
       {"directory size", 12, 0, false, GARC_ERR_CORRUPT},
       {"directory offset", 16, 1, false, GARC_ERR_CORRUPT},
-      {"disk number", 4, 1, false, GARC_ERR_UNSUPPORTED},
+      // A second disk holding only the end record would count no entries.
+      {"disk number", 4, 1, false, GARC_ERR_CORRUPT},
       {"comment longer than what is left", 20, 9, false, GARC_ERR_CORRUPT},
       {"a byte after the end", 0, 0, true, GARC_ERR_FORMAT},
   };
@@ -2135,6 +2136,159 @@ TEST(Zip, ASplitZipWithoutAllItsPartsIsRefusedByName) {
   // offsets land on no header.
   got.clear();
   EXPECT_NE(GARC_OK, walk_parts({parts[2], parts[0], parts[1]}, &got));
+}
+
+/** Walk @p bytes off a pipe: the names and data, or the status that ended it. */
+GARC_Result walk_piped(const std::vector<uint8_t> & bytes,
+    std::vector<std::pair<std::string, std::string>> * out) {
+  Piped piped(bytes);
+  GARC_Result result = piped.open_result();
+  const GARC_Member * member = nullptr;
+  while (result == GARC_OK
+      && (result = garc_next(piped.archive(), &member)) == GARC_OK) {
+    GARC_Result status = GARC_OK;
+    const std::string data = read_checked(piped.archive(), &status);
+    if (status != GARC_OK) {
+      return status;
+    }
+    out->emplace_back(member_name(member), data);
+  }
+  return result == GARC_END ? GARC_OK : result;
+}
+
+/** The volumes of a split set back in a row, as `cat` would give them. */
+std::vector<uint8_t> joined(const std::vector<std::vector<uint8_t>> & parts) {
+  std::vector<uint8_t> out;
+  for (const auto & part : parts) {
+    out.insert(out.end(), part.begin(), part.end());
+  }
+  return out;
+}
+
+TEST(Zip, ASplitZipIsReadFromAPipeOfItsPartsInOrder) {
+  // A pipe has no boundaries, so each record says where its volume began -
+  // its place in the stream less the offset its volume gave it - and those
+  // must agree. Deflated, so that a descriptor member has an end of its own.
+  const std::vector<std::pair<std::string, std::string>> files = {
+      {"one.txt", patterned(5000, 3)}, {"two.txt", patterned(7000, 5)},
+      {"dir/three.txt", "three\n"}};
+  const std::vector<uint8_t> whole
+      = descriptor_zip(GARC_ZIP_METHOD_DEFLATE, files, true);
+  std::vector<std::pair<std::string, std::string>> want;
+  ASSERT_EQ(GARC_OK, walk_piped(whole, &want));
+  ASSERT_EQ(want.size(), files.size());
+  const size_t central = std::string(whole.begin(), whole.end())
+                             .find(std::string("PK\x01\x02", 4));
+  ASSERT_NE(central, std::string::npos);
+  const std::vector<std::vector<size_t>> cut_sets = {{100}, {20, 60, 90},
+      {central + 10}, {whole.size() - 30}, {30, 60, central, central + 50}};
+  for (const auto & cuts : cut_sets) {
+    SCOPED_TRACE(cuts.size());
+    const auto parts = split_zip(whole, cuts);
+    std::vector<std::pair<std::string, std::string>> got;
+    EXPECT_EQ(GARC_OK, walk_piped(joined(parts), &got));
+    EXPECT_TRUE(got == want);
+    // The seekable reader through the parts agrees.
+    std::vector<std::pair<std::string, std::string>> seek;
+    EXPECT_EQ(GARC_OK, walk_parts(parts, &seek));
+    EXPECT_TRUE(seek == want);
+  }
+}
+
+TEST(Zip, ASplitZipWhoseDisksDisagreeIsCorruptOnAPipe) {
+  const std::vector<uint8_t> whole = descriptor_zip(GARC_ZIP_METHOD_DEFLATE,
+      {{"one.txt", patterned(5000, 3)}, {"two.txt", "two\n"},
+          {"three.txt", "three\n"}},
+      true);
+  const size_t central = std::string(whole.begin(), whole.end())
+                             .find(std::string("PK\x01\x02", 4));
+  ASSERT_NE(central, std::string::npos);
+  // Each member on a disk of its own, and the directory on the last.
+  const size_t second = std::string(whole.begin(), whole.end())
+                            .find(std::string("PK\x03\x04", 4), 4);
+  ASSERT_NE(second, std::string::npos);
+  const std::vector<uint8_t> clean = joined(split_zip(whole, {second, central}));
+  const size_t directory = clean.size() - 22u
+      - (whole.size() - 22u - central); // where the directory is in the joined set
+  std::vector<std::pair<std::string, std::string>> got;
+  ASSERT_EQ(GARC_OK, walk_piped(clean, &got)) << "control";
+  const size_t two = directory + 46u + 7u; // the second entry: "one.txt" is 7
+  ASSERT_EQ(clean[two], 'P');
+  ASSERT_EQ(clean[two + 34], 1u);
+  struct Case {
+    const char * what;
+    size_t at;
+    uint8_t value;
+  };
+  const Case cases[] = {
+      // The second member's offset moved: its disk would begin somewhere the
+      // third member's says it does not.
+      {"an offset off by one", two + 42, static_cast<uint8_t>(clean[two + 42] + 1)},
+      // The second member on disk 0: its volume would begin after the first's.
+      {"a disk that went back", two + 34, 0},
+      // The directory said to start on disk 0, after members on disk 1.
+      {"the directory on an earlier disk", clean.size() - 22u + 6u, 0},
+      // The end record's disk before the directory's.
+      {"the last disk before the directory", clean.size() - 22u + 4u, 1},
+  };
+  for (const Case & c : cases) {
+    SCOPED_TRACE(c.what);
+    std::vector<uint8_t> bytes = clean;
+    bytes[c.at] = c.value;
+    got.clear();
+    EXPECT_EQ(GARC_ERR_CORRUPT, walk_piped(bytes, &got));
+  }
+}
+
+TEST(Zip, AZip64EndWhose16BitCountsDisagreeIsRefusedOnAPipe) {
+  // garc_zip_open() reads the 16-bit end record before it looks for zip64,
+  // and two counts that differ there are a split set - refused, on one
+  // stream, for having no parts. The pipe takes zip64's values for the
+  // archive's and must still refuse what the seekable reader does. fuzz_zip
+  // found the counts unchecked once the pipe began reading split sets.
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_force_zip64 = 1;
+  options.zip_method = GARC_ZIP_METHOD_DEFLATE;
+  GARC_Writer * writer = nullptr;
+  ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer), GARC_OK);
+  GARC_Member member;
+  std::memset(&member, 0, sizeof(member));
+  member.name = "member.txt";
+  member.name_length = 10;
+  member.type = GARC_MEMBER_FILE;
+  member.size = 7;
+  ASSERT_EQ(garc_writer_add(writer, &member), GARC_OK);
+  ASSERT_EQ(garc_writer_write(writer, "member\n", 7), GARC_OK);
+  ASSERT_EQ(garc_writer_finish(writer), GARC_OK);
+  const void * data = nullptr;
+  size_t length = 0;
+  ASSERT_EQ(garc_sink_data(sink, &data, &length), GARC_OK);
+  const std::vector<uint8_t> clean(static_cast<const uint8_t *>(data),
+      static_cast<const uint8_t *>(data) + length);
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  const size_t eocd = clean.size() - 22u;
+  ASSERT_EQ(0, std::memcmp(clean.data() + eocd, "PK\x05\x06", 4));
+  ASSERT_EQ(0, std::memcmp(clean.data() + eocd - 20u, "PK\x06\x07", 4));
+  std::vector<std::pair<std::string, std::string>> got;
+  ASSERT_EQ(GARC_OK, walk_piped(clean, &got)) << "control";
+  for (const size_t field : {size_t(8), size_t(10)}) {
+    SCOPED_TRACE(field == 8 ? "entries on this disk" : "entries in all");
+    std::vector<uint8_t> bytes = clean;
+    bytes[eocd + field] = 0x3f;
+    bytes[eocd + field + 1] = 0xc3;
+    got.clear();
+    EXPECT_EQ(GARC_ERR_CORRUPT, walk_piped(bytes, &got));
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(garc_stream_create_memory(bytes.data(), bytes.size(), &stream), GARC_OK);
+    GARC_Archive * archive = nullptr;
+    EXPECT_EQ(GARC_ERR_UNSUPPORTED, garc_open(stream, nullptr, &archive));
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
 }
 
 TEST(Zip, AZipBehindAStubIsNotFoundOnAPipe) {

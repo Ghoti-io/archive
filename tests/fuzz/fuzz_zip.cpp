@@ -163,6 +163,29 @@ struct Ended {
   GARC_Result last = GARC_ERR_INTERNAL; ///< What ended the walk.
 };
 
+/**
+ * Whether the end record at the end of @p body says more than one disk.
+ *
+ * Read as the pipe reads it: the 22-byte record whose comment runs exactly
+ * to the end, and the zip64 locator's disk count before it when there is one.
+ */
+bool declares_disks(const uint8_t * body, size_t size) {
+  auto le16 = [body](size_t at) { return (uint32_t)(body[at] | (body[at + 1] << 8)); };
+  auto le32 = [&](size_t at) { return le16(at) | (le16(at + 2) << 16); };
+  for (size_t comment = 0; comment <= 0xFFFFu && comment + 22u <= size; ++comment) {
+    const size_t at = size - 22u - comment;
+    if (std::memcmp(body + at, "PK\x05\x06", 4) != 0 || le16(at + 20) != comment) {
+      continue;
+    }
+    if (le16(at + 4) != 0u || le16(at + 6) != 0u) {
+      return true;
+    }
+    return at >= 20u && std::memcmp(body + at - 20u, "PK\x06\x07", 4) == 0
+        && le32(at - 20u + 16u) > 1u;
+  }
+  return false;
+}
+
 /** How the bytes reach the reader. */
 enum class Shape { memory, pipe, two_parts };
 
@@ -430,10 +453,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   }
 
   // **A streamed walk that the directory approved is the seekable walk.**
+  // Except for a split zip, which a pipe of its volumes reads and one stream
+  // of memory refuses, having no parts to place its disks in.
   std::vector<Seen> piped;
   const Ended p_end = walk(body, body_size, limits, nullptr, nullptr, read_data,
       Shape::pipe, &piped);
-  if (p_end.opened && p_end.last == GARC_END) {
+  const bool split_set = declares_disks(body, body_size);
+  if (p_end.opened && p_end.last == GARC_END && !split_set) {
     REQUIRE(b && b_end.last == GARC_END,
         "a pipe read to the end an archive the seekable reader refuses");
     REQUIRE(piped.size() == without.size(),
@@ -451,6 +477,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   std::vector<Seen> split;
   const Ended s_end = walk(body, body_size, limits, nullptr, nullptr, read_data,
       Shape::two_parts, &split);
+  if (split_set && p_end.opened && p_end.last == GARC_END && s_end.opened
+      && s_end.last == GARC_END) {
+    // A split set the pipe read, and the cut happened to fall where its
+    // second disk begins: the two readings of it must be one.
+    REQUIRE(split.size() == piped.size(),
+        "a split zip read differently from a pipe and from its parts");
+    for (size_t i = 0; i < split.size(); ++i) {
+      REQUIRE(!(split[i] != piped[i]),
+          "a split zip's member read differently from a pipe and from its parts");
+    }
+  }
   if (b && b_end.last == GARC_END) {
     REQUIRE(s_end.opened && s_end.last == GARC_END,
         "a zip read from memory was refused when cut in two");
