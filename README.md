@@ -525,7 +525,8 @@ sees a path; `fs.h` is the half that does, and `archive.h` does not include it.
   it is and a writer for what it will be, with `garc_fs_update_keep()` copying a
   member across (raw, for zip), so deleting, replacing, renaming and adding are
   all one walk and an atomic rename. `GARC_FS_IN_PLACE` appends instead, to an
-  uncompressed tar or a zip where it lies, and an abandoned append puts the file
+  uncompressed tar, a zip or a 7z where it lies - a 7z's folders carried into its
+  new header undecoded, BCJ2's included - and an abandoned append puts the file
   back byte for byte.
 
 **Allocation.** Everything goes through a `GARC_Allocator`, which is cutil's

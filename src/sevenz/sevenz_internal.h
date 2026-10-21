@@ -145,6 +145,94 @@ void garc_sevenz_release(GARC_Archive * archive);
 void garc_sevenz_counts(
     const GARC_Archive * archive, uint64_t * out_folders, uint64_t * out_files);
 
+/** One coder of a carried folder, as the header lists it. */
+typedef struct {
+  uint8_t id[8];      ///< The method id, most significant byte first.
+  uint8_t id_len;     ///< Bytes of @ref id in use.
+  uint32_t num_in;    ///< Streams it consumes.
+  uint32_t num_out;   ///< Streams it produces.
+  uint32_t props_off; ///< Into ::GARC_SevenZ_Carry.props.
+  uint32_t props_len; ///< Its property bytes.
+} GARC_SevenZ_Carry_Coder;
+
+/** One folder of an archive being appended to, as its header lists it. */
+typedef struct {
+  uint32_t coder0;  ///< First coder, into ::GARC_SevenZ_Carry.coders.
+  uint32_t ncoders; ///< Its coders.
+  uint32_t bind0;   ///< First bind pair (two numbers each), into binds.
+  uint32_t nbind;   ///< Its bind pairs.
+  uint32_t packed0; ///< First packed in-stream index, into packed.
+  uint32_t npacked; ///< Its packed streams.
+  uint32_t unpack0; ///< First out-stream size, into unpack_sizes.
+  uint32_t nout;    ///< Its out streams.
+  uint32_t nsub;    ///< Members it holds.
+  int has_crc;      ///< Whether it has a folder CRC-32.
+  uint32_t crc;     ///< That CRC-32.
+} GARC_SevenZ_Carry_Folder;
+
+/** One entry of the file table of an archive being appended to. */
+typedef struct {
+  uint32_t name_off; ///< Into ::GARC_SevenZ_Carry.names, UTF-8.
+  uint32_t name_len; ///< Its bytes.
+  uint8_t flags;     ///< The ::GARC_SEVENZ_CARRY_EMPTY_STREAM family.
+  uint64_t mtime;    ///< FILETIME ticks, with ::GARC_SEVENZ_CARRY_HAS_MTIME.
+  uint32_t attrib;   ///< The attribute word, with ::GARC_SEVENZ_CARRY_HAS_ATTRIB.
+} GARC_SevenZ_Carry_File;
+
+#define GARC_SEVENZ_CARRY_EMPTY_STREAM 1u ///< No stream: a directory or empty file.
+#define GARC_SEVENZ_CARRY_EMPTY_FILE 2u   ///< An empty stream that is a file.
+#define GARC_SEVENZ_CARRY_ANTI 4u         ///< An empty stream that is an anti-item.
+#define GARC_SEVENZ_CARRY_HAS_MTIME 8u    ///< Has a modification time.
+#define GARC_SEVENZ_CARRY_HAS_ATTRIB 16u  ///< Has an attribute word.
+
+/**
+ * What an archive's header says, in the form a writer can say it again: the
+ * tables an in-place append keeps and adds to (::garc_fs_update_begin()).
+ *
+ * Everything the reader keeps of a header, which is everything this library
+ * reads: the packed streams, every folder's coders as they were, their sizes
+ * and CRC-32s, how they divide into members, and the file table's names,
+ * empty-stream, empty-file and anti bits, modification times and attributes.
+ * Not carried, as the reader does not keep them: creation and access times,
+ * a packed stream's own CRC-32, and archive properties.
+ */
+typedef struct GARC_SevenZ_Carry {
+  /** Where the packed streams end, counted from the end of the start header. */
+  uint64_t data_end;
+  uint32_t num_pack;         ///< Packed streams.
+  uint64_t * pack_sizes;     ///< Their sizes.
+  uint32_t num_folders;      ///< Folders.
+  GARC_SevenZ_Carry_Folder * folders; ///< The folders.
+  GARC_SevenZ_Carry_Coder * coders;   ///< Every folder's coders.
+  uint32_t * binds;          ///< Every bind pair: in-stream, then out-stream.
+  uint32_t * packed;         ///< Every folder's packed in-stream indices.
+  uint8_t * props;           ///< Every coder's properties.
+  uint64_t * unpack_sizes;   ///< Every folder's out-stream sizes.
+  uint64_t num_sub;          ///< Members with a stream, across the folders.
+  uint64_t * sub_sizes;      ///< Each one's size.
+  uint8_t * sub_has_crc;     ///< Whether each has a CRC-32.
+  uint32_t * sub_crc;        ///< Each one's CRC-32.
+  uint64_t num_files;        ///< Entries in the file table.
+  GARC_SevenZ_Carry_File * files; ///< The entries.
+  char * names;              ///< Their names, UTF-8, end to end.
+} GARC_SevenZ_Carry;
+
+/**
+ * Copy an open 7z's header tables for an in-place append.
+ *
+ * @param archive A 7z, open.
+ * @param allocator Where the copy is allocated.
+ * @param out Receives the copy, freed with ::garc_sevenz_carry_free().
+ * @return ::GARC_OK, ::GARC_ERR_OOM, or ::GARC_ERR_INVALID for an archive
+ *   that is not a 7z.
+ */
+GARC_Result garc_sevenz_carry(const GARC_Archive * archive,
+    const GARC_Allocator * allocator, GARC_SevenZ_Carry ** out);
+
+/** Free a ::GARC_SevenZ_Carry; NULL is allowed. */
+void garc_sevenz_carry_free(GARC_SevenZ_Carry * carry,
+    const GARC_Allocator * allocator);
+
 #ifdef __cplusplus
 }
 #endif

@@ -38,8 +38,11 @@
  * Usage:
  *   sevenz_writer_probe write <directory>   write the archives, print intent
  *   sevenz_writer_probe read <path.7z>      print this library's reading
+ *   sevenz_writer_probe append <path.7z>    add one member where the archive
+ *                                           lies (::GARC_FS_IN_PLACE), print
+ *                                           its row
  *
- * Both print tab-separated rows:
+ * Each prints tab-separated rows:
  *
  *   archive name type size mtime mode link crc
  *
@@ -53,6 +56,7 @@
 #include <string.h>
 
 #include <ghoti.io/archive/archive.h>
+#include <ghoti.io/archive/fs.h>
 #include <ghoti.io/compress/crc32.h>
 
 typedef struct {
@@ -374,6 +378,48 @@ static int do_read(const char * path) {
   return 0;
 }
 
+/**
+ * Append one member to the 7z at @p path where it lies (::GARC_FS_IN_PLACE),
+ * and print its row as `write` prints the intent.
+ */
+static int do_append(const char * path) {
+  static const char NAME[] = "appended/by-the-probe.txt";
+  static const char DATA[] = "appended in place by sevenz_writer_probe\n";
+  GARC_Fs_Update * update = NULL;
+  GARC_Result result = garc_fs_update_begin(path, NULL, NULL,
+      GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update);
+  if (result == GARC_OK) {
+    GARC_Member member;
+    memset(&member, 0, sizeof(member));
+    member.name = NAME;
+    member.name_length = sizeof(NAME) - 1u;
+    member.type = GARC_MEMBER_FILE;
+    member.size = sizeof(DATA) - 1u;
+    member.mode = 0640;
+    member.mode_valid = 1;
+    member.mtime_seconds = 1234567890;
+    member.mtime_source = GARC_TIME_FILETIME;
+    GARC_Writer * writer = garc_fs_update_writer(update);
+    result = garc_writer_add(writer, &member);
+    if (result == GARC_OK) {
+      result = garc_writer_write(writer, DATA, sizeof(DATA) - 1u);
+    }
+  }
+  if (result == GARC_OK) {
+    result = garc_fs_update_commit(update);
+  }
+  garc_fs_update_destroy(update);
+  if (result != GARC_OK) {
+    fprintf(stderr, "%s: append: %s\n", path, garc_result_string(result));
+    return 1;
+  }
+  const uint32_t crc = gcomp_crc32_finalize(gcomp_crc32_update(
+      GCOMP_CRC32_INIT, (const uint8_t *)DATA, sizeof(DATA) - 1u));
+  print_row(path, NAME, sizeof(NAME) - 1u, "file", sizeof(DATA) - 1u,
+      1234567890, 0640, NULL, 0u, crc);
+  return 0;
+}
+
 static const struct {
   const char * name;
   GARC_SevenZ_Method method;
@@ -402,6 +448,11 @@ int main(int argc, char ** argv) {
   if (argc == 3 && strcmp(argv[1], "read") == 0) {
     return do_read(argv[2]);
   }
-  fprintf(stderr, "usage: %s write <directory> | read <path.7z>\n", argv[0]);
+  if (argc == 3 && strcmp(argv[1], "append") == 0) {
+    return do_append(argv[2]);
+  }
+  fprintf(stderr,
+      "usage: %s write <directory> | read <path.7z> | append <path.7z>\n",
+      argv[0]);
   return 2;
 }

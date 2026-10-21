@@ -36,6 +36,7 @@
 
 #include "fs/fs_internal.h"
 #include "reader/reader_internal.h"
+#include "sevenz/sevenz_internal.h"
 #include "writer/writer_internal.h"
 
 /** Every flag ::garc_fs_update_begin() accepts. */
@@ -74,8 +75,14 @@ struct GARC_Fs_Update {
    */
   GCU_File_Temp tail_file;
   bool tail_in_file;                ///< Whether @ref tail_file holds the tail.
-  /** Where the archive's own offsets count from: a zip's stub, or 0. */
+  /** Where the archive's own offsets count from: a zip's or a 7z's stub, or 0. */
   uint64_t origin;
+  /**
+   * A 7z's start header before the append, which the writer rewrites: put
+   * back with the tail when the append is abandoned.
+   */
+  uint8_t start[GARC_SEVENZ_START_SIZE];
+  bool start_saved;                 ///< Whether @ref start holds it.
   bool touched;                     ///< Whether the append has written a byte.
 };
 
@@ -337,6 +344,80 @@ static GARC_Result update_begin_zip(GARC_Fs_Update * update, const char * path,
   return result;
 }
 
+/**
+ * Append to a 7z where it lies: the new folders go where its packed streams
+ * end - over its header, which the tail keeps - and the writer, which has the
+ * old header's tables, writes them and the new ones in a new header, then the
+ * start header that points at it.
+ */
+static GARC_Result update_begin_sevenz(GARC_Fs_Update * update, const char * path,
+    const GARC_Limits * limits, const GARC_Writer_Options * options) {
+  GARC_Stream * stream = NULL;
+  GARC_Result result = garc_fs_stream_open_with_allocator(
+      path, update->allocator, &stream);
+  if (result != GARC_OK) {
+    return result;
+  }
+  GARC_Archive * archive = NULL;
+  GARC_SevenZ_Carry * carry = NULL;
+  result = garc_open_with_allocator(stream, limits, update->allocator, &archive);
+  if (result == GARC_OK) {
+    update->origin = garc_base_offset(archive);
+    result = garc_sevenz_carry(archive, update->allocator, &carry);
+  }
+  // Closed before the file is opened to be written, which Windows wants.
+  garc_close(archive);
+  garc_stream_destroy(stream);
+  if (result != GARC_OK) {
+    return result;
+  }
+  const uint64_t data = GARC_SEVENZ_START_SIZE + carry->data_end;
+  update->end = update->origin + data;
+  result = garc_fs_from_file(gcu_file_open(&update->file, path,
+      GCU_FILE_OPEN_UPDATE, GCU_FILE_PERMS_PRESERVE, update->allocator));
+  int64_t file_length = 0;
+  size_t got = 0;
+  if (result == GARC_OK
+      && (update->end > (uint64_t)INT64_MAX
+          || gcu_file_seek(&update->file, 0, GCU_FILE_SEEK_END) != GCU_FILE_OK
+          || gcu_file_tell(&update->file, &file_length) != GCU_FILE_OK
+          || (uint64_t)file_length < update->end
+          || gcu_file_seek(&update->file, (int64_t)update->origin, GCU_FILE_SEEK_SET)
+              != GCU_FILE_OK
+          || gcu_file_read_bytes(&update->file, update->start, sizeof(update->start),
+                 &got) != GCU_FILE_OK
+          || got != sizeof(update->start))) {
+    result = GARC_ERR_IO;
+  }
+  if (result == GARC_OK) {
+    update->start_saved = true;
+    update->length = (uint64_t)file_length;
+    result = update_save_tail(update, update->end);
+  }
+  if (result == GARC_OK
+      && gcu_file_seek(&update->file, (int64_t)update->end, GCU_FILE_SEEK_SET)
+          != GCU_FILE_OK) {
+    result = GARC_ERR_IO;
+  }
+  if (result == GARC_OK) {
+    GARC_Sink_Callbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.write = update_write;
+    callbacks.patch = update_patch;
+    callbacks.ctx = update;
+    // In the archive's own frame, past any stub, as the start header counts.
+    callbacks.start = data;
+    result = garc_sink_create_callback_with_allocator(
+        &callbacks, update->allocator, &update->sink);
+  }
+  if (result != GARC_OK) {
+    garc_sevenz_carry_free(carry, update->allocator);
+    return result;
+  }
+  return garc_writer_create_sevenz_append(
+      update->sink, options, update->allocator, carry, &update->writer);
+}
+
 static GARC_Result update_begin_in_place(GARC_Fs_Update * update,
     const char * path, const GARC_Limits * limits,
     const GARC_Writer_Options * options) {
@@ -347,6 +428,9 @@ static GARC_Result update_begin_in_place(GARC_Fs_Update * update,
   }
   if (format == GARC_FORMAT_ZIP) {
     return update_begin_zip(update, path, limits, options);
+  }
+  if (format == GARC_FORMAT_SEVENZ) {
+    return update_begin_sevenz(update, path, limits, options);
   }
   result = update_find_end(path, limits, update->allocator, &update->end);
   if (result != GARC_OK) {
@@ -498,6 +582,28 @@ GARC_Result garc_fs_update_commit(GARC_Fs_Update * update) {
   if (result != GARC_OK) {
     return result;
   }
+  if (update->in_place && update->start_saved) {
+    // A 7z's start header, which now points at the new header: written last,
+    // as the writer patches it last in a new archive. Abandoned before here,
+    // the tail and the old start header both go back (garc_fs_update_destroy).
+    uint8_t start[GARC_SEVENZ_START_SIZE];
+    int64_t here = 0;
+    result = garc_sevenz_write_start_header(update->writer, start);
+    if (result == GARC_OK
+        && (gcu_file_tell(&update->file, &here) != GCU_FILE_OK
+            || update->origin > (uint64_t)INT64_MAX
+            || gcu_file_seek(&update->file, (int64_t)update->origin,
+                   GCU_FILE_SEEK_SET) != GCU_FILE_OK
+            || gcu_file_write_bytes(&update->file, start, sizeof(start))
+                != GCU_FILE_OK
+            || gcu_file_seek(&update->file, here, GCU_FILE_SEEK_SET)
+                != GCU_FILE_OK)) {
+      result = GARC_ERR_IO;
+    }
+    if (result != GARC_OK) {
+      return result;
+    }
+  }
   if (update->in_place) {
     // The archive now ends where the writer stopped; what the old one had past
     // that - a zip's longer directory or comment, padding - would read as more.
@@ -538,6 +644,11 @@ void garc_fs_update_destroy(GARC_Fs_Update * update) {
   if (update->in_place && !update->committed && update->file.stream
       && update->tail_in_file && update->touched) {
     update_restore_tail(update, update->end);
+    if (update->start_saved && update->origin <= (uint64_t)INT64_MAX
+        && gcu_file_seek(&update->file, (int64_t)update->origin, GCU_FILE_SEEK_SET)
+            == GCU_FILE_OK) {
+      (void)gcu_file_write_bytes(&update->file, update->start, sizeof(update->start));
+    }
   }
   if (update->in_place && !update->committed && update->file.stream
       && update->tail && update->sink

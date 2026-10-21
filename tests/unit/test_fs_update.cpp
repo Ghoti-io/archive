@@ -408,6 +408,233 @@ TEST_F(FsUpdate, AppendingInPlaceToAZipBehindAStubKeepsItsOffsets) {
   EXPECT_EQ(read_all(at("sfx.exe")).size(), 4u);
 }
 
+namespace {
+
+/** A member as a read reports it: what an append must leave alone. */
+struct Seen7z {
+  std::string name;
+  GARC_Member_Type type = GARC_MEMBER_FILE;
+  std::string data;
+  GARC_Result status = GARC_OK;
+  int64_t mtime = 0;
+  uint32_t mode = 0;
+  bool operator==(const Seen7z & o) const {
+    return name == o.name && type == o.type && data == o.data
+        && status == o.status && mtime == o.mtime && mode == o.mode;
+  }
+};
+
+std::vector<Seen7z> read_7z(const std::string & path) {
+  std::vector<Seen7z> found;
+  GARC_Archive * archive = nullptr;
+  EXPECT_EQ(garc_fs_open(path.c_str(), nullptr, nullptr, 0, &archive), GARC_OK);
+  if (!archive) {
+    return found;
+  }
+  EXPECT_EQ(garc_format(archive), GARC_FORMAT_SEVENZ);
+  const GARC_Member * member = nullptr;
+  GARC_Result result;
+  while ((result = garc_next(archive, &member)) == GARC_OK) {
+    Seen7z seen;
+    seen.name.assign(member->name, member->name_length);
+    seen.type = member->type;
+    seen.mtime = member->mtime_seconds;
+    seen.mode = member->mode_valid ? member->mode : 0u;
+    char buffer[4096];
+    size_t got = 0;
+    while ((seen.status = garc_read_member(archive, buffer, sizeof(buffer), &got))
+            == GARC_OK
+        && got) {
+      seen.data.append(buffer, got);
+    }
+    found.push_back(seen);
+  }
+  EXPECT_EQ(result, GARC_END);
+  garc_close(archive);
+  return found;
+}
+
+/** The next header's offset from a 7z's start header: where its packed data ends, or later. */
+uint64_t next_header_offset(const std::string & bytes, size_t origin = 0) {
+  uint64_t value = 0;
+  for (int i = 7; i >= 0; --i) {
+    value = (value << 8) | static_cast<uint8_t>(bytes[origin + 12 + i]);
+  }
+  return value;
+}
+
+} // namespace
+
+TEST_F(FsUpdate, AppendingInPlaceToASevenZipWritesAfterItsPackedStreams) {
+  // The new folders go where the old packed streams end, over the old header;
+  // the new header lists the old folders as they were and the new ones after
+  // them, and the start header is rewritten to point at it. Every packed byte
+  // before the old header is the same. Solid and not, and stored.
+  for (const GARC_SevenZ_Method method : {GARC_SEVENZ_LZMA2, GARC_SEVENZ_COPY}) {
+    for (const int non_solid : {0, 1}) {
+      SCOPED_TRACE(std::to_string(method) + (non_solid ? " non-solid" : " solid"));
+      GARC_Writer_Options options;
+      garc_writer_options_default(&options);
+      options.sevenz_method = method;
+      options.sevenz_non_solid = non_solid;
+      {
+        GARC_Sink * sink = nullptr;
+        ASSERT_EQ(garc_fs_sink_create(at("log.7z").c_str(), nullptr, nullptr,
+                      GARC_FS_NO_SYNC, &sink), GARC_OK);
+        GARC_Writer * writer = nullptr;
+        ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_SEVENZ, &options, &writer),
+            GARC_OK);
+        for (const Entry & entry : kThree) {
+          ASSERT_EQ(add(writer, entry), GARC_OK);
+        }
+        ASSERT_EQ(garc_writer_finish(writer), GARC_OK);
+        ASSERT_EQ(garc_sink_finish(sink), GARC_OK);
+        garc_writer_destroy(writer);
+        garc_sink_destroy(sink);
+      }
+      const std::string before = read_file(at("log.7z"));
+      const std::vector<Seen7z> old = read_7z(at("log.7z"));
+      const uint64_t packed = next_header_offset(before);
+      GARC_Fs_Update * update = nullptr;
+      ASSERT_EQ(garc_fs_update_begin(at("log.7z").c_str(), nullptr, &options,
+                    GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+          GARC_OK);
+      EXPECT_EQ(garc_fs_update_archive(update), nullptr);
+      ASSERT_EQ(add(garc_fs_update_writer(update), {"d.txt", "delta\n"}), GARC_OK);
+      ASSERT_EQ(add(garc_fs_update_writer(update), {"e.txt", std::string(9000, 'e')}),
+          GARC_OK);
+      ASSERT_EQ(garc_fs_update_commit(update), GARC_OK);
+      garc_fs_update_destroy(update);
+      const std::string after = read_file(at("log.7z"));
+      EXPECT_EQ(after.substr(32, (size_t)packed), before.substr(32, (size_t)packed));
+      const std::vector<Seen7z> now = read_7z(at("log.7z"));
+      ASSERT_EQ(now.size(), 5u);
+      for (size_t i = 0; i < old.size(); ++i) {
+        EXPECT_TRUE(now[i] == old[i]) << old[i].name;
+      }
+      EXPECT_EQ(now[3].name, "d.txt");
+      EXPECT_EQ(now[3].data, "delta\n");
+      EXPECT_EQ(now[4].data, std::string(9000, 'e'));
+
+      // And a second append, onto the first one's header.
+      ASSERT_EQ(garc_fs_update_begin(at("log.7z").c_str(), nullptr, &options,
+                    GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+          GARC_OK);
+      ASSERT_EQ(add(garc_fs_update_writer(update), {"f.txt", "foxtrot\n"}), GARC_OK);
+      ASSERT_EQ(garc_fs_update_commit(update), GARC_OK);
+      garc_fs_update_destroy(update);
+      const std::vector<Seen7z> twice = read_7z(at("log.7z"));
+      ASSERT_EQ(twice.size(), 6u);
+      EXPECT_EQ(twice[5].data, "foxtrot\n");
+      EXPECT_EQ(names(), (std::set<std::string>{"log.7z"}));
+      gcu_file_remove(at("log.7z").c_str());
+    }
+  }
+}
+
+TEST_F(FsUpdate, AppendingInPlaceToEverySevenZipFixtureKeepsWhatItHad) {
+  // Archives 7-Zip wrote: encoded headers, folders of several coders (BCJ,
+  // BCJ2's four streams, delta), every method, a symlink. Their folders are
+  // carried into the new header as they were, so each reads as it did, its
+  // refusals included, with the new member after them.
+  size_t fixtures = 0;
+  for (const char * name : {"arm64.7z", "arm.7z", "armt.7z", "basic.7z", "bcj2.7z",
+           "bcj.7z", "bzip2.7z", "copy.7z", "deflate64.7z", "deflate.7z", "delta.7z",
+           "ia64.7z", "lzma.7z", "nonsolid.7z", "plainhdr.7z", "ppc.7z", "riscv.7z",
+           "sparc.7z", "symlink.7z"}) {
+    SCOPED_TRACE(name);
+    const std::string source = read_file(std::string(GARC_TEST_DATA) + "/sevenz/" + name);
+    ASSERT_FALSE(source.empty());
+    {
+      GARC_Sink * sink = nullptr;
+      ASSERT_EQ(garc_fs_sink_create(at("x.7z").c_str(), nullptr, nullptr,
+                    GARC_FS_NO_SYNC, &sink), GARC_OK);
+      ASSERT_EQ(garc_sink_write(sink, source.data(), source.size()), GARC_OK);
+      ASSERT_EQ(garc_sink_finish(sink), GARC_OK);
+      garc_sink_destroy(sink);
+    }
+    const std::vector<Seen7z> old = read_7z(at("x.7z"));
+    ASSERT_FALSE(old.empty());
+    GARC_Fs_Update * update = nullptr;
+    ASSERT_EQ(garc_fs_update_begin(at("x.7z").c_str(), nullptr, nullptr,
+                  GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+        GARC_OK);
+    ASSERT_EQ(add(garc_fs_update_writer(update), {"added.txt", "added\n"}), GARC_OK);
+    ASSERT_EQ(garc_fs_update_commit(update), GARC_OK);
+    garc_fs_update_destroy(update);
+    const std::vector<Seen7z> now = read_7z(at("x.7z"));
+    ASSERT_EQ(now.size(), old.size() + 1u);
+    for (size_t i = 0; i < old.size(); ++i) {
+      EXPECT_TRUE(now[i] == old[i]) << old[i].name;
+    }
+    EXPECT_EQ(now.back().name, "added.txt");
+    EXPECT_EQ(now.back().data, "added\n");
+    gcu_file_remove(at("x.7z").c_str());
+    ++fixtures;
+  }
+  EXPECT_EQ(fixtures, 19u);
+}
+
+TEST_F(FsUpdate, AppendingInPlaceToAnEmptySevenZipGivesItAHeader) {
+  // An archive of nothing has no header - its start header names none - so
+  // the new folder goes straight after the start header.
+  make("empty.7z", GARC_FORMAT_SEVENZ, {});
+  ASSERT_EQ(read_file(at("empty.7z")).size(), 32u);
+  GARC_Fs_Update * update = nullptr;
+  ASSERT_EQ(garc_fs_update_begin(at("empty.7z").c_str(), nullptr, nullptr,
+                GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+      GARC_OK);
+  ASSERT_EQ(add(garc_fs_update_writer(update), {"first.txt", "first\n"}), GARC_OK);
+  ASSERT_EQ(garc_fs_update_commit(update), GARC_OK);
+  garc_fs_update_destroy(update);
+  EXPECT_EQ(read_all(at("empty.7z")),
+      (std::vector<Entry>{{"first.txt", "first\n"}}));
+}
+
+TEST_F(FsUpdate, AnAbandonedInPlaceSevenZipAppendPutsTheFileBackAsItWas) {
+  make("log.7z", GARC_FORMAT_SEVENZ, kThree);
+  const std::string before = read_file(at("log.7z"));
+  GARC_Fs_Update * update = nullptr;
+  ASSERT_EQ(garc_fs_update_begin(at("log.7z").c_str(), nullptr, nullptr,
+                GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+      GARC_OK);
+  ASSERT_EQ(add(garc_fs_update_writer(update), {"half.txt", std::string(50000, 'h')}),
+      GARC_OK);
+  garc_fs_update_destroy(update);
+  EXPECT_EQ(read_file(at("log.7z")), before);
+  EXPECT_EQ(read_all(at("log.7z")), kThree);
+  EXPECT_EQ(names(), (std::set<std::string>{"log.7z"}));
+}
+
+TEST_F(FsUpdate, AppendingInPlaceToASevenZipBehindAStubKeepsTheStub) {
+  // A self-extractor: the start header is after the stub, and its offsets
+  // count from there, the new folders' too.
+  make("plain.7z", GARC_FORMAT_SEVENZ, kThree);
+  std::string stub(70000, '\0');
+  stub[0] = 'M';
+  stub[1] = 'Z';
+  {
+    GARC_Sink * sink = nullptr;
+    ASSERT_EQ(garc_fs_sink_create(at("sfx.exe").c_str(), nullptr, nullptr,
+                  GARC_FS_NO_SYNC, &sink), GARC_OK);
+    const std::string body = stub + read_file(at("plain.7z"));
+    ASSERT_EQ(garc_sink_write(sink, body.data(), body.size()), GARC_OK);
+    ASSERT_EQ(garc_sink_finish(sink), GARC_OK);
+    garc_sink_destroy(sink);
+  }
+  GARC_Fs_Update * update = nullptr;
+  ASSERT_EQ(garc_fs_update_begin(at("sfx.exe").c_str(), nullptr, nullptr,
+                GARC_FS_IN_PLACE | GARC_FS_NO_SYNC, &update),
+      GARC_OK);
+  ASSERT_EQ(add(garc_fs_update_writer(update), {"d.txt", "delta\n"}), GARC_OK);
+  ASSERT_EQ(garc_fs_update_commit(update), GARC_OK);
+  garc_fs_update_destroy(update);
+  EXPECT_EQ(read_file(at("sfx.exe")).substr(0, stub.size()), stub);
+  const std::vector<Seen7z> now = read_7z(at("sfx.exe"));
+  ASSERT_EQ(now.size(), 4u);
+  EXPECT_EQ(now[3].data, "delta\n");
+}
+
 TEST_F(FsUpdate, InPlaceIsRefusedWhereItCannotBeHonest) {
   make("x.zip", GARC_FORMAT_ZIP, kThree);
   make("x.tar.gz", GARC_FORMAT_TAR, kThree, "gzip");

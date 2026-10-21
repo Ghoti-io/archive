@@ -173,9 +173,14 @@ GARC_Result garc_writer_create(GARC_Sink * sink, GARC_Format format,
       sink, format, options, NULL, out_writer);
 }
 
-GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
-    GARC_Format format, const GARC_Writer_Options * options,
-    const GARC_Allocator * allocator, GARC_Writer ** out_writer) {
+/**
+ * Create a writer; for a 7z with @p carry, one that appends to the archive
+ * those tables describe. @p carry is the writer's from the moment
+ * @p carry_taken is set, and the caller's to free otherwise.
+ */
+static GARC_Result writer_create(GARC_Sink * sink, GARC_Format format,
+    const GARC_Writer_Options * options, const GARC_Allocator * allocator,
+    GARC_SevenZ_Carry * carry, int * carry_taken, GARC_Writer ** out_writer) {
   if (!out_writer || !sink) {
     return GARC_ERR_INVALID;
   }
@@ -328,7 +333,12 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
   }
 
   if (format == GARC_FORMAT_SEVENZ) {
-    const GARC_Result begun = garc_sevenz_write_begin(writer);
+    if (carry) {
+      *carry_taken = 1;
+    }
+    const GARC_Result begun = carry
+        ? garc_sevenz_write_begin_append(writer, carry)
+        : garc_sevenz_write_begin(writer);
     if (begun != GARC_OK) {
       garc_writer_destroy(writer);
       return begun;
@@ -337,6 +347,24 @@ GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
 
   *out_writer = writer;
   return GARC_OK;
+}
+
+GARC_Result garc_writer_create_with_allocator(GARC_Sink * sink,
+    GARC_Format format, const GARC_Writer_Options * options,
+    const GARC_Allocator * allocator, GARC_Writer ** out_writer) {
+  return writer_create(sink, format, options, allocator, NULL, NULL, out_writer);
+}
+
+GARC_Result garc_writer_create_sevenz_append(GARC_Sink * sink,
+    const GARC_Writer_Options * options, const GARC_Allocator * allocator,
+    GARC_SevenZ_Carry * carry, GARC_Writer ** out_writer) {
+  int taken = 0;
+  const GARC_Result result = writer_create(sink, GARC_FORMAT_SEVENZ, options,
+      allocator, carry, &taken, out_writer);
+  if (!taken) {
+    garc_sevenz_carry_free(carry, allocator ? allocator : garc_allocator_default());
+  }
+  return result;
 }
 
 GARC_Result garc_writer_add(GARC_Writer * writer, const GARC_Member * member) {

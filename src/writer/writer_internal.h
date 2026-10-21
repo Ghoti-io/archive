@@ -39,6 +39,8 @@
 #include "core/buffer_internal.h"
 #include "reader/reader_internal.h"
 
+struct GARC_SevenZ_Carry; // sevenz_internal.h
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -438,6 +440,48 @@ void garc_zip_write_release(GARC_Writer * writer);
  * @return ::GARC_OK, ::GARC_ERR_OOM, or the sink's failure.
  */
 GARC_Result garc_sevenz_write_begin(GARC_Writer * writer);
+
+/**
+ * Start appending to a 7z: no signature header is reserved, because the
+ * archive has one, which ::garc_sevenz_write_end() rewrites. The sink must
+ * stand where @p carry's packed streams end, in the archive's own frame.
+ *
+ * @param writer The writer.
+ * @param carry The archive's header tables; the writer's from this call on.
+ * @return ::GARC_OK, ::GARC_ERR_OOM, or ::GARC_ERR_INTERNAL for a sink that is
+ *   not where the packed streams end.
+ */
+GARC_Result garc_sevenz_write_begin_append(
+    GARC_Writer * writer, struct GARC_SevenZ_Carry * carry);
+
+/**
+ * The start header an appending 7z writer made at its end, which goes over
+ * the archive's old one at offset 0 of its frame - before where the sink
+ * starts, so the update writes it rather than the sink.
+ *
+ * @param writer The writer.
+ * @param out Receives the 32 bytes.
+ * @return ::GARC_OK, or ::GARC_ERR_INVALID before ::garc_writer_finish() or
+ *   for a writer that is not appending to a 7z.
+ */
+GARC_Result garc_sevenz_write_start_header(
+    const GARC_Writer * writer, uint8_t out[32]);
+
+/**
+ * Create a writer that appends to the 7z whose tables @p carry holds: as
+ * ::garc_writer_create_with_allocator() for ::GARC_FORMAT_SEVENZ otherwise.
+ *
+ * @param sink Where the archive is; standing where its packed streams end.
+ * @param options For the writer, or NULL for the defaults.
+ * @param allocator Where the writer allocates, or NULL for the default.
+ * @param carry From ::garc_sevenz_carry(); taken by the call whatever it
+ *   returns.
+ * @param out_writer Receives the writer.
+ * @return As ::garc_writer_create_with_allocator().
+ */
+GARC_Result garc_writer_create_sevenz_append(GARC_Sink * sink,
+    const GARC_Writer_Options * options, const GARC_Allocator * allocator,
+    struct GARC_SevenZ_Carry * carry, GARC_Writer ** out_writer);
 
 /**
  * Add a member to the archive's table. A directory or an empty file has no

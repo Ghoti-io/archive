@@ -282,6 +282,57 @@ def main(argv):
                     % (tested.returncode,
                         tested.stderr.decode("utf-8", "replace").strip()))
 
+    # Appended to where it lies: three of the archives above, and one 7-Zip
+    # writes with a BCJ2 folder - four packed streams - and an encoded
+    # header, which this library can carry into a new header and not decode.
+    # 7-Zip tests each, and its listing must be the old one's members as they
+    # were and the appended one after them.
+    appended = 0
+    made = reference("sevenzip", ["sh", "-c",
+        'mkdir -p "$0/ref-src" && cd "$0/ref-src" '
+        '&& printf "plain text\\n" > a.txt '
+        '&& head -c 40000 /usr/lib/7zip/7zCon.sfx > code.bin '
+        '&& cd .. && 7z a -bso0 -bsp0 -mf=BCJ2 -mhc=on ref-bcj2.7z ./ref-src/*',
+        work], work)
+    if made.returncode != 0:
+        failures.append("7-Zip could not write the BCJ2 archive: %s"
+            % made.stderr.decode("utf-8", "replace").strip())
+    for name in ["lzma2.7z", "lzma2-nonsolid.7z", "bzip2.7z", "ref-bcj2.7z"]:
+        source = os.path.join(work, name)
+        if not os.path.exists(source):
+            failures.append("append: %s was not written" % name)
+            continue
+        target = os.path.join(work, "appended-" + name)
+        with open(source, "rb") as fin, open(target, "wb") as fout:
+            fout.write(fin.read())
+        before = reference("sevenzip", ["7z", "l", "-slt", target], work)
+        added = subprocess.run([probe, "append", target], capture_output=True,
+            text=True)
+        if added.returncode != 0:
+            failures.append("append %s: %s" % (name, added.stderr.strip()))
+            continue
+        tested = reference("sevenzip", ["7z", "t", "-bso0", "-bsp0", target], work)
+        if tested.returncode != 0 or tested.stderr.strip():
+            failures.append("appended %s: 7z t exited %d: %s" % (name,
+                tested.returncode,
+                tested.stderr.decode("utf-8", "replace").strip()))
+            continue
+        after = reference("sevenzip", ["7z", "l", "-slt", target], work)
+        keys = ("Path", "Size", "CRC", "Attributes", "Modified")
+        old = [tuple(f.get(k) for k in keys) for f in
+            sevenzip_listing(before.stdout)]
+        new = [tuple(f.get(k) for k in keys) for f in
+            sevenzip_listing(after.stdout)]
+        row = rows_from(added.stdout)[0]
+        if new[:-1] != old or not new or new[-1][0] != row["name"].decode("utf-8") \
+                or new[-1][1] != row["size"] \
+                or (new[-1][2] or "").lower().rjust(8, "0") != row["crc"]:
+            failures.append("appended %s: 7-Zip lists\n      %s\n    after\n"
+                "      %s" % (name, "\n      ".join(map(str, new)),
+                    "\n      ".join(map(str, old))))
+            continue
+        appended += 1
+
     if failures:
         sys.stderr.write("### check-sevenz-writer: the references disagree "
             "with the writer ###\n")
@@ -292,11 +343,17 @@ def main(argv):
         sys.stderr.write("### check-sevenz-writer: the self-extractor step "
             "compared nothing ###\n")
         return 1
+    if appended != 4:
+        sys.stderr.write("### check-sevenz-writer: %d of 4 in-place appends "
+            "were checked ###\n" % appended)
+        return 1
     print("check-sevenz-writer: %d archives, %d members each, all accepted "
         "by 7-Zip and all but %s by libarchive; %d fields compared against "
-        "the intent, and %d more from %s behind 7-Zip's 7zCon.sfx"
+        "the intent, and %d more from %s behind 7-Zip's 7zCon.sfx; %d "
+        "appended in place, one of them 7-Zip's own with BCJ2 and an encoded "
+        "header, each tested and listed by 7-Zip"
         % (len(archives), EXPECTED_MEMBERS, DEFLATE64_ARCHIVE, compared,
-            sfx_checked, archives[0]))
+            sfx_checked, archives[0], appended))
     return 0
 
 

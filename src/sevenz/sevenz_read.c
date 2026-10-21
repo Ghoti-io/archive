@@ -2058,3 +2058,128 @@ void garc_sevenz_counts(
   *out_folders = z ? z->main.num_folders : 0u;
   *out_files = z ? z->num_files : 0u;
 }
+
+////////////////////////////////////////////////////////////////////////
+// Carrying a header into an append
+////////////////////////////////////////////////////////////////////////
+
+/** A copy of @p count items of @p size bytes, or NULL; a count of 0 is one byte. */
+static void * sz_copy(const GARC_Allocator * a, const void * from,
+    uint64_t count, size_t size) {
+  void * to = sz_calloc(a, count, size);
+  if (to && count && from) {
+    memcpy(to, from, (size_t)count * size);
+  }
+  return to;
+}
+
+void garc_sevenz_carry_free(GARC_SevenZ_Carry * carry,
+    const GARC_Allocator * allocator) {
+  if (!carry) {
+    return;
+  }
+  gcu_allocator_free(allocator, carry->pack_sizes);
+  gcu_allocator_free(allocator, carry->folders);
+  gcu_allocator_free(allocator, carry->coders);
+  gcu_allocator_free(allocator, carry->binds);
+  gcu_allocator_free(allocator, carry->packed);
+  gcu_allocator_free(allocator, carry->props);
+  gcu_allocator_free(allocator, carry->unpack_sizes);
+  gcu_allocator_free(allocator, carry->sub_sizes);
+  gcu_allocator_free(allocator, carry->sub_has_crc);
+  gcu_allocator_free(allocator, carry->sub_crc);
+  gcu_allocator_free(allocator, carry->files);
+  gcu_allocator_free(allocator, carry->names);
+  gcu_allocator_free(allocator, carry);
+}
+
+GARC_Result garc_sevenz_carry(const GARC_Archive * archive,
+    const GARC_Allocator * allocator, GARC_SevenZ_Carry ** out) {
+  if (!archive || !out || archive->format != GARC_FORMAT_SEVENZ
+      || !archive->sevenz) {
+    return GARC_ERR_INVALID;
+  }
+  const struct GARC_SevenZ * z = archive->sevenz;
+  const Streams * s = &z->main;
+  const GARC_Allocator * a = allocator;
+  GARC_SevenZ_Carry * c
+      = (GARC_SevenZ_Carry *)gcu_allocator_calloc(a, 1, sizeof(*c));
+  if (!c) {
+    return GARC_ERR_OOM;
+  }
+  c->num_pack = s->num_pack;
+  c->data_end = s->pack_pos;
+  if (s->num_pack) {
+    c->data_end += s->pack_offsets[s->num_pack - 1u]
+        + s->pack_sizes[s->num_pack - 1u];
+  }
+  c->pack_sizes = (uint64_t *)sz_copy(a, s->pack_sizes, s->num_pack, sizeof(uint64_t));
+  c->num_folders = s->num_folders;
+  c->folders = (GARC_SevenZ_Carry_Folder *)sz_calloc(
+      a, s->num_folders, sizeof(GARC_SevenZ_Carry_Folder));
+  c->coders = (GARC_SevenZ_Carry_Coder *)sz_calloc(
+      a, s->num_coders, sizeof(GARC_SevenZ_Carry_Coder));
+  c->binds = (uint32_t *)sz_calloc(a, (uint64_t)s->num_binds * 2u, sizeof(uint32_t));
+  c->packed = (uint32_t *)sz_copy(a, s->packed, s->num_packed, sizeof(uint32_t));
+  c->props = (uint8_t *)sz_copy(a, s->props, s->props_len, 1u);
+  c->unpack_sizes = (uint64_t *)sz_copy(a, s->unpack, s->num_unpack, sizeof(uint64_t));
+  c->num_sub = s->num_sub;
+  c->sub_sizes = (uint64_t *)sz_copy(a, s->sub_sizes, s->num_sub, sizeof(uint64_t));
+  c->sub_has_crc = (uint8_t *)sz_copy(a, s->sub_has_crc, s->num_sub, 1u);
+  c->sub_crc = (uint32_t *)sz_copy(a, s->sub_crc, s->num_sub, sizeof(uint32_t));
+  c->num_files = z->num_files;
+  c->files = (GARC_SevenZ_Carry_File *)sz_calloc(
+      a, z->num_files, sizeof(GARC_SevenZ_Carry_File));
+  c->names = (char *)sz_copy(a, z->names, z->names_len, 1u);
+  if (!c->pack_sizes || !c->folders || !c->coders || !c->binds || !c->packed
+      || !c->props || !c->unpack_sizes || !c->sub_sizes || !c->sub_has_crc
+      || !c->sub_crc || !c->files || !c->names) {
+    garc_sevenz_carry_free(c, a);
+    return GARC_ERR_OOM;
+  }
+  for (uint32_t i = 0; i < s->num_folders; ++i) {
+    const Folder * f = &s->folders[i];
+    GARC_SevenZ_Carry_Folder * to = &c->folders[i];
+    to->coder0 = f->coder0;
+    to->ncoders = f->ncoders;
+    to->bind0 = f->bind0;
+    to->nbind = f->nbind;
+    to->packed0 = f->packed0;
+    to->npacked = f->npacked;
+    to->unpack0 = f->unpack0;
+    to->nout = f->nout;
+    to->nsub = f->nsub;
+    to->has_crc = f->has_crc;
+    to->crc = f->crc;
+  }
+  for (uint32_t i = 0; i < s->num_coders; ++i) {
+    const Coder * from = &s->coders[i];
+    GARC_SevenZ_Carry_Coder * to = &c->coders[i];
+    memcpy(to->id, from->id, sizeof(to->id));
+    to->id_len = from->id_len;
+    to->num_in = from->num_in;
+    to->num_out = from->num_out;
+    to->props_off = from->props_off;
+    to->props_len = from->props_len;
+  }
+  for (uint32_t i = 0; i < s->num_binds; ++i) {
+    c->binds[2u * i] = s->binds[i].in_index;
+    c->binds[2u * i + 1u] = s->binds[i].out_index;
+  }
+  for (uint64_t i = 0; i < z->num_files; ++i) {
+    const File * from = &z->files[i];
+    GARC_SevenZ_Carry_File * to = &c->files[i];
+    to->name_off = from->name_off;
+    to->name_len = from->name_len;
+    to->mtime = from->mtime;
+    to->attrib = from->attrib;
+    to->flags = (uint8_t)(((from->flags & SZF_EMPTY_STREAM)
+                              ? GARC_SEVENZ_CARRY_EMPTY_STREAM : 0u)
+        | ((from->flags & SZF_EMPTY_FILE) ? GARC_SEVENZ_CARRY_EMPTY_FILE : 0u)
+        | ((from->flags & SZF_ANTI) ? GARC_SEVENZ_CARRY_ANTI : 0u)
+        | ((from->flags & SZF_HAS_MTIME) ? GARC_SEVENZ_CARRY_HAS_MTIME : 0u)
+        | ((from->flags & SZF_HAS_ATTRIB) ? GARC_SEVENZ_CARRY_HAS_ATTRIB : 0u));
+  }
+  *out = c;
+  return GARC_OK;
+}

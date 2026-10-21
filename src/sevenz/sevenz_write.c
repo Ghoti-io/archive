@@ -130,6 +130,17 @@ struct GARC_SevenZ_Write {
   uint32_t running_crc; ///< The unfinalized CRC-32 so far.
   uint32_t current; ///< Index in entries.
   int in_member; ///< Whether a member is open.
+  /**
+   * The header tables of the archive being appended to, which the new header
+   * lists first; NULL for a new archive. Owned.
+   */
+  GARC_SevenZ_Carry * carry;
+  /**
+   * With @ref carry, the start header ::garc_sevenz_write_end() made, for the
+   * update to write over the old one: it is before where the sink starts.
+   */
+  uint8_t start[GARC_SEVENZ_START_SIZE];
+  int start_ready; ///< Whether @ref start is made.
 };
 
 static GARC_Result szw_grow(const GARC_Allocator * a, void * slot,
@@ -165,6 +176,26 @@ static const char * szw_encoder_name(GARC_SevenZ_Method method) {
     default:
       return "deflate";
   }
+}
+
+GARC_Result garc_sevenz_write_begin_append(
+    GARC_Writer * writer, GARC_SevenZ_Carry * carry) {
+  const GARC_Allocator * a = writer->allocator;
+  struct GARC_SevenZ_Write * z = (struct GARC_SevenZ_Write *)gcu_allocator_calloc(
+      a, 1, sizeof(*z));
+  if (!z) {
+    garc_sevenz_carry_free(carry, a);
+    return GARC_ERR_OOM;
+  }
+  writer->sevenz = z;
+  z->carry = carry;
+  // The archive's own frame: its start header is at 0, and the sink starts
+  // where its packed streams end, so the new ones follow them.
+  z->origin = 0;
+  if (garc_sink_tell(writer->sink) != GARC_SEVENZ_START_SIZE + carry->data_end) {
+    return GARC_ERR_INTERNAL;
+  }
+  return GARC_OK;
 }
 
 GARC_Result garc_sevenz_write_begin(GARC_Writer * writer) {
@@ -632,53 +663,219 @@ static void put_name(GARC_Buffer * b, const GARC_Allocator * a,
   put_byte(b, a, 0, status);
 }
 
+/** A carried folder's record: its coders, bind pairs and packed indices. */
+static void put_carry_folder(GARC_Buffer * b, const GARC_Allocator * a,
+    const GARC_SevenZ_Carry * c, const GARC_SevenZ_Carry_Folder * f,
+    GARC_Result * status) {
+  put_number(b, a, f->ncoders, status);
+  for (uint32_t i = 0; i < f->ncoders; ++i) {
+    const GARC_SevenZ_Carry_Coder * coder = &c->coders[f->coder0 + i];
+    const int complex = coder->num_in != 1u || coder->num_out != 1u;
+    put_byte(b, a, (uint8_t)(coder->id_len | (complex ? 0x10u : 0u)
+                       | (coder->props_len ? 0x20u : 0u)), status);
+    put_bytes(b, a, coder->id, coder->id_len, status);
+    if (complex) {
+      put_number(b, a, coder->num_in, status);
+      put_number(b, a, coder->num_out, status);
+    }
+    if (coder->props_len) {
+      put_number(b, a, coder->props_len, status);
+      put_bytes(b, a, c->props + coder->props_off, coder->props_len, status);
+    }
+  }
+  for (uint32_t i = 0; i < f->nbind; ++i) {
+    put_number(b, a, c->binds[2u * (f->bind0 + i)], status);
+    put_number(b, a, c->binds[2u * (f->bind0 + i) + 1u], status);
+  }
+  if (f->npacked > 1u) {
+    for (uint32_t i = 0; i < f->npacked; ++i) {
+      put_number(b, a, c->packed[f->packed0 + i], status);
+    }
+  }
+}
+
+/**
+ * The file table's entries, carried first and then the writer's own, seen
+ * one way: whether each has a stream, is an empty file or an anti-item, and
+ * its time and attributes.
+ */
+typedef struct {
+  const GARC_SevenZ_Carry * c;        ///< The carried tables, or NULL.
+  const struct GARC_SevenZ_Write * z; ///< The writer, for its own entries.
+  uint64_t carried;                   ///< How many entries come from @ref c.
+} SzwFiles;
+
+static int szw_file_stream(const SzwFiles * f, uint64_t i) {
+  return i < f->carried
+      ? !(f->c->files[i].flags & GARC_SEVENZ_CARRY_EMPTY_STREAM)
+      : f->z->entries[i - f->carried].has_stream;
+}
+
+static int szw_file_empty(const SzwFiles * f, uint64_t i) {
+  return i < f->carried ? (f->c->files[i].flags & GARC_SEVENZ_CARRY_EMPTY_FILE) != 0
+                        : (f->z->entries[i - f->carried].flags & SZWF_EMPTY_FILE) != 0;
+}
+
+static int szw_file_anti(const SzwFiles * f, uint64_t i) {
+  return i < f->carried && (f->c->files[i].flags & GARC_SEVENZ_CARRY_ANTI) != 0;
+}
+
+static int szw_file_mtime(const SzwFiles * f, uint64_t i, uint64_t * out) {
+  if (i < f->carried) {
+    *out = f->c->files[i].mtime;
+    return (f->c->files[i].flags & GARC_SEVENZ_CARRY_HAS_MTIME) != 0;
+  }
+  *out = f->z->entries[i - f->carried].mtime;
+  return (f->z->entries[i - f->carried].flags & SZWF_HAS_MTIME) != 0;
+}
+
+static int szw_file_attrib(const SzwFiles * f, uint64_t i, uint32_t * out) {
+  if (i < f->carried) {
+    *out = f->c->files[i].attrib;
+    return (f->c->files[i].flags & GARC_SEVENZ_CARRY_HAS_ATTRIB) != 0;
+  }
+  *out = f->z->entries[i - f->carried].attrib;
+  return 1;
+}
+
+static void szw_file_name(const SzwFiles * f, uint64_t i,
+    const uint8_t ** name, size_t * length) {
+  if (i < f->carried) {
+    *name = (const uint8_t *)f->c->names + f->c->files[i].name_off;
+    *length = f->c->files[i].name_len;
+    return;
+  }
+  const SzwEntry * e = &f->z->entries[i - f->carried];
+  *name = (const uint8_t *)f->z->names.bytes + e->name_off;
+  *length = e->name_len;
+}
+
+/** A property of the file table: its id, then its length, then @p part. */
+static void put_property(GARC_Buffer * h, const GARC_Allocator * a, uint8_t id,
+    GARC_Buffer * part, GARC_Result * status) {
+  put_byte(h, a, id, status);
+  put_number(h, a, part->length, status);
+  put_bytes(h, a, part->bytes, part->length, status);
+  garc_buffer_free(a, part);
+  memset(part, 0, sizeof(*part));
+}
+
+/**
+ * A digest list, or a defined-vector: 1 then the values when all of @p n are
+ * defined, else 0, the bits, and the defined values.
+ */
+static void put_defined(GARC_Buffer * b, const GARC_Allocator * a,
+    const uint8_t * defined, uint64_t n, GARC_Result * status) {
+  int all = 1;
+  for (uint64_t i = 0; i < n; ++i) {
+    all &= defined[i] != 0;
+  }
+  put_byte(b, a, all ? 0x01u : 0x00u, status);
+  if (!all) {
+    put_bits(b, a, defined, n, status);
+  }
+}
+
 static GARC_Result szw_build_header(
     GARC_Writer * writer, GARC_Buffer * h) {
   struct GARC_SevenZ_Write * z = writer->sevenz;
+  const GARC_SevenZ_Carry * c = z->carry;
   const GARC_Allocator * a = writer->allocator;
   const GARC_SevenZ_Method method = writer->options.sevenz_method;
   GARC_Result status = GARC_OK;
+  const uint32_t carried_folders = c ? c->num_folders : 0u;
+  const uint64_t folders = (uint64_t)carried_folders + z->num_folders;
+  const uint64_t carried_pack = c ? c->num_pack : 0u;
   put_byte(h, a, 0x01, &status);
-  if (z->num_folders) {
+  if (folders) {
     put_byte(h, a, 0x04, &status);
     put_byte(h, a, 0x06, &status);
     put_number(h, a, 0, &status);
-    put_number(h, a, z->num_folders, &status);
+    put_number(h, a, carried_pack + z->num_folders, &status);
     put_byte(h, a, 0x09, &status);
+    for (uint64_t i = 0; i < carried_pack; ++i) {
+      put_number(h, a, c->pack_sizes[i], &status);
+    }
     for (uint32_t i = 0; i < z->num_folders; ++i) {
       put_number(h, a, z->folders[i].pack_size, &status);
     }
     put_byte(h, a, 0x00, &status);
     put_byte(h, a, 0x07, &status);
     put_byte(h, a, 0x0B, &status);
-    put_number(h, a, z->num_folders, &status);
+    put_number(h, a, folders, &status);
     put_byte(h, a, 0x00, &status);
+    for (uint32_t i = 0; i < carried_folders; ++i) {
+      put_carry_folder(h, a, c, &c->folders[i], &status);
+    }
     for (uint32_t i = 0; i < z->num_folders; ++i) {
       put_number(h, a, 1, &status);
       put_coder(h, a, method, &status);
     }
     put_byte(h, a, 0x0C, &status);
+    for (uint32_t i = 0; i < carried_folders; ++i) {
+      const GARC_SevenZ_Carry_Folder * f = &c->folders[i];
+      for (uint32_t j = 0; j < f->nout; ++j) {
+        put_number(h, a, c->unpack_sizes[f->unpack0 + j], &status);
+      }
+    }
     for (uint32_t i = 0; i < z->num_folders; ++i) {
       put_number(h, a, z->folders[i].unpack_size, &status);
     }
+    // Folder CRC-32s, which only carried folders have: the writer's own are
+    // checked member by member.
+    int any_folder_crc = 0;
+    for (uint32_t i = 0; i < carried_folders; ++i) {
+      any_folder_crc |= c->folders[i].has_crc;
+    }
+    if (any_folder_crc) {
+      uint8_t * def = (uint8_t *)gcu_allocator_calloc(a, (size_t)folders, 1u);
+      if (!def) {
+        return GARC_ERR_OOM;
+      }
+      for (uint32_t i = 0; i < carried_folders; ++i) {
+        def[i] = (uint8_t)(c->folders[i].has_crc != 0);
+      }
+      put_byte(h, a, 0x0A, &status);
+      put_defined(h, a, def, folders, &status);
+      for (uint32_t i = 0; i < carried_folders; ++i) {
+        if (c->folders[i].has_crc) {
+          put_u32(h, a, c->folders[i].crc, &status);
+        }
+      }
+      gcu_allocator_free(a, def);
+    }
     put_byte(h, a, 0x00, &status);
+
     put_byte(h, a, 0x08, &status);
     int any_not_one = 0;
     int any_many = 0;
-    uint64_t substreams = 0;
+    for (uint32_t i = 0; i < carried_folders; ++i) {
+      any_not_one |= c->folders[i].nsub != 1u;
+      any_many |= c->folders[i].nsub > 1u;
+    }
     for (uint32_t i = 0; i < z->num_folders; ++i) {
       any_not_one |= z->folders[i].nsub != 1u;
       any_many |= z->folders[i].nsub > 1u;
-      substreams += z->folders[i].nsub;
     }
     if (any_not_one) {
       put_byte(h, a, 0x0D, &status);
+      for (uint32_t i = 0; i < carried_folders; ++i) {
+        put_number(h, a, c->folders[i].nsub, &status);
+      }
       for (uint32_t i = 0; i < z->num_folders; ++i) {
         put_number(h, a, z->folders[i].nsub, &status);
       }
     }
     if (any_many) {
       put_byte(h, a, 0x09, &status);
+      uint64_t sub = 0;
+      for (uint32_t i = 0; i < carried_folders; ++i) {
+        const uint32_t nsub = c->folders[i].nsub;
+        for (uint32_t j = 0; j + 1u < nsub; ++j) {
+          put_number(h, a, c->sub_sizes[sub + j], &status);
+        }
+        sub += nsub;
+      }
       uint32_t e = 0;
       for (uint32_t i = 0; i < z->num_folders; ++i) {
         uint32_t seen = 0;
@@ -694,116 +891,153 @@ static GARC_Result szw_build_header(
         }
       }
     }
-    put_byte(h, a, 0x0A, &status);
-    put_byte(h, a, 0x01, &status);
-    for (uint32_t e = 0; e < z->num_entries; ++e) {
-      if (z->entries[e].has_stream) {
-        put_u32(h, a, z->entries[e].crc, &status);
+    // The digests of every member a folder CRC does not already check: a
+    // folder of one member with a CRC passes it down, as the reader takes it.
+    uint64_t listed = 0;
+    for (uint32_t i = 0; i < carried_folders; ++i) {
+      const GARC_SevenZ_Carry_Folder * f = &c->folders[i];
+      if (!(f->nsub == 1u && f->has_crc)) {
+        listed += f->nsub;
       }
     }
-    (void)substreams;
+    uint64_t own = 0;
+    for (uint32_t e = 0; e < z->num_entries; ++e) {
+      own += z->entries[e].has_stream ? 1u : 0u;
+    }
+    if (listed + own) {
+      uint8_t * def = (uint8_t *)gcu_allocator_calloc(a, (size_t)(listed + own), 1u);
+      if (!def) {
+        return GARC_ERR_OOM;
+      }
+      uint64_t k = 0;
+      uint64_t sub = 0;
+      for (uint32_t i = 0; i < carried_folders; ++i) {
+        const GARC_SevenZ_Carry_Folder * f = &c->folders[i];
+        if (!(f->nsub == 1u && f->has_crc)) {
+          for (uint32_t j = 0; j < f->nsub; ++j) {
+            def[k++] = c->sub_has_crc[sub + j];
+          }
+        }
+        sub += f->nsub;
+      }
+      for (; k < listed + own; ++k) {
+        def[k] = 1u;
+      }
+      put_byte(h, a, 0x0A, &status);
+      put_defined(h, a, def, listed + own, &status);
+      gcu_allocator_free(a, def);
+      sub = 0;
+      for (uint32_t i = 0; i < carried_folders; ++i) {
+        const GARC_SevenZ_Carry_Folder * f = &c->folders[i];
+        if (!(f->nsub == 1u && f->has_crc)) {
+          for (uint32_t j = 0; j < f->nsub; ++j) {
+            if (c->sub_has_crc[sub + j]) {
+              put_u32(h, a, c->sub_crc[sub + j], &status);
+            }
+          }
+        }
+        sub += f->nsub;
+      }
+      for (uint32_t e = 0; e < z->num_entries; ++e) {
+        if (z->entries[e].has_stream) {
+          put_u32(h, a, z->entries[e].crc, &status);
+        }
+      }
+    }
     put_byte(h, a, 0x00, &status);
     put_byte(h, a, 0x00, &status);
   }
 
-  if (z->num_entries) {
+  SzwFiles files = {c, z, c ? c->num_files : 0u};
+  const uint64_t total = files.carried + z->num_entries;
+  if (total) {
     put_byte(h, a, 0x05, &status);
-    put_number(h, a, z->num_entries, &status);
-    uint8_t * bits = (uint8_t *)gcu_allocator_calloc(a, z->num_entries, 1u);
-    uint8_t * empty_bits = (uint8_t *)gcu_allocator_calloc(a, z->num_entries, 1u);
-    if (!bits || !empty_bits) {
+    put_number(h, a, total, &status);
+    uint8_t * bits = (uint8_t *)gcu_allocator_calloc(a, (size_t)total, 1u);
+    uint8_t * empty_bits = (uint8_t *)gcu_allocator_calloc(a, (size_t)total, 1u);
+    uint8_t * anti_bits = (uint8_t *)gcu_allocator_calloc(a, (size_t)total, 1u);
+    if (!bits || !empty_bits || !anti_bits) {
       gcu_allocator_free(a, bits);
       gcu_allocator_free(a, empty_bits);
+      gcu_allocator_free(a, anti_bits);
       return GARC_ERR_OOM;
     }
     uint64_t nempty = 0;
     int any_file = 0;
-    int any_mtime = 0;
-    for (uint32_t e = 0; e < z->num_entries; ++e) {
-      const SzwEntry * entry = &z->entries[e];
-      if (!entry->has_stream) {
+    int any_anti = 0;
+    for (uint64_t e = 0; e < total; ++e) {
+      if (!szw_file_stream(&files, e)) {
         bits[e] = 1;
-        empty_bits[nempty++] = (entry->flags & SZWF_EMPTY_FILE) ? 1u : 0u;
-        any_file |= (entry->flags & SZWF_EMPTY_FILE) != 0;
-      }
-      any_mtime |= (entry->flags & SZWF_HAS_MTIME) != 0;
-    }
-    if (nempty) {
-      GARC_Buffer part;
-      memset(&part, 0, sizeof(part));
-      put_bits(&part, a, bits, z->num_entries, &status);
-      put_byte(h, a, 0x0E, &status);
-      put_number(h, a, part.length, &status);
-      put_bytes(h, a, part.bytes, part.length, &status);
-      garc_buffer_free(a, &part);
-      if (any_file) {
-        memset(&part, 0, sizeof(part));
-        put_bits(&part, a, empty_bits, nempty, &status);
-        put_byte(h, a, 0x0F, &status);
-        put_number(h, a, part.length, &status);
-        put_bytes(h, a, part.bytes, part.length, &status);
-        garc_buffer_free(a, &part);
+        empty_bits[nempty] = szw_file_empty(&files, e) ? 1u : 0u;
+        anti_bits[nempty] = szw_file_anti(&files, e) ? 1u : 0u;
+        any_file |= empty_bits[nempty];
+        any_anti |= anti_bits[nempty];
+        ++nempty;
       }
     }
-    gcu_allocator_free(a, bits);
-    gcu_allocator_free(a, empty_bits);
-
     GARC_Buffer part;
     memset(&part, 0, sizeof(part));
-    put_byte(&part, a, 0x00, &status);
-    for (uint32_t e = 0; e < z->num_entries; ++e) {
-      put_name(&part, a, (const uint8_t *)z->names.bytes + z->entries[e].name_off,
-          z->entries[e].name_len, &status);
+    if (nempty) {
+      put_bits(&part, a, bits, total, &status);
+      put_property(h, a, 0x0E, &part, &status);
+      if (any_file) {
+        put_bits(&part, a, empty_bits, nempty, &status);
+        put_property(h, a, 0x0F, &part, &status);
+      }
+      if (any_anti) {
+        put_bits(&part, a, anti_bits, nempty, &status);
+        put_property(h, a, 0x10, &part, &status);
+      }
     }
-    put_byte(h, a, 0x11, &status);
-    put_number(h, a, part.length, &status);
-    put_bytes(h, a, part.bytes, part.length, &status);
-    garc_buffer_free(a, &part);
+    gcu_allocator_free(a, empty_bits);
+    gcu_allocator_free(a, anti_bits);
 
+    put_byte(&part, a, 0x00, &status);
+    for (uint64_t e = 0; e < total; ++e) {
+      const uint8_t * name = NULL;
+      size_t length = 0;
+      szw_file_name(&files, e, &name, &length);
+      put_name(&part, a, name, length, &status);
+    }
+    put_property(h, a, 0x11, &part, &status);
+
+    // Times and attributes, each with a defined-vector when not every entry
+    // has one; `bits` is reused for it.
+    int any_mtime = 0;
+    for (uint64_t e = 0; e < total; ++e) {
+      uint64_t unused = 0;
+      bits[e] = (uint8_t)szw_file_mtime(&files, e, &unused);
+      any_mtime |= bits[e];
+    }
     if (any_mtime) {
-      memset(&part, 0, sizeof(part));
-      int all = 1;
-      for (uint32_t e = 0; e < z->num_entries; ++e) {
-        all &= (z->entries[e].flags & SZWF_HAS_MTIME) != 0;
-      }
-      if (all) {
-        put_byte(&part, a, 0x01, &status);
-      }
-      else {
-        put_byte(&part, a, 0x00, &status);
-        uint8_t * def = (uint8_t *)gcu_allocator_calloc(a, z->num_entries, 1u);
-        if (!def) {
-          garc_buffer_free(a, &part);
-          return GARC_ERR_OOM;
-        }
-        for (uint32_t e = 0; e < z->num_entries; ++e) {
-          def[e] = (z->entries[e].flags & SZWF_HAS_MTIME) ? 1u : 0u;
-        }
-        put_bits(&part, a, def, z->num_entries, &status);
-        gcu_allocator_free(a, def);
-      }
+      put_defined(&part, a, bits, total, &status);
       put_byte(&part, a, 0x00, &status);
-      for (uint32_t e = 0; e < z->num_entries; ++e) {
-        if (z->entries[e].flags & SZWF_HAS_MTIME) {
-          put_u64(&part, a, z->entries[e].mtime, &status);
+      for (uint64_t e = 0; e < total; ++e) {
+        uint64_t mtime = 0;
+        if (szw_file_mtime(&files, e, &mtime)) {
+          put_u64(&part, a, mtime, &status);
         }
       }
-      put_byte(h, a, 0x14, &status);
-      put_number(h, a, part.length, &status);
-      put_bytes(h, a, part.bytes, part.length, &status);
-      garc_buffer_free(a, &part);
+      put_property(h, a, 0x14, &part, &status);
     }
-
-    memset(&part, 0, sizeof(part));
-    put_byte(&part, a, 0x01, &status);
-    put_byte(&part, a, 0x00, &status);
-    for (uint32_t e = 0; e < z->num_entries; ++e) {
-      put_u32(&part, a, z->entries[e].attrib, &status);
+    int any_attrib = 0;
+    for (uint64_t e = 0; e < total; ++e) {
+      uint32_t unused = 0;
+      bits[e] = (uint8_t)szw_file_attrib(&files, e, &unused);
+      any_attrib |= bits[e];
     }
-    put_byte(h, a, 0x15, &status);
-    put_number(h, a, part.length, &status);
-    put_bytes(h, a, part.bytes, part.length, &status);
-    garc_buffer_free(a, &part);
+    if (any_attrib) {
+      put_defined(&part, a, bits, total, &status);
+      put_byte(&part, a, 0x00, &status);
+      for (uint64_t e = 0; e < total; ++e) {
+        uint32_t attrib = 0;
+        if (szw_file_attrib(&files, e, &attrib)) {
+          put_u32(&part, a, attrib, &status);
+        }
+      }
+      put_property(h, a, 0x15, &part, &status);
+    }
+    gcu_allocator_free(a, bits);
     put_byte(h, a, 0x00, &status);
   }
   put_byte(h, a, 0x00, &status);
@@ -826,7 +1060,7 @@ GARC_Result garc_sevenz_write_end(GARC_Writer * writer) {
 
   uint64_t next_size = 0;
   uint32_t next_crc = 0;
-  if (z->num_entries) {
+  if (z->num_entries || (z->carry && z->carry->num_files)) {
     GARC_Buffer header;
     memset(&header, 0, sizeof(header));
     result = szw_build_header(writer, &header);
@@ -859,7 +1093,22 @@ GARC_Result garc_sevenz_write_end(GARC_Writer * writer) {
   for (unsigned i = 0; i < 4u; ++i) {
     start[8u + i] = (uint8_t)(start_crc >> (8u * i));
   }
+  if (z->carry) {
+    memcpy(z->start, start, sizeof(start));
+    z->start_ready = 1;
+    return GARC_OK;
+  }
   return garc_sink_patch(writer->sink, z->origin, start, sizeof(start));
+}
+
+GARC_Result garc_sevenz_write_start_header(
+    const GARC_Writer * writer, uint8_t out[32]) {
+  const struct GARC_SevenZ_Write * z = writer->sevenz;
+  if (!z || !z->start_ready) {
+    return GARC_ERR_INVALID;
+  }
+  memcpy(out, z->start, GARC_SEVENZ_START_SIZE);
+  return GARC_OK;
 }
 
 void garc_sevenz_write_release(GARC_Writer * writer) {
@@ -874,6 +1123,7 @@ void garc_sevenz_write_release(GARC_Writer * writer) {
   gcu_allocator_free(a, z->entries);
   gcu_allocator_free(a, z->folders);
   garc_buffer_free(a, &z->names);
+  garc_sevenz_carry_free(z->carry, a);
   gcu_allocator_free(a, z);
   writer->sevenz = NULL;
 }
