@@ -420,6 +420,76 @@ TEST(SevenZ, NamesAreUtf8) {
   EXPECT_EQ(seen.count("unicode/\xC3\xA9\xC3\xA8\xF0\x9F\x98\x80.txt"), 1u);
 }
 
+namespace {
+
+/**
+ * Walk a 7z seekably, reading every member through, with the read after
+ * @p fail_after failing (none when SIZE_MAX) and at most @p cap bytes a read.
+ * Returns the first failure anywhere, or GARC_OK; what was read in @p seen.
+ */
+GARC_Result sweep_walk(const std::vector<uint8_t> & bytes, size_t cap,
+    size_t fail_after, size_t * reads, std::string * seen) {
+  BufferSource source(bytes.data(), bytes.size(), true, true);
+  source.cap_reads(cap);
+  if (fail_after != SIZE_MAX) {
+    source.fail_reads_after(fail_after, 1u);
+  }
+  GARC_Stream * stream = nullptr;
+  if (garc_stream_create_callback(source.callbacks(), &stream) != GARC_OK) {
+    return GARC_ERR_OOM;
+  }
+  GARC_Archive * archive = nullptr;
+  GARC_Result result = garc_open(stream, nullptr, &archive);
+  const GARC_Member * member = nullptr;
+  while (result == GARC_OK && (result = garc_next(archive, &member)) == GARC_OK) {
+    seen->append(member->name, member->name_length);
+    seen->push_back('\0');
+    char buffer[4096];
+    size_t got = 0;
+    while ((result = garc_read_member(archive, buffer, sizeof(buffer), &got))
+            == GARC_OK
+        && got) {
+      seen->append(buffer, got);
+    }
+    seen->push_back('\0');
+  }
+  garc_close(archive);
+  garc_stream_destroy(stream);
+  *reads = source.reads();
+  return result == GARC_END ? GARC_OK : result;
+}
+
+} // namespace
+
+TEST(SevenZ, EveryReadFailureOfAWalkIsReportedAsTheFailure) {
+  // The signature, the start header, the header, an encoded header's packed
+  // stream, every folder's packed streams through every coder: each read a
+  // clean walk makes, failed in turn, ends the walk with the stream's own
+  // status - never with a verdict on bytes that were not read, and never with
+  // a walk that went on as if they had been.
+  size_t points = 0;
+  for (const char * name : {"basic.7z", "copy.7z", "nonsolid.7z", "plainhdr.7z",
+           "bzip2.7z", "deflate.7z", "delta.7z", "bcj.7z", "symlink.7z"}) {
+    const std::vector<uint8_t> bytes = read_fixture(data_path(name));
+    ASSERT_FALSE(bytes.empty()) << name;
+    for (const size_t cap : {size_t(0), size_t(512)}) {
+      SCOPED_TRACE(std::string(name) + " in reads of " + std::to_string(cap));
+      size_t reads = 0;
+      std::string want;
+      ASSERT_EQ(GARC_OK, sweep_walk(bytes, cap, SIZE_MAX, &reads, &want));
+      for (size_t k = 0; k < reads; ++k) {
+        size_t unused = 0;
+        std::string got;
+        EXPECT_EQ(GARC_ERR_IO, sweep_walk(bytes, cap, k, &unused, &got))
+            << "failing read " << k << " of " << reads;
+        ++points;
+      }
+    }
+  }
+  // 530 when this was written.
+  EXPECT_GT(points, 500u) << points;
+}
+
 TEST(SevenZ, EveryTruncationOfAnArchiveIsRefusedAtOpen) {
   const std::vector<uint8_t> whole = fixture("plainhdr.7z");
   for (size_t length : {size_t(0), size_t(1), size_t(6), size_t(31), size_t(32),

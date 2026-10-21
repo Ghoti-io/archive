@@ -1443,6 +1443,93 @@ TEST(ZipStructure, AReadFailureAtEveryStageIsReportedAsItself) {
   EXPECT_GE(io_failures, 10u);
 }
 
+namespace {
+
+/**
+ * Walk @p bytes seekably with the read after @p fail_after failing (none when
+ * SIZE_MAX), setting the password and reading every member through. Returns
+ * the first failure anywhere - open, next or a read - or GARC_OK, and the
+ * reads a clean walk took through @p reads.
+ */
+GARC_Result sweep_walk(const std::vector<uint8_t> & bytes, size_t cap,
+    size_t fail_after, size_t * reads, std::string * seen) {
+  BufferSource source(bytes.data(), bytes.size(), true, true);
+  source.cap_reads(cap);
+  if (fail_after != SIZE_MAX) {
+    source.fail_reads_after(fail_after, 1u);
+  }
+  GARC_Stream * stream = nullptr;
+  if (garc_stream_create_callback(source.callbacks(), &stream) != GARC_OK) {
+    return GARC_ERR_OOM;
+  }
+  GARC_Archive * archive = nullptr;
+  GARC_Result result = garc_open(stream, nullptr, &archive);
+  if (result == GARC_OK) {
+    garc_zip_set_password(archive, kPassword, sizeof(kPassword) - 1u);
+  }
+  const GARC_Member * member = nullptr;
+  while (result == GARC_OK && (result = garc_next(archive, &member)) == GARC_OK) {
+    seen->append(member->name, member->name_length);
+    seen->push_back('\0');
+    char buffer[64];
+    size_t got = 0;
+    while ((result = garc_read_member(archive, buffer, sizeof(buffer), &got))
+            == GARC_OK
+        && got) {
+      seen->append(buffer, got);
+    }
+    seen->push_back('\0');
+  }
+  garc_close(archive);
+  garc_stream_destroy(stream);
+  *reads = source.reads();
+  return result == GARC_END ? GARC_OK : result;
+}
+
+} // namespace
+
+TEST(ZipStructure, EveryReadFailureOfAWalkIsReportedAsTheFailure) {
+  // The strict companion of the sweep above: every read a clean walk makes is
+  // failed in turn, and wherever it lands - the scan for the end record, the
+  // directory, a header, an encryption header, a member's data, its AES tag -
+  // the walk ends with the stream's own status. A read failure reported as
+  // corrupt bytes sends a caller looking at an archive that is fine.
+  size_t points = 0;
+  size_t recovered = 0;
+  for (const auto & shape : shapes()) {
+    for (const size_t cap : {size_t(0), size_t(1)}) {
+    SCOPED_TRACE(shape.first + " in reads of " + std::to_string(cap));
+    size_t reads = 0;
+    std::string want;
+    const GARC_Result clean
+        = sweep_walk(shape.second, cap, SIZE_MAX, &reads, &want);
+    ASSERT_EQ(clean, GARC_OK) << garc_result_string(clean);
+    for (size_t k = 0; k < reads; ++k) {
+      size_t unused = 0;
+      std::string got;
+      const GARC_Result result = sweep_walk(shape.second, cap, k, &unused, &got);
+      // A failure, as itself - or none, where the reader had another way to
+      // the same bytes (the zip64 end record is looked for in two places) and
+      // read the archive it would have read anyway.
+      if (result == GARC_OK) {
+        EXPECT_EQ(got, want) << "failing read " << k << " changed the walk";
+        ++recovered;
+      }
+      else {
+        EXPECT_EQ(GARC_ERR_IO, result)
+            << "failing read " << k << " of " << reads << ": "
+            << garc_result_string(result);
+      }
+      ++points;
+    }
+    }
+  }
+  // One-byte reads make it a sweep; 4,032 points, 57 of them recovered (the
+  // zip64 record's first place, every byte of it), when this was written.
+  EXPECT_GT(points, 3900u) << points;
+  EXPECT_LT(recovered, points / 20u) << recovered;
+}
+
 TEST(ZipStructure, ASeekFailureAtEveryStageIsReportedAsItself) {
   // The companion of the read sweep. A zip seeks before every read, so the seek
   // arms are a second set of failure paths - and a reader that checked only the
