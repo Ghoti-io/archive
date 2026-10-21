@@ -241,7 +241,11 @@ static int fs_name_refused(const char * name, size_t length, uint32_t flags,
       = GARC_NAME_ESCAPES | GARC_NAME_NUL_BYTE | GARC_NAME_EMPTY;
   uint32_t findings = garc_name_check(name, length);
   if (portability && (flags & GARC_FS_ALLOW_PORTABLE_NAMES) == 0) {
-    blocked |= GARC_NAME_PORTABILITY;
+    // Less a `.` component, which every reference extracts and every tar of
+    // a directory made with `tar -C dir -cf x.tar .` has on every member:
+    // `./x` is `x`, and two members reaching one file are refused anyway, by
+    // the claim on its canonical path.
+    blocked |= GARC_NAME_PORTABILITY & ~(uint32_t)GARC_NAME_CURRENT_COMPONENT;
   }
 #ifdef _WIN32
   // **On Windows these are not portability questions; they are what the name
@@ -793,6 +797,13 @@ static GARC_Result fs_create_final(GARC_Archive * archive,
         fs_free(dest);
         return result;
       }
+    }
+    if (member->type == GARC_MEMBER_DIRECTORY && strcmp(canon, state->root) == 0) {
+      // `./`, the root itself, which the caller made and owns: there is
+      // nothing to create, and its mode is the caller's, not the archive's.
+      fs_free(dest);
+      fs_free(canon);
+      return GARC_OK;
     }
     if (member->type == GARC_MEMBER_DIRECTORY
         && fs_paths_has(&state->made, canon)

@@ -715,6 +715,45 @@ TEST_F(ExtractRoot, AnExistingFileIsLeftUnchanged) {
   EXPECT_EQ("original", read_file(join_path(root, "keep.txt")));
 }
 
+TEST_F(ExtractRoot, GnuTarsDotLayoutExtracts) {
+  // `tar -C dir -cf x.tar .` names the root "./" and everything under it
+  // "./name". The commonest tar there is, and its first member is the root.
+  Opened opened(TarArchive()
+          .header(file_header("./", 0, 0755, '5'))
+          .header(file_header("./a.txt", 3, 0644))
+          .data("one")
+          .header(file_header("./d/", 0, 0755, '5'))
+          .header(file_header("./d/b.txt", 3, 0644))
+          .data("two")
+          .marker()
+          .bytes());
+  opened.open();
+  EXPECT_EQ(GARC_OK, garc_fs_extract(opened.archive, root.c_str(), 0));
+  EXPECT_EQ("one", read_file(join_path(root, "a.txt")));
+  EXPECT_EQ("two", read_file(join_path(root, "d/b.txt")));
+  expect_parent_unchanged();
+}
+
+TEST_F(ExtractRoot, ADirectoryMemberAfterItsChildrenIsGivenItsMode) {
+  // A zip lists files before (or without) their directories as often as not,
+  // so the directory a child made has its own member later.
+  Opened opened(TarArchive()
+          .header(file_header("late/child.txt", 3, 0644))
+          .data("kid")
+          .header(file_header("late/", 0, 0700, '5'))
+          .marker()
+          .bytes());
+  opened.open();
+  EXPECT_EQ(GARC_OK, garc_fs_extract(opened.archive, root.c_str(), 0));
+  EXPECT_EQ("kid", read_file(join_path(root, "late/child.txt")));
+#ifndef _WIN32
+  GCU_File_Identity identity;
+  ASSERT_EQ(GCU_FILE_OK,
+      gcu_file_identity(join_path(root, "late").c_str(), &identity));
+  EXPECT_EQ(0700u, identity.mode & 0777u);
+#endif
+}
+
 TEST_F(ExtractRoot, ParentComponentStaysInsideOnlyWithTheFlag) {
   TarArchive archive = TarArchive()
                            .header(file_header("sub/../inside.txt", 3, 0644))
@@ -1016,6 +1055,45 @@ TEST_F(ExtractRoot, APreexistingSymlinkIsNotFollowed) {
   opened.open();
   EXPECT_EQ(GARC_ERR_REFUSED, garc_fs_extract(opened.archive, root.c_str(), 0));
   EXPECT_FALSE(gcu_file_exists(join_path(root, "real/note.txt").c_str()));
+}
+
+TEST_F(ExtractRoot, APreexistingSymlinkOutOfTheRootIsNotFollowed) {
+#ifdef _WIN32
+  GTEST_SKIP() << "the setup makes a symlink, which cutil does not create on Windows";
+#endif
+  // The link was there before the extract, and it leads out: the parent's
+  // canonical path is outside the root, which is refused before the link's
+  // own provenance is asked about.
+  char * made = nullptr;
+  ASSERT_EQ(GCU_FILE_OK, gcu_dir_temp_create(nullptr, "garc-out", nullptr, &made));
+  const std::string outside = made;
+  gcu_dir_free_path(nullptr, made);
+  ASSERT_EQ(GCU_FILE_OK,
+      gcu_file_symlink(outside.c_str(), join_path(root, "out").c_str()));
+  Opened opened(TarArchive()
+                    .header(file_header("out/note.txt", 4, 0644))
+                    .data("nope")
+                    .marker()
+                    .bytes());
+  opened.open();
+  EXPECT_EQ(GARC_ERR_REFUSED, garc_fs_extract(opened.archive, root.c_str(), 0));
+  EXPECT_TRUE(list_dir(outside).empty());
+  remove_tree(outside);
+}
+
+TEST_F(ExtractRoot, AFileIsNotAParentDirectory) {
+  // A member under a name an earlier member wrote as a file: the walk finds a
+  // file where a directory has to be, and refuses rather than replacing it.
+  Opened opened(TarArchive()
+                    .header(file_header("plain", 3, 0644))
+                    .data("one")
+                    .header(file_header("plain/child.txt", 3, 0644))
+                    .data("two")
+                    .marker()
+                    .bytes());
+  opened.open();
+  EXPECT_EQ(GARC_ERR_REFUSED, garc_fs_extract(opened.archive, root.c_str(), 0));
+  EXPECT_EQ("one", read_file(join_path(root, "plain")));
 }
 
 TEST_F(ExtractRoot, ALinkIntoAPreexistingDirectoryDoesNotReceiveChildren) {

@@ -37,7 +37,11 @@
  *
  * ::GARC_NAME_ESCAPES, a NUL, and an empty name are refused with no flag.
  * ::GARC_NAME_PORTABILITY is refused unless ::GARC_FS_ALLOW_PORTABLE_NAMES
- * is set, and a `..` that leaves the root is still an escape when it is.
+ * is set, and a `..` that leaves the root is still an escape when it is. The
+ * exception is a `.` component (::GARC_NAME_CURRENT_COMPONENT), which needs no
+ * flag: `tar -C dir -cf x.tar .` writes one on every member, `./x` is `x`, and
+ * the root's own `./` member is accepted and changes nothing, since the root
+ * and its mode are the caller's.
  * Symbolic links and hard links are refused unless ::GARC_FS_ALLOW_LINKS is
  * set, and a link target must still resolve inside the root. A hard link may
  * only name a path this extract has already claimed.
