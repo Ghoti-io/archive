@@ -43,8 +43,14 @@
  * the root's own `./` member is accepted and changes nothing, since the root
  * and its mode are the caller's.
  * Symbolic links and hard links are refused unless ::GARC_FS_ALLOW_LINKS is
- * set, and a link target must still resolve inside the root. A hard link may
- * only name a path this extract has already claimed.
+ * set, and a link target must still resolve inside the root. A symlink's
+ * target is resolved from the link's own directory, as the link will be, so
+ * `usr/lib/libx.so -> ../../lib/libx.so` is inside; what exists is followed
+ * and what does not yet is judged by its spelling, except that a `..` after a
+ * name that does not exist yet is refused - a later member could make that
+ * name a link, and the `..` would climb from wherever it leads. An absolute
+ * target is refused. A hard link may only name a path this extract has
+ * already claimed.
  *
  * The first refusal stops the call. Members already written stay, later
  * members are not written, and the root is not deleted. A path that already
@@ -529,7 +535,10 @@ GARC_API GARC_Result garc_fs_extract(GARC_Archive * archive, const char * root,
  * read. A hard link to a path inside the tree is a hard link member. A hard
  * link to a path outside it is ::GARC_ERR_REFUSED. A fifo, a device, or any
  * other type is ::GARC_ERR_REFUSED. If the writer cannot store a hard link,
- * that status is returned and the pack stops.
+ * that status is returned and the pack stops. A tree more than 64 directories
+ * deep below @p root, or a directory reached a second time on the way down (a
+ * bind mount of one of its ancestors), is ::GARC_ERR_REFUSED: each level holds
+ * a directory open while the next is read.
  *
  * @param writer The writer to add members to. Not NULL.
  * @param root The directory to read. Not NULL. It must already exist.

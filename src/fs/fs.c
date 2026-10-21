@@ -234,11 +234,23 @@ static GARC_Result fs_normalize(const char * path, char ** out) {
 /**
  * Portability applies to member names. A link target is judged by where it
  * resolves, so a `./` in a target is not a reason to refuse the link.
+ *
+ * @p portability is 1 for a member name, 0 for a hard link's target (named
+ * from the root, as a member is), and -1 for a symlink's target (named from
+ * the link's directory, so its climbing is judged where it resolves).
  */
 static int fs_name_refused(const char * name, size_t length, uint32_t flags,
     int portability) {
   uint32_t blocked
       = GARC_NAME_ESCAPES | GARC_NAME_NUL_BYTE | GARC_NAME_EMPTY;
+  if (portability < 0) {
+    // A symlink's target, which climbs from the link's own directory and not
+    // from the root: `usr/lib/libx.so -> ../../lib/libx.so` stays inside. How
+    // far it climbs is fs_target_inside()'s question, asked from the link's
+    // parent, as Python's data_filter asks it. Its other findings stand.
+    blocked &= ~(uint32_t)GARC_NAME_TRAVERSAL;
+    portability = 0;
+  }
   uint32_t findings = garc_name_check(name, length);
   if (portability && (flags & GARC_FS_ALLOW_PORTABLE_NAMES) == 0) {
     // Less a `.` component, which every reference extracts and every tar of
@@ -459,6 +471,20 @@ static GARC_Result fs_target_inside(const char * root, const char * parent,
     if (looked == GCU_FILE_ERR_NOT_FOUND) {
       char * lexical = NULL;
       size_t rest;
+      // What does not exist yet can be made a link by a later member, and a
+      // `..` after it then climbs from wherever that link leads: `l -> d/../x`
+      // and a later `d -> .` are each inside, and together `l` is outside. So
+      // the spelling decides only what has no `..` left to climb with.
+      for (rest = index + 1u; rest < count; ++rest) {
+        if (strcmp(parts[rest], "..") == 0) {
+          result = GARC_ERR_REFUSED;
+          break;
+        }
+      }
+      if (result != GARC_OK) {
+        fs_free(joined);
+        break;
+      }
       fs_free(joined);
       joined = fs_dup(current);
       if (!joined) {
@@ -484,6 +510,9 @@ static GARC_Result fs_target_inside(const char * root, const char * parent,
       if (result != GARC_OK) {
         break;
       }
+      // With no `..` left this cannot leave, as `current` is inside; kept so
+      // that the rule above is not the only thing standing between a target
+      // and the outside.
       if (!fs_under(root, lexical)) {
         result = GARC_ERR_REFUSED;
       }
@@ -951,7 +980,7 @@ static GARC_Result fs_extract_member(GARC_Archive * archive,
       return GARC_ERR_REFUSED;
     }
     if (fs_name_refused(member->link_target, member->link_target_length,
-            state->flags, 0)) {
+            state->flags, member->type == GARC_MEMBER_SYMLINK ? -1 : 0)) {
       return GARC_ERR_REFUSED;
     }
     link_text = fs_dup_n(member->link_target, member->link_target_length);

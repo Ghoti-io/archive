@@ -16,6 +16,9 @@
 #include <vector>
 
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include <gtest/gtest.h>
 
@@ -570,6 +573,104 @@ TEST_F(ExtractRoot, ContainedSymlinkIsCreatedWhenLinksAreAllowed) {
   gcu_file_free(nullptr, text);
   EXPECT_EQ("body", read_file(join_path(root, "link")));
   expect_parent_unchanged();
+}
+
+namespace {
+
+/** A ustar symlink header: @p name pointing at @p target. */
+garctest::TarHeader symlink_header(const std::string & name, const std::string & target) {
+  garctest::TarHeader symlink;
+  symlink.field(0, 100, name);
+  symlink.octal(100, 8, 0777);
+  symlink.octal(108, 8, 0);
+  symlink.octal(116, 8, 0);
+  symlink.octal(124, 12, 0);
+  symlink.octal(136, 12, 0);
+  symlink.bytes[156] = '2';
+  symlink.field(157, 100, target);
+  symlink.ustar();
+  symlink.checksum();
+  return symlink;
+}
+
+} // namespace
+
+TEST_F(ExtractRoot, ALinkMayComeBeforeItsTarget) {
+#ifdef _WIN32
+  GTEST_SKIP() << "cutil does not create a symlink on Windows";
+#endif
+  // The target does not exist when the link is made, so what is left of it
+  // is judged by its spelling - and stays inside.
+  Opened opened(TarArchive()
+                    .header(symlink_header("early", "later/file.txt"))
+                    .header(file_header("later/", 0, 0755, '5'))
+                    .header(file_header("later/file.txt", 4, 0644))
+                    .data("body")
+                    .marker()
+                    .bytes());
+  opened.open();
+  ASSERT_EQ(GARC_OK,
+      garc_fs_extract(opened.archive, root.c_str(), GARC_FS_ALLOW_LINKS));
+  EXPECT_EQ("body", read_file(join_path(root, "early")));
+}
+
+TEST_F(ExtractRoot, ALinkThatClimbsButStaysInsideIsCreated) {
+#ifdef _WIN32
+  GTEST_SKIP() << "cutil does not create a symlink on Windows";
+#endif
+  // `usr/lib/libx.so -> ../../lib/libx.so`, as packages ship them: the target
+  // climbs out of the link's directory and not out of the root.
+  Opened opened(TarArchive()
+                    .header(file_header("lib/", 0, 0755, '5'))
+                    .header(file_header("lib/libx.so", 4, 0644))
+                    .data("code")
+                    .header(file_header("usr/", 0, 0755, '5'))
+                    .header(file_header("usr/lib/", 0, 0755, '5'))
+                    .header(symlink_header("usr/lib/libx.so", "../../lib/libx.so"))
+                    .marker()
+                    .bytes());
+  opened.open();
+  ASSERT_EQ(GARC_OK,
+      garc_fs_extract(opened.archive, root.c_str(), GARC_FS_ALLOW_LINKS));
+  EXPECT_EQ("code", read_file(join_path(root, "usr/lib/libx.so")));
+}
+
+TEST_F(ExtractRoot, ALinkThatClimbsOutOfTheRootIsRefused) {
+  // One `..` more than the link is deep: through directories that exist, so
+  // the resolved half refuses, and after one that does not, which climbs
+  // from a name a later member could still make a link.
+  for (const char * target : {"../../outside", "missing/../../../x"}) {
+    SCOPED_TRACE(target);
+    Opened opened(TarArchive()
+                      .header(file_header("d/", 0, 0755, '5'))
+                      .header(symlink_header("d/l", target))
+                      .marker()
+                      .bytes());
+    opened.open();
+    EXPECT_EQ(GARC_ERR_REFUSED,
+        garc_fs_extract(opened.archive, root.c_str(), GARC_FS_ALLOW_LINKS));
+    EXPECT_FALSE(tree_has_symlink(root));
+    remove_tree(join_path(root, "d"));
+  }
+  expect_parent_unchanged();
+}
+
+TEST_F(ExtractRoot, ALinkCannotClimbThroughANameThatDoesNotExistYet) {
+  // `l -> d/../x` with no `d` reads as `x`, inside. But a later member can
+  // make `d` a link to the root itself, inside too, and then `l` is
+  // `root/../x`: outside, made of two links each judged inside on its own. A
+  // `..` after a component that is not there yet is unknowable when the link
+  // is made, so it is refused.
+  Opened opened(TarArchive()
+                    .header(symlink_header("l", "d/../x"))
+                    .header(symlink_header("d", "."))
+                    .marker()
+                    .bytes());
+  opened.open();
+  EXPECT_EQ(GARC_ERR_REFUSED,
+      garc_fs_extract(opened.archive, root.c_str(), GARC_FS_ALLOW_LINKS));
+  EXPECT_FALSE(gcu_file_exists(join_path(root, "l").c_str()));
+  EXPECT_FALSE(tree_has_symlink(root));
 }
 
 TEST_F(ExtractRoot, SymlinkWhoseTargetLeavesIsNotCreated) {
@@ -1219,6 +1320,52 @@ TEST_F(ExtractRoot, PackRefusesAFifo) {
   EXPECT_EQ(GARC_ERR_REFUSED, garc_fs_pack(writer, root.c_str(), 0));
   garc_writer_destroy(writer);
   garc_sink_destroy(sink);
+#endif
+}
+
+namespace {
+
+/** Pack @p dir into a tar in memory; the status. */
+GARC_Result pack_status(const std::string & dir) {
+  GARC_Sink * sink = nullptr;
+  EXPECT_EQ(GARC_OK, garc_sink_create_memory(&sink));
+  GARC_Writer * writer = nullptr;
+  EXPECT_EQ(GARC_OK, garc_writer_create(sink, GARC_FORMAT_TAR, nullptr, &writer));
+  const GARC_Result result = garc_fs_pack(writer, dir.c_str(), 0);
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  return result;
+}
+
+} // namespace
+
+TEST_F(ExtractRoot, PackStopsAtSixtyFourDirectoriesDeep) {
+  // Each level holds a directory handle open while the next is read, so the
+  // depth is capped, and a tree past it is refused rather than half packed.
+  std::string at = root;
+  for (int level = 0; level < 64; ++level) {
+    at = join_path(at, "d");
+    ASSERT_EQ(GCU_FILE_OK, gcu_dir_create(at.c_str()));
+  }
+  EXPECT_EQ(GARC_OK, pack_status(root));
+  at = join_path(at, "d");
+  ASSERT_EQ(GCU_FILE_OK, gcu_dir_create(at.c_str()));
+  EXPECT_EQ(GARC_ERR_REFUSED, pack_status(root));
+}
+
+TEST_F(ExtractRoot, PackReportsADirectoryItCannotRead) {
+#ifdef _WIN32
+  GTEST_SKIP() << "a Unix mode does not take read access away on Windows";
+#else
+  if (geteuid() == 0) {
+    GTEST_SKIP() << "root reads a directory whatever its mode";
+  }
+  const std::string closed = join_path(root, "closed");
+  ASSERT_EQ(GCU_FILE_OK, gcu_dir_create(closed.c_str()));
+  write_file(join_path(closed, "inside.txt"), "x");
+  ASSERT_EQ(0, chmod(closed.c_str(), 0));
+  EXPECT_EQ(GARC_ERR_ACCESS, pack_status(root));
+  ASSERT_EQ(0, chmod(closed.c_str(), 0755));
 #endif
 }
 
