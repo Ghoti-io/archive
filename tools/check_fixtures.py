@@ -95,8 +95,8 @@ def ignored(paths):
 def in_a_checkout():
     """Whether there is a git index to ask at all.
 
-    A tree shipped without its .git - a release tarball, the EVO job's copy, a
-    cross build's scratch tree - has no index, so the question this gate asks
+    A tree shipped without its .git - a release tarball, a copy sent to a
+    build machine, a cross build's scratch tree - has no index, so the question this gate asks
     has no answer there. That is said, and is a pass, unless
     GARC_FIXTURES_REQUIRED=1 asks for the answer anyway.
     """

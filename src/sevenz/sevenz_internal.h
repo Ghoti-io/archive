@@ -275,6 +275,61 @@ GARC_Result garc_sevenz_aes_stream_create(const GARC_Allocator * allocator,
 GARC_Result garc_sevenz_bcj2_stream_create(const GARC_Allocator * allocator,
     GARC_Stream * const in[4], uint64_t out_size, GARC_Stream ** out_stream);
 
+/**
+ * Where a BCJ2 encoder's four streams go: @p which is 0 for MAIN, 1 for CALL,
+ * 2 for JUMP and 3 for the range coder's bytes.
+ */
+typedef GARC_Result (*GARC_SevenZ_Bcj2_Sink)(
+    void * ctx, unsigned which, const uint8_t * bytes, size_t size);
+
+/** A BCJ2 encoder, from sevenz_bcj2.c. */
+typedef struct GARC_SevenZ_Bcj2_Enc GARC_SevenZ_Bcj2_Enc;
+
+/**
+ * A BCJ2 encoder converting as 7-Zip does since 23.
+ *
+ * @param allocator For its state.
+ * @param sink Where the four streams go, as they are made.
+ * @param ctx The sink's argument.
+ * @param out Receives the encoder.
+ * @return ::GARC_OK or ::GARC_ERR_OOM.
+ */
+GARC_Result garc_sevenz_bcj2_enc_create(const GARC_Allocator * allocator,
+    GARC_SevenZ_Bcj2_Sink sink, void * ctx, GARC_SevenZ_Bcj2_Enc ** out);
+
+/**
+ * Say that the bytes given from now on are a new file of @p size bytes. 7-Zip
+ * converts a branch only when its target is inside its own file.
+ *
+ * @param e The encoder.
+ * @param size The file's size.
+ */
+void garc_sevenz_bcj2_enc_file(GARC_SevenZ_Bcj2_Enc * e, uint64_t size);
+
+/**
+ * Encode some bytes. Up to four after a candidate are held until the
+ * candidate is decided.
+ *
+ * @param e The encoder.
+ * @param data The bytes.
+ * @param size How many.
+ * @return ::GARC_OK, or what the sink returned.
+ */
+GARC_Result garc_sevenz_bcj2_enc_write(
+    GARC_SevenZ_Bcj2_Enc * e, const void * data, size_t size);
+
+/**
+ * End the stream: decide what is held, flush the range coder and every
+ * buffer to the sink.
+ *
+ * @param e The encoder.
+ * @return ::GARC_OK, or what the sink returned.
+ */
+GARC_Result garc_sevenz_bcj2_enc_finish(GARC_SevenZ_Bcj2_Enc * e);
+
+/** Free an encoder; NULL is allowed. */
+void garc_sevenz_bcj2_enc_destroy(GARC_SevenZ_Bcj2_Enc * e);
+
 /** One coder of a carried folder, as the header lists it. */
 typedef struct {
   uint8_t id[8];      ///< The method id, most significant byte first.

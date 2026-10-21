@@ -68,6 +68,7 @@ void garc_writer_options_default(GARC_Writer_Options * options) {
   // LZMA2 solid, which is 7-Zip's default and the zero of both fields.
   options->sevenz_method = GARC_SEVENZ_LZMA2;
   options->sevenz_non_solid = 0;
+  options->sevenz_filter = GARC_SEVENZ_FILTER_NONE;
   options->cpio_variant = GARC_CPIO_NEWC;
   options->shar_uuencode = 0;
   // Stored, which is also this field's zero. GARC_Writer_Options argues it.
@@ -290,7 +291,8 @@ static GARC_Result writer_create(GARC_Sink * sink, GARC_Format format,
         return GARC_ERR_INVALID;
     }
     if ((resolved.sevenz_encrypt_header && !resolved.password)
-        || resolved.sevenz_key_power > 24u) {
+        || resolved.sevenz_key_power > 24u
+        || (unsigned)resolved.sevenz_filter > (unsigned)GARC_SEVENZ_FILTER_RISCV) {
       return GARC_ERR_INVALID;
     }
   }

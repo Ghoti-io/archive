@@ -24,6 +24,7 @@
 
 #include "failing_allocator.h"
 #include "sevenz_builder.h"
+#include "tar_manifest.h"
 #include "test_helpers.h"
 
 using garctest::BufferSource;
@@ -718,6 +719,313 @@ TEST(SevenZWriteAes, EveryAllocationFailureIsReportedAndFreesWhatItTook) {
       EXPECT_EQ(allocator.live(), 0u);
     }
     EXPECT_TRUE(finished) << "never reached a finished archive";
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Branch filters, BCJ2 among them
+//-----------------------------------------------------------------------------
+
+namespace {
+
+/** x86-ish bytes: E8, E9 and 0F 8x with displacements inside the file. */
+std::string x86ish(uint32_t seed, size_t size) {
+  std::string out;
+  uint32_t x = seed;
+  auto next = [&x]() {
+    x = x * 1103515245u + 12345u;
+    return x >> 16;
+  };
+  while (out.size() < size) {
+    const uint32_t r = next() % 100u;
+    if (r < 6u) {
+      out.push_back(static_cast<char>(r < 3u ? 0xE8 : 0xE9));
+      const uint32_t rel = next() % 0x1000u;
+      for (unsigned k = 0; k < 4u; ++k) {
+        out.push_back(static_cast<char>((rel >> (8u * k)) & 0xFFu));
+      }
+    }
+    else if (r < 8u) {
+      out.push_back(0x0F);
+      out.push_back(static_cast<char>(0x80 + next() % 16u));
+    }
+    else {
+      out.push_back(static_cast<char>(next() & 0xFFu));
+    }
+  }
+  out.resize(size);
+  return out;
+}
+
+/** The corpus with two programs in it, which is what a filter is for. */
+std::vector<Spec> program_corpus() {
+  std::vector<Spec> specs = corpus();
+  Spec one;
+  one.name = "bin/one";
+  one.data = x86ish(1, 20000);
+  specs.push_back(one);
+  Spec two;
+  two.name = "bin/two";
+  two.data = x86ish(2, 7000) + std::string("\xE8\x01\x02", 3);
+  specs.push_back(two);
+  return specs;
+}
+
+const GARC_SevenZ_Filter kFilters[] = {GARC_SEVENZ_FILTER_BCJ2,
+    GARC_SEVENZ_FILTER_X86, GARC_SEVENZ_FILTER_PPC, GARC_SEVENZ_FILTER_IA64,
+    GARC_SEVENZ_FILTER_ARM, GARC_SEVENZ_FILTER_ARMT, GARC_SEVENZ_FILTER_SPARC,
+    GARC_SEVENZ_FILTER_ARM64, GARC_SEVENZ_FILTER_RISCV};
+
+/** Write @p specs through @p filter; the archive's bytes, or empty. */
+std::vector<uint8_t> write_filtered(const std::vector<Spec> & specs,
+    GARC_SevenZ_Method method, GARC_SevenZ_Filter filter, bool non_solid,
+    const std::string * password = nullptr, bool header = false) {
+  GARC_Sink * sink = nullptr;
+  if (garc_sink_create_memory(&sink) != GARC_OK) {
+    return {};
+  }
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.sevenz_method = method;
+  options.sevenz_filter = filter;
+  options.sevenz_non_solid = non_solid ? 1 : 0;
+  if (password) {
+    options.password = password->data();
+    options.password_length = password->size();
+    options.sevenz_encrypt_header = header ? 1 : 0;
+    options.sevenz_key_power = 1;
+  }
+  GARC_Writer * writer = nullptr;
+  std::vector<uint8_t> bytes;
+  if (garc_writer_create(sink, GARC_FORMAT_SEVENZ, &options, &writer) == GARC_OK) {
+    GARC_Result result = GARC_OK;
+    for (const Spec & spec : specs) {
+      const GARC_Member member = member_of(spec);
+      result = garc_writer_add(writer, &member);
+      if (result == GARC_OK && member.size && spec.type == GARC_MEMBER_FILE) {
+        result = garc_writer_write(writer, spec.data.data(), spec.data.size());
+      }
+      if (result != GARC_OK) {
+        break;
+      }
+    }
+    if (result == GARC_OK && garc_writer_finish(writer) == GARC_OK) {
+      const void * data = nullptr;
+      size_t size = 0;
+      if (garc_sink_data(sink, &data, &size) == GARC_OK) {
+        const uint8_t * raw = static_cast<const uint8_t *>(data);
+        bytes.assign(raw, raw + size);
+      }
+    }
+  }
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  return bytes;
+}
+
+} // namespace
+
+TEST(SevenZWriteFilter, EveryFilterRoundTripsSolidOrNotAndEncryptedOrNot) {
+  const std::vector<Spec> specs = program_corpus();
+  const std::string password = "filters";
+  // BCJ2, which has a folder layout of its own, through everything: three
+  // methods (copy makes CALL and JUMP copy too), solid or not, plain, data
+  // encrypted, header too. The one-stream filters are one coder more in a
+  // chain the other tests already cover, so once each, with LZMA2.
+  for (GARC_SevenZ_Filter filter : kFilters) {
+    const bool bcj2 = filter == GARC_SEVENZ_FILTER_BCJ2;
+    for (GARC_SevenZ_Method method : {GARC_SEVENZ_LZMA2, GARC_SEVENZ_COPY,
+             GARC_SEVENZ_DEFLATE}) {
+      if (!bcj2 && method != GARC_SEVENZ_LZMA2) {
+        continue;
+      }
+      for (bool non_solid : {false, true}) {
+        for (int aes = 0; aes < 3; ++aes) {
+          if (!bcj2 && (non_solid || aes == 1)) {
+            continue;
+          }
+          SCOPED_TRACE(static_cast<int>(filter));
+          SCOPED_TRACE(static_cast<int>(method));
+          SCOPED_TRACE(non_solid);
+          SCOPED_TRACE(aes);
+          const std::vector<uint8_t> bytes = write_filtered(specs, method,
+              filter, non_solid, aes ? &password : nullptr, aes == 2);
+          ASSERT_FALSE(bytes.empty());
+          std::map<std::string, Read> got;
+          ASSERT_EQ(read_back(bytes, &got, nullptr, aes ? &password : nullptr),
+              GARC_END);
+          ASSERT_EQ(got.size(), specs.size());
+          for (const Spec & spec : specs) {
+            SCOPED_TRACE(spec.name);
+            EXPECT_EQ(got[spec.name].status, GARC_OK);
+            if (spec.type == GARC_MEMBER_FILE) {
+              EXPECT_TRUE(got[spec.name].data == spec.data);
+            }
+            if (spec.type == GARC_MEMBER_SYMLINK) {
+              EXPECT_EQ(got[spec.name].link, spec.link);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(SevenZWriteFilter, Bcj2WritesTheFourStreams7ZipWrote) {
+  // 7-Zip's bcj2-copy.7z is the corpus's files through BCJ2 with Copy for all
+  // three of its other coders, so its packed area is the four streams raw:
+  // MAIN, the range coder, CALL, JUMP. The same files, in the same order,
+  // through this writer must give the same bytes - which checks the
+  // conversion rule, the range coder and the stream order against 7-Zip.
+  const std::vector<uint8_t> theirs = garctest::read_fixture(
+      std::string(GARC_TEST_DATA) + "/sevenz/bcj2-copy.7z");
+  ASSERT_FALSE(theirs.empty());
+  std::vector<Spec> specs;
+  {
+    BufferSource source(theirs.data(), theirs.size(), true, true);
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+    const GARC_Member * member = nullptr;
+    while (garc_next(archive, &member) == GARC_OK) {
+      if (member->type != GARC_MEMBER_FILE || !member->size) {
+        continue;
+      }
+      Spec spec;
+      spec.name.assign(member->name, member->name_length);
+      char buffer[1024];
+      size_t got = 0;
+      while (garc_read_member(archive, buffer, sizeof(buffer), &got) == GARC_OK
+          && got) {
+        spec.data.append(buffer, got);
+      }
+      specs.push_back(spec);
+    }
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
+  ASSERT_GT(specs.size(), 5u);
+  const std::vector<uint8_t> ours = write_filtered(
+      specs, GARC_SEVENZ_COPY, GARC_SEVENZ_FILTER_BCJ2, false);
+  ASSERT_FALSE(ours.empty());
+  size_t total = 0;
+  for (const Spec & spec : specs) {
+    total += spec.data.size();
+  }
+  // The packed area is MAIN plus CALL and JUMP - the data, less nothing, as
+  // conversion only moves bytes - plus the range coder's few.
+  ASSERT_GT(ours.size(), 32u + total);
+  size_t same = 0;
+  while (32u + same < ours.size() && 32u + same < theirs.size()
+      && ours[32u + same] == theirs[32u + same]) {
+    ++same;
+  }
+  EXPECT_GT(same, total) << "the streams part at byte " << same;
+}
+
+TEST(SevenZWriteFilter, Bcj2ConvertsTheBranchesItShould) {
+  // Not just a round trip that a filter doing nothing would pass: the packed
+  // area must have fewer E8 displacements left in it than the input has.
+  const std::vector<Spec> specs = {[] {
+    Spec s;
+    s.name = "p";
+    s.data = x86ish(9, 30000);
+    return s;
+  }()};
+  const std::vector<uint8_t> plain
+      = write_filtered(specs, GARC_SEVENZ_COPY, GARC_SEVENZ_FILTER_NONE, false);
+  const std::vector<uint8_t> bcj2
+      = write_filtered(specs, GARC_SEVENZ_COPY, GARC_SEVENZ_FILTER_BCJ2, false);
+  ASSERT_FALSE(plain.empty());
+  ASSERT_FALSE(bcj2.empty());
+  // Copy: the plain archive holds the input as it was. BCJ2's MAIN, which
+  // comes first, holds it with the converted displacements taken out.
+  const std::string input = specs[0].data;
+  EXPECT_TRUE(std::equal(input.begin(), input.end(), plain.begin() + 32,
+      [](char a, uint8_t b) { return static_cast<uint8_t>(a) == b; }));
+  EXPECT_FALSE(std::equal(input.begin(), input.begin() + 2000, bcj2.begin() + 32,
+      [](char a, uint8_t b) { return static_cast<uint8_t>(a) == b; }));
+}
+
+TEST(SevenZWriteFilter, AnUnknownFilterIsInvalid) {
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.sevenz_filter = static_cast<GARC_SevenZ_Filter>(99);
+  GARC_Writer * writer = nullptr;
+  EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_SEVENZ, &options, &writer),
+      GARC_ERR_INVALID);
+  EXPECT_EQ(writer, nullptr);
+  garc_sink_destroy(sink);
+}
+
+TEST(SevenZWriteFilter, EveryAllocationFailureIsReportedAndFreesWhatItTook) {
+  std::vector<Spec> small;
+  for (const Spec & spec : program_corpus()) {
+    Spec cut = spec;
+    if (cut.data.size() > 1500u) {
+      cut.data.resize(1500u);
+    }
+    small.push_back(cut);
+  }
+  const std::string password = "sweep";
+  for (GARC_SevenZ_Filter filter : {GARC_SEVENZ_FILTER_BCJ2,
+           GARC_SEVENZ_FILTER_X86}) {
+    for (bool aes : {false, true}) {
+      if (filter != GARC_SEVENZ_FILTER_BCJ2 && aes) {
+        continue;
+      }
+      SCOPED_TRACE(static_cast<int>(filter));
+      SCOPED_TRACE(aes);
+      bool finished = false;
+      for (size_t budget = 0; budget < 600u && !finished; ++budget) {
+        FailingAllocator allocator(budget);
+        GARC_Sink * sink = nullptr;
+        ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+        GARC_Writer_Options options;
+        garc_writer_options_default(&options);
+        options.sevenz_method = GARC_SEVENZ_LZMA2;
+        options.sevenz_filter = filter;
+        options.sevenz_non_solid = 1;
+        if (aes) {
+          options.password = password.data();
+          options.password_length = password.size();
+          options.sevenz_encrypt_header = 1;
+          options.sevenz_key_power = 1;
+        }
+        GARC_Writer * writer = nullptr;
+        GARC_Result last = garc_writer_create_with_allocator(sink,
+            GARC_FORMAT_SEVENZ, &options, allocator.get(), &writer);
+        if (last == GARC_OK) {
+          for (const Spec & spec : small) {
+            const GARC_Member member = member_of(spec);
+            last = garc_writer_add(writer, &member);
+            if (last == GARC_OK && member.size && spec.type == GARC_MEMBER_FILE) {
+              last = garc_writer_write(writer, spec.data.data(), spec.data.size());
+            }
+            if (last != GARC_OK) {
+              break;
+            }
+          }
+          if (last == GARC_OK) {
+            last = garc_writer_finish(writer);
+          }
+          EXPECT_TRUE(last == GARC_OK || last == GARC_ERR_OOM)
+              << garc_result_string(last) << " at budget " << budget;
+          finished = last == GARC_OK;
+          garc_writer_destroy(writer);
+        }
+        else {
+          EXPECT_EQ(last, GARC_ERR_OOM);
+        }
+        garc_sink_destroy(sink);
+        allocator.stop_failing();
+        EXPECT_EQ(allocator.live(), 0u) << "budget " << budget;
+      }
+      EXPECT_TRUE(finished) << "never reached a finished archive";
+    }
   }
 }
 

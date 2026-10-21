@@ -130,6 +130,36 @@ typedef enum {
 } GARC_SevenZ_Method;
 
 /**
+ * @brief The branch filter a 7z's data goes through before it is compressed.
+ *
+ * A filter rewrites the relative addresses of branches in machine code as
+ * absolute ones, so that calls to one function look alike and compress. Zero
+ * is none.
+ *
+ * ::GARC_SEVENZ_FILTER_BCJ2 is 7-Zip's for x86 executables, what `-mf=BCJ2`
+ * writes: four packed streams instead of one - the code with the branches'
+ * addresses taken out, the CALL and JUMP targets (each LZMA), and a range
+ * coder's record of which branches were converted - and it converts as 7-Zip
+ * does since 23, so its streams are 7-Zip's byte for byte. CALL, JUMP and the
+ * range coder's bytes are held in memory until the folder closes, while the
+ * main stream goes out as it is made; together they are a few percent of the
+ * folder. The others are the one-stream filters 7-Zip names BCJ, PPC, IA64,
+ * ARM, ARMT, SPARC, ARM64 and RISCV, through `compress`.
+ */
+typedef enum {
+  GARC_SEVENZ_FILTER_NONE = 0, ///< No filter.
+  GARC_SEVENZ_FILTER_BCJ2,     ///< x86, four streams: 7-Zip's BCJ2.
+  GARC_SEVENZ_FILTER_X86,      ///< x86, one stream: 7-Zip's BCJ.
+  GARC_SEVENZ_FILTER_PPC,      ///< PowerPC, big-endian.
+  GARC_SEVENZ_FILTER_IA64,     ///< Itanium.
+  GARC_SEVENZ_FILTER_ARM,      ///< 32-bit ARM, little-endian.
+  GARC_SEVENZ_FILTER_ARMT,     ///< ARM Thumb.
+  GARC_SEVENZ_FILTER_SPARC,    ///< SPARC.
+  GARC_SEVENZ_FILTER_ARM64,    ///< 64-bit ARM.
+  GARC_SEVENZ_FILTER_RISCV     ///< RISC-V.
+} GARC_SevenZ_Filter;
+
+/**
  * @brief Which cpio header a cpio archive is written with.
  *
  * Zero is newc, which is what Linux initramfs and RPM use and what every
@@ -330,6 +360,13 @@ typedef struct GARC_Writer_Options {
    * Ignored for tar and zip.
    */
   int sevenz_non_solid;
+
+  /**
+   * The branch filter in front of a 7z's compressor; zero is none. Ignored for
+   * every other format. See ::GARC_SevenZ_Filter. A value outside it is
+   * ::GARC_ERR_INVALID from ::garc_writer_create().
+   */
+  GARC_SevenZ_Filter sevenz_filter;
 
   /**
    * Encrypt a 7z's header too, as 7-Zip's `-mhe=on` does. Ignored for every

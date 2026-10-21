@@ -99,6 +99,9 @@ static const Entry ENTRIES[] = {
   {LIT("private"), GARC_MEMBER_FILE, LIT("secret\n"), NULL, 0600, 1000000000},
   {LIT("odd-second.txt"), GARC_MEMBER_FILE, LIT("odd\n"), NULL, 0644,
       1000000001},
+  /* x86-like: calls, jumps and conditional jumps whose targets are inside the
+   * file, which is what the branch filters, BCJ2 most of all, convert. */
+  {LIT("program.bin"), GARC_MEMBER_FILE, NULL, 0u, NULL, 0755, 1000000000},
 };
 
 #define ENTRY_COUNT (sizeof(ENTRIES) / sizeof(*ENTRIES))
@@ -106,6 +109,7 @@ static const Entry ENTRIES[] = {
 static char BIG[20000];
 static char NOISE[3000];
 static char FAR_BIN[41000];
+static char PROGRAM[24000];
 
 static void fill(void) {
   for (size_t i = 0; i < sizeof(BIG); ++i) {
@@ -126,6 +130,26 @@ static void fill(void) {
     FAR_BIN[i] = (char)('a' + ((state >> 16) % 7u));
   }
   memcpy(FAR_BIN + 40000u, FAR_BIN, 1000u);
+  state = 0x13579BDFu;
+  for (size_t i = 0; i < sizeof(PROGRAM);) {
+    state = state * 1103515245u + 12345u;
+    const uint32_t r = (state >> 16) % 100u;
+    if (r < 6u && i + 5u <= sizeof(PROGRAM)) {
+      PROGRAM[i++] = (char)(r < 3u ? 0xE8 : 0xE9);
+      state = state * 1103515245u + 12345u;
+      const uint32_t rel = (state >> 16) % 0x2000u;
+      for (unsigned k = 0; k < 4u; ++k) {
+        PROGRAM[i++] = (char)((rel >> (8u * k)) & 0xFFu);
+      }
+    }
+    else if (r < 8u && i + 2u <= sizeof(PROGRAM)) {
+      PROGRAM[i++] = 0x0F;
+      PROGRAM[i++] = (char)(0x80 + r);
+    }
+    else {
+      PROGRAM[i++] = (char)(state >> 24);
+    }
+  }
 }
 
 static void print_escaped(const char * bytes, size_t length) {
@@ -225,7 +249,8 @@ static GARC_Result size_cb(void * ctx, uint64_t * out_size) {
 #define PROBE_PASSWORD "probe-p\xC3\xA4ss-\xF0\x9F\x98\x80"
 
 static int write_one(const char * directory, const char * name,
-    GARC_SevenZ_Method method, int non_solid, int encrypt, int header) {
+    GARC_SevenZ_Method method, int non_solid, int encrypt, int header,
+    GARC_SevenZ_Filter filter) {
   char path[1024];
   snprintf(path, sizeof(path), "%s/%s", directory, name);
   FILE * file = fopen(path, "wb");
@@ -249,6 +274,7 @@ static int write_one(const char * directory, const char * name,
   garc_writer_options_default(&options);
   options.sevenz_method = method;
   options.sevenz_non_solid = non_solid;
+  options.sevenz_filter = filter;
   if (encrypt) {
     /* 7-Zip's own cost, so the archive is what 7-Zip itself would write. */
     options.password = PROBE_PASSWORD;
@@ -278,6 +304,10 @@ static int write_one(const char * directory, const char * name,
     else if (strcmp(entry->name, "noise.bin") == 0) {
       data = NOISE;
       data_length = sizeof(NOISE);
+    }
+    else if (strcmp(entry->name, "program.bin") == 0) {
+      data = PROGRAM;
+      data_length = sizeof(PROGRAM);
     }
     GARC_Member member;
     memset(&member, 0, sizeof(member));
@@ -445,17 +475,23 @@ static const struct {
   int non_solid;
   int encrypt;
   int header;
+  GARC_SevenZ_Filter filter;
 } ARCHIVES[] = {
-  {"lzma2.7z", GARC_SEVENZ_LZMA2, 0, 0, 0},
-  {"lzma2-nonsolid.7z", GARC_SEVENZ_LZMA2, 1, 0, 0},
-  {"lzma.7z", GARC_SEVENZ_LZMA, 0, 0, 0},
-  {"bzip2.7z", GARC_SEVENZ_BZIP2, 0, 0, 0},
-  {"deflate.7z", GARC_SEVENZ_DEFLATE, 0, 0, 0},
-  {"deflate64.7z", GARC_SEVENZ_DEFLATE64, 0, 0, 0},
-  {"copy.7z", GARC_SEVENZ_COPY, 0, 0, 0},
-  {"aes.7z", GARC_SEVENZ_LZMA2, 0, 1, 0},
-  {"aes-header.7z", GARC_SEVENZ_LZMA2, 0, 1, 1},
-  {"aes-copy-nonsolid.7z", GARC_SEVENZ_COPY, 1, 1, 0},
+  {"lzma2.7z", GARC_SEVENZ_LZMA2, 0, 0, 0, GARC_SEVENZ_FILTER_NONE},
+  {"lzma2-nonsolid.7z", GARC_SEVENZ_LZMA2, 1, 0, 0, GARC_SEVENZ_FILTER_NONE},
+  {"lzma.7z", GARC_SEVENZ_LZMA, 0, 0, 0, GARC_SEVENZ_FILTER_NONE},
+  {"bzip2.7z", GARC_SEVENZ_BZIP2, 0, 0, 0, GARC_SEVENZ_FILTER_NONE},
+  {"deflate.7z", GARC_SEVENZ_DEFLATE, 0, 0, 0, GARC_SEVENZ_FILTER_NONE},
+  {"deflate64.7z", GARC_SEVENZ_DEFLATE64, 0, 0, 0, GARC_SEVENZ_FILTER_NONE},
+  {"copy.7z", GARC_SEVENZ_COPY, 0, 0, 0, GARC_SEVENZ_FILTER_NONE},
+  {"aes.7z", GARC_SEVENZ_LZMA2, 0, 1, 0, GARC_SEVENZ_FILTER_NONE},
+  {"aes-header.7z", GARC_SEVENZ_LZMA2, 0, 1, 1, GARC_SEVENZ_FILTER_NONE},
+  {"aes-copy-nonsolid.7z", GARC_SEVENZ_COPY, 1, 1, 0, GARC_SEVENZ_FILTER_NONE},
+  {"bcj2.7z", GARC_SEVENZ_LZMA2, 0, 0, 0, GARC_SEVENZ_FILTER_BCJ2},
+  {"bcj2-nonsolid.7z", GARC_SEVENZ_LZMA2, 1, 0, 0, GARC_SEVENZ_FILTER_BCJ2},
+  {"aes-bcj2.7z", GARC_SEVENZ_LZMA2, 0, 1, 1, GARC_SEVENZ_FILTER_BCJ2},
+  {"bcj-x86.7z", GARC_SEVENZ_LZMA2, 0, 0, 0, GARC_SEVENZ_FILTER_X86},
+  {"bcj-arm64.7z", GARC_SEVENZ_LZMA2, 0, 0, 0, GARC_SEVENZ_FILTER_ARM64},
 };
 
 int main(int argc, char ** argv) {
@@ -464,7 +500,7 @@ int main(int argc, char ** argv) {
     for (size_t i = 0; i < sizeof(ARCHIVES) / sizeof(*ARCHIVES); ++i) {
       if (write_one(argv[2], ARCHIVES[i].name, ARCHIVES[i].method,
               ARCHIVES[i].non_solid, ARCHIVES[i].encrypt,
-              ARCHIVES[i].header)) {
+              ARCHIVES[i].header, ARCHIVES[i].filter)) {
         return 1;
       }
     }

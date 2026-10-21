@@ -384,6 +384,7 @@ TEST(WriterOptions, TheDefaultDoesNotDependOnWhatTheStructHeldBefore) {
   EXPECT_EQ(a.zip_volume_size, b.zip_volume_size);
   EXPECT_EQ(a.sevenz_method, b.sevenz_method);
   EXPECT_EQ(a.sevenz_non_solid, b.sevenz_non_solid);
+  EXPECT_EQ(a.sevenz_filter, b.sevenz_filter);
   EXPECT_EQ(a.sevenz_encrypt_header, b.sevenz_encrypt_header);
   EXPECT_EQ(a.sevenz_key_power, b.sevenz_key_power);
   EXPECT_EQ(a.cpio_variant, b.cpio_variant);

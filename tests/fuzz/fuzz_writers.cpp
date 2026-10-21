@@ -428,6 +428,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     break;
   }
 
+  // A 7z's branch filter, from one byte more: none half the time, BCJ2 - four
+  // packed streams, three held to the folder's end - a quarter, and the
+  // one-stream filters the rest. Read last, so the inputs that came before it
+  // carve as they did.
+  const uint8_t filter = carver.byte();
+  if (filter & 1u) {
+    options.sevenz_filter = (filter & 2u)
+        ? GARC_SEVENZ_FILTER_BCJ2
+        : static_cast<GARC_SevenZ_Filter>(
+              GARC_SEVENZ_FILTER_X86 + (filter >> 2) % 8u);
+  }
+
   // The undisturbed run is the reference for everything below.
   const Run whole = write_all(format, options, specs, patchable,
       static_cast<size_t>(-1), nullptr);

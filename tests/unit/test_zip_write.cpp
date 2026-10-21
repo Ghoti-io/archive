@@ -1227,7 +1227,7 @@ TEST(ZipWrite, AMemberOfFourGibibytesIsWrittenAndReadBack) {
   // stands on: a stored member whose sizes do not fit 32 bits, so both go in
   // zip64 fields, the directory's widened once the stored size is known. It
   // writes and reads 4 GiB, so it runs only when asked: GARC_TEST_LARGE=1,
-  // which the EVO gate sets.
+  // which a full gate on a machine with the room sets.
   if (!std::getenv("GARC_TEST_LARGE")) {
     GTEST_SKIP() << "writes and reads 4 GiB; set GARC_TEST_LARGE=1";
   }

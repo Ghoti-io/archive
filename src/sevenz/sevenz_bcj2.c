@@ -393,3 +393,274 @@ GARC_Result garc_sevenz_bcj2_stream_create(const GARC_Allocator * allocator,
   *out_stream = stream;
   return GARC_OK;
 }
+
+////////////////////////////////////////////////////////////////////////
+// The encoder
+////////////////////////////////////////////////////////////////////////
+
+/*
+ * The inverse of the decoder above, written from the same description. Its
+ * only freedom is which candidates to convert, and it uses 7-Zip's rule since
+ * 23: a signed displacement in [-0x0F000000, 0x0F000000), a target inside the
+ * branch's own file, and for a 0F 8x a 0F in that file too. That is the rule a
+ * test checks against 7-Zip's own streams byte for byte; given it, MAIN, CALL,
+ * JUMP and the range coder's bytes are all determined.
+ */
+
+/** The relative limit: a displacement this far or more is never converted. */
+#define BCJ2_REL_LIMIT 0x0F000000
+
+/** Files remembered, so a candidate in an earlier file still finds its own. */
+#define BCJ2_FILES 8u
+
+/** One of the four outputs, buffered. */
+typedef struct {
+  uint8_t data[BCJ2_SIDE_BUFFER]; ///< Bytes not yet handed on.
+  size_t len;                     ///< How many.
+} Bcj2_Out;
+
+/** Where one file of the folder starts, and how long it is. */
+typedef struct {
+  uint64_t start; ///< Its first byte's offset in the stream.
+  uint64_t size;  ///< Its declared size.
+} Bcj2_File;
+
+struct GARC_SevenZ_Bcj2_Enc {
+  const GARC_Allocator * allocator; ///< For this state.
+  GARC_SevenZ_Bcj2_Sink sink;       ///< Where the four streams go.
+  void * ctx;                       ///< The sink's argument.
+  Bcj2_Out out[4];                  ///< MAIN, CALL, JUMP, range coder.
+  uint64_t pos;       ///< Bytes scanned: the next scanned byte's offset.
+  uint64_t fed;       ///< Bytes given to the encoder.
+  uint8_t prev;       ///< The scanning context.
+  int pending;        ///< A candidate waits for the four bytes after it.
+  uint8_t op;         ///< That candidate's byte.
+  unsigned slot;      ///< Its probability slot.
+  uint64_t op_pos;    ///< Its offset in the stream.
+  uint8_t look[4];    ///< The bytes after it so far.
+  unsigned nlook;     ///< How many.
+  Bcj2_File files[BCJ2_FILES]; ///< The latest files, a ring.
+  unsigned nfiles;    ///< Files begun, in all.
+  uint64_t low;       ///< The range coder's low, with its carry.
+  uint32_t range;     ///< The range coder's range.
+  uint8_t cache;      ///< The byte held back for a carry.
+  uint64_t cache_size; ///< It, and the 0xFF bytes behind it.
+  uint16_t prob[BCJ2_SLOTS]; ///< P(not converted).
+};
+
+static GARC_Result enc_flush(GARC_SevenZ_Bcj2_Enc * e, unsigned which) {
+  Bcj2_Out * o = &e->out[which];
+  if (!o->len) {
+    return GARC_OK;
+  }
+  GARC_Result result = e->sink(e->ctx, which, o->data, o->len);
+  o->len = 0;
+  return result;
+}
+
+static GARC_Result enc_put(GARC_SevenZ_Bcj2_Enc * e, unsigned which, uint8_t b) {
+  Bcj2_Out * o = &e->out[which];
+  o->data[o->len++] = b;
+  return o->len == sizeof(o->data) ? enc_flush(e, which) : GARC_OK;
+}
+
+static GARC_Result enc_shift(GARC_SevenZ_Bcj2_Enc * e) {
+  GARC_Result result = GARC_OK;
+  if ((uint32_t)e->low < 0xFF000000u || (e->low >> 32) != 0u) {
+    const uint8_t carry = (uint8_t)(e->low >> 32);
+    uint8_t temp = e->cache;
+    do {
+      result = enc_put(e, 3u, (uint8_t)(temp + carry));
+      if (result != GARC_OK) {
+        return result;
+      }
+      temp = 0xFFu;
+    } while (--e->cache_size != 0u);
+    e->cache = (uint8_t)(e->low >> 24);
+  }
+  ++e->cache_size;
+  e->low = (e->low & 0x00FFFFFFu) << 8;
+  return result;
+}
+
+static GARC_Result enc_bit(GARC_SevenZ_Bcj2_Enc * e, unsigned slot, int bit) {
+  uint16_t * p = &e->prob[slot];
+  const uint32_t bound = (e->range >> 11) * (uint32_t)*p;
+  if (!bit) {
+    e->range = bound;
+    *p = (uint16_t)(*p + ((BCJ2_PROB_ONE - *p) >> BCJ2_MOVE_BITS));
+  }
+  else {
+    e->low += bound;
+    e->range -= bound;
+    *p = (uint16_t)(*p - (*p >> BCJ2_MOVE_BITS));
+  }
+  while (e->range < BCJ2_TOP) {
+    e->range <<= 8;
+    GARC_Result result = enc_shift(e);
+    if (result != GARC_OK) {
+      return result;
+    }
+  }
+  return GARC_OK;
+}
+
+/** The file holding stream offset @p at, or NULL when it is not remembered. */
+static const Bcj2_File * enc_file_of(const GARC_SevenZ_Bcj2_Enc * e, uint64_t at) {
+  const unsigned have = e->nfiles < BCJ2_FILES ? e->nfiles : BCJ2_FILES;
+  for (unsigned k = 0; k < have; ++k) {
+    const Bcj2_File * f = &e->files[(e->nfiles - 1u - k) % BCJ2_FILES];
+    if (at >= f->start) {
+      return at - f->start < f->size ? f : NULL;
+    }
+  }
+  return NULL;
+}
+
+/** Whether 7-Zip's rule converts the pending candidate, its bytes now known. */
+static int enc_converts(const GARC_SevenZ_Bcj2_Enc * e, int32_t rel) {
+  if (rel < -BCJ2_REL_LIMIT || rel >= BCJ2_REL_LIMIT) {
+    return 0;
+  }
+  const Bcj2_File * f = enc_file_of(e, e->op_pos);
+  if (!f) {
+    return 0;
+  }
+  if (e->op != 0xE8u && e->op != 0xE9u && e->op_pos == f->start) {
+    return 0; /* a 0F 8x whose 0F is the last file's */
+  }
+  const int64_t target = (int64_t)(e->op_pos - f->start) + 5 + (int64_t)rel;
+  return target >= 0 && (uint64_t)target < f->size;
+}
+
+static GARC_Result enc_byte(GARC_SevenZ_Bcj2_Enc * e, uint8_t x, int at_end);
+
+/** Scan one byte: it goes to MAIN, and may be a candidate. */
+static GARC_Result enc_scan(GARC_SevenZ_Bcj2_Enc * e, uint8_t x, int at_end) {
+  GARC_Result result = enc_put(e, 0u, x);
+  if (result != GARC_OK) {
+    return result;
+  }
+  const uint64_t here = e->pos++;
+  const int candidate = x == 0xE8u || x == 0xE9u
+      || (e->prev == 0x0Fu && (x & 0xF0u) == 0x80u);
+  if (!candidate) {
+    e->prev = x;
+    return GARC_OK;
+  }
+  e->slot = x == 0xE8u ? BCJ2_SLOT_E8 + e->prev
+                       : (x == 0xE9u ? BCJ2_SLOT_E9 : BCJ2_SLOT_JCC);
+  e->prev = x;
+  if (at_end) {
+    /* Fewer than four bytes can follow: never converted, and still a bit. */
+    return enc_bit(e, e->slot, 0);
+  }
+  e->pending = 1;
+  e->op = x;
+  e->op_pos = here;
+  e->nlook = 0;
+  return GARC_OK;
+}
+
+/** The four bytes after a candidate are in: convert it, or scan them. */
+static GARC_Result enc_decide(GARC_SevenZ_Bcj2_Enc * e) {
+  const uint32_t rel = (uint32_t)e->look[0] | ((uint32_t)e->look[1] << 8)
+      | ((uint32_t)e->look[2] << 16) | ((uint32_t)e->look[3] << 24);
+  const int convert = enc_converts(e, (int32_t)rel);
+  e->pending = 0;
+  GARC_Result result = enc_bit(e, e->slot, convert);
+  if (result != GARC_OK) {
+    return result;
+  }
+  if (convert) {
+    const uint32_t absolute = (uint32_t)(e->op_pos + 5u) + rel;
+    const unsigned which = e->op == 0xE8u ? 1u : 2u;
+    for (int k = 3; k >= 0 && result == GARC_OK; --k) {
+      result = enc_put(e, which, (uint8_t)(absolute >> (8 * k)));
+    }
+    e->prev = e->look[3];
+    e->pos += 4u;
+    return result;
+  }
+  /* Not converted: they are ordinary bytes, and scanned as such. They cannot
+     fill a new candidate's four, so this does not come back here. */
+  uint8_t again[4];
+  memcpy(again, e->look, sizeof(again));
+  for (unsigned k = 0; k < 4u && result == GARC_OK; ++k) {
+    result = enc_byte(e, again[k], 0);
+  }
+  return result;
+}
+
+static GARC_Result enc_byte(GARC_SevenZ_Bcj2_Enc * e, uint8_t x, int at_end) {
+  if (e->pending) {
+    e->look[e->nlook++] = x;
+    return e->nlook == 4u ? enc_decide(e) : GARC_OK;
+  }
+  return enc_scan(e, x, at_end);
+}
+
+GARC_Result garc_sevenz_bcj2_enc_create(const GARC_Allocator * allocator,
+    GARC_SevenZ_Bcj2_Sink sink, void * ctx, GARC_SevenZ_Bcj2_Enc ** out) {
+  GARC_SevenZ_Bcj2_Enc * e = (GARC_SevenZ_Bcj2_Enc *)gcu_allocator_calloc(
+      allocator, 1, sizeof(*e));
+  if (!e) {
+    return GARC_ERR_OOM;
+  }
+  e->allocator = allocator;
+  e->sink = sink;
+  e->ctx = ctx;
+  e->range = 0xFFFFFFFFu;
+  e->cache_size = 1u;
+  for (unsigned i = 0; i < BCJ2_SLOTS; ++i) {
+    e->prob[i] = (uint16_t)(BCJ2_PROB_ONE / 2u);
+  }
+  *out = e;
+  return GARC_OK;
+}
+
+void garc_sevenz_bcj2_enc_file(GARC_SevenZ_Bcj2_Enc * e, uint64_t size) {
+  Bcj2_File * f = &e->files[e->nfiles % BCJ2_FILES];
+  f->start = e->fed;
+  f->size = size;
+  ++e->nfiles;
+}
+
+GARC_Result garc_sevenz_bcj2_enc_write(
+    GARC_SevenZ_Bcj2_Enc * e, const void * data, size_t size) {
+  const uint8_t * p = (const uint8_t *)data;
+  for (size_t i = 0; i < size; ++i) {
+    ++e->fed;
+    GARC_Result result = enc_byte(e, p[i], 0);
+    if (result != GARC_OK) {
+      return result;
+    }
+  }
+  return GARC_OK;
+}
+
+GARC_Result garc_sevenz_bcj2_enc_finish(GARC_SevenZ_Bcj2_Enc * e) {
+  GARC_Result result = GARC_OK;
+  if (e->pending) {
+    /* The stream ended inside the four: the candidate is not converted, and
+       what followed it is scanned with no room for another conversion. */
+    e->pending = 0;
+    result = enc_bit(e, e->slot, 0);
+    for (unsigned k = 0; k < e->nlook && result == GARC_OK; ++k) {
+      result = enc_scan(e, e->look[k], 1);
+    }
+  }
+  for (int i = 0; i < 5 && result == GARC_OK; ++i) {
+    result = enc_shift(e);
+  }
+  for (unsigned which = 0; which < 4u && result == GARC_OK; ++which) {
+    result = enc_flush(e, which);
+  }
+  return result;
+}
+
+void garc_sevenz_bcj2_enc_destroy(GARC_SevenZ_Bcj2_Enc * e) {
+  if (e) {
+    gcu_allocator_free(e->allocator, e);
+  }
+}

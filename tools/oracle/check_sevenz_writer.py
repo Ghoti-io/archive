@@ -13,10 +13,11 @@
     make check-sevenz-writer
 
 The writer is the subject and there is no fixture: `sevenz_writer_probe write`
-produces ten archives of one member list - LZMA2 solid and non-solid, LZMA,
-bzip2, deflate, deflate64 and copy, then three encrypted with 7-Zip's AES
-(LZMA2, LZMA2 with the header encrypted too, and copy non-solid) - and prints
-the *intent*, the member list as the probe
+produces fifteen archives of one member list - LZMA2 solid and non-solid,
+LZMA, bzip2, deflate, deflate64 and copy; three encrypted with 7-Zip's AES
+(LZMA2, LZMA2 with the header encrypted too, and copy non-solid); and five
+through branch filters (BCJ2 solid, non-solid, and encrypted with its header,
+x86 BCJ, ARM64) - and prints the *intent*, the member list as the probe
 means it, before any reference has seen a byte. Every reading is compared with
 that intent and never with another reading, because two readers wrong the same
 way would agree.
@@ -53,10 +54,10 @@ DEFLATE64_ARCHIVE = "deflate64.7z"
 # wrong one does not, and - for aes-header.7z - that without one the archive
 # cannot even be listed, which is what an encrypted header is for.
 ENCRYPTED = {"aes.7z": False, "aes-header.7z": True,
-    "aes-copy-nonsolid.7z": False}
+    "aes-copy-nonsolid.7z": False, "aes-bcj2.7z": True}
 PASSWORD = "probe-p\u00e4ss-\U0001F600"
-EXPECTED_ARCHIVES = 10
-EXPECTED_MEMBERS = 13
+EXPECTED_ARCHIVES = 15
+EXPECTED_MEMBERS = 14
 COLUMNS = ["archive", "name", "type", "size", "mtime", "mode", "link", "crc"]
 
 

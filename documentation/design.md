@@ -838,6 +838,21 @@ too; otherwise it is refused rather than written in the clear. An in-place
 append to an archive whose header is encrypted is refused outright: it is
 opened without a password, so its tables are not known.
 
+**Writing BCJ2.** The encoder (sevenz_bcj2.c, beside the decoder and from the
+same description) scans as the decoder does and holds up to four bytes after a
+candidate until it can decide; its one freedom, which branches to convert, it
+spends as 7-Zip does since 23 - a signed displacement in [-0x0F000000,
+0x0F000000), a target inside the branch's own file, and for a 0F 8x a 0F in
+that file too - and given that, all four streams are determined; a test holds
+them to 7-Zip's byte for byte. Only one packed stream can go to the sink as it
+is made, so MAIN does, through the folder's compressor, and the range coder's
+bytes and the LZMA-compressed CALL and JUMP are held in memory and written
+after it at the folder's end, in 7-Zip's order. The folder record is 7-Zip's:
+JUMP's and CALL's coders, the main compressor, BCJ2; with AES, an AES coder in
+front of each of the four packed streams, each with its IV. The one-stream
+filters are `compress`'s `bcj` encoder in front of the compressor, one coder
+more in the chain.
+
 **Names are the one conversion.** Elsewhere a name is the bytes the container
 carried. 7z stores UTF-16LE, so the reader converts to UTF-8 and says so with
 `GARC_NAME_UTF8`. A lone surrogate is reported as U+FFFD rather than as an error:

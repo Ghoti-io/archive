@@ -135,10 +135,16 @@ every folder, each with an IV of its own, with the key derived once at
 `sevenz_key_power` (7-Zip's 19 unless set); `sevenz_encrypt_header` encrypts the
 header too, so the names cannot be listed without the password. The same
 `password` field gives a zip WinZip AES, and is `GARC_ERR_INVALID` for a format
-with no encryption. `make check-sevenz-writer` hands ten archives to 7-Zip and
-libarchive - three of them encrypted, which 7-Zip must test with the password,
-refuse with a wrong one and, for the encrypted header, not list without one -
-and compares what each says with what was meant; neither is asked what it
+with no encryption. **`sevenz_filter` puts a branch filter in front of the
+compressor**: 7-Zip's BCJ2 for x86 executables, written as 7-Zip writes it -
+four packed streams, CALL and JUMP through LZMA, converting by 7-Zip's own rule
+so that its streams are byte for byte 7-Zip's - or one of the one-stream
+filters (x86, PowerPC, IA-64, ARM, ARM Thumb, SPARC, ARM64, RISC-V). BCJ2 holds
+its three smaller streams in memory until the folder closes, a few percent of
+the folder. `make check-sevenz-writer` hands fifteen archives to 7-Zip
+and libarchive - four of them encrypted, which 7-Zip must test with the
+password, refuse with a wrong one and, for an encrypted header, not list
+without one, and five through branch filters - and compares what each says with what was meant; neither is asked what it
 cannot say.
 
 **Reads and writes ar and cpio, and writes shar.** All three are streams and
@@ -261,7 +267,7 @@ Measured on 2026-10-21, after the work that followed phase I
 ASan+UBSan and under Valgrind, with 3 named skips (one is the 4 GiB member,
 which runs with `GARC_TEST_LARGE=1` and passed); the same 857 pass under qemu on
 i686, s390x, PowerPC and SPARC64 (big-endian and strict-alignment) and natively
-on a Raspberry Pi 4 (arm64), and win64 under wine runs 859 with 13 skips named
+on arm64 hardware, and win64 under wine runs 859 with 13 skips named
 in `m1-skips.txt`. Line coverage is 92.9% of 11,024 lines; what is left is
 mostly allocation failures `fs.c` cannot be made to have, failures of its
 dependencies, and Windows-only arms. `check-symbols`, `check-aliasing`,
