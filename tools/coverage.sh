@@ -123,4 +123,11 @@ awk '
   }
 ' ./*.gcov
 
-rm -f ./*.gcov
+# COVERAGE_KEEP names a directory to keep the per-line .gcov files in, for
+# triage line by line; otherwise they go, as they would litter the root.
+if [ -n "${COVERAGE_KEEP:-}" ]; then
+  mkdir -p "$COVERAGE_KEEP"
+  mv ./*.gcov "$COVERAGE_KEEP"/
+else
+  rm -f ./*.gcov
+fi
