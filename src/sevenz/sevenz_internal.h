@@ -182,6 +182,14 @@ GARC_Result garc_sevenz_set_password(
 int garc_sevenz_member_encrypted(const GARC_Archive * archive);
 
 /**
+ * Whether a 7z's header was encrypted, or still is and waits for a password.
+ *
+ * @param archive A 7z.
+ * @return Non-zero when it is.
+ */
+int garc_sevenz_header_encrypted(const GARC_Archive * archive);
+
+/**
  * A password as 7-Zip keys with it, and the last key derived from it.
  *
  * Deriving a key costs 2^19 SHA-256 compressions by default, and a non-solid
@@ -199,6 +207,40 @@ typedef struct {
   uint64_t rounds_spent; ///< Derivation rounds spent since the password was set.
   uint64_t rounds_cap;  ///< ::GARC_Limits.max_key_rounds; 0 is none.
 } GARC_SevenZ_Password;
+
+/**
+ * A password, UTF-8, as the UTF-16LE 7-Zip keys with: no terminator, a
+ * character past the BMP as a surrogate pair. The reader and the writer key
+ * the same way through this.
+ *
+ * @param a For the result.
+ * @param password The UTF-8 bytes.
+ * @param length Their length.
+ * @param out Receives the UTF-16LE bytes, to be wiped and freed by the caller.
+ * @param out_len Receives their length.
+ * @return ::GARC_OK, ::GARC_ERR_INVALID for bytes that are not UTF-8, or
+ *   ::GARC_ERR_OOM.
+ */
+GARC_Result garc_sevenz_password_utf16(const GARC_Allocator * a,
+    const void * password, size_t length, uint8_t ** out, size_t * out_len);
+
+/**
+ * 7-Zip's AES key: SHA-256 over 2^@p power copies of salt, password and a
+ * 64-bit little-endian counter from zero. @p power is 0 to 24; the raw key of
+ * power 63 is not this function's.
+ *
+ * @param a For a working buffer.
+ * @param utf16 The password from ::garc_sevenz_password_utf16().
+ * @param utf16_len Its length.
+ * @param power The cycle power.
+ * @param salt The salt, or NULL when @p salt_len is 0.
+ * @param salt_len Its length, 0 to 16.
+ * @param key Receives the 32-byte key.
+ * @return ::GARC_OK, ::GARC_ERR_OOM, or ::GARC_ERR_INTERNAL.
+ */
+GARC_Result garc_sevenz_aes_derive(const GARC_Allocator * a,
+    const uint8_t * utf16, size_t utf16_len, unsigned power,
+    const uint8_t * salt, size_t salt_len, uint8_t key[32]);
 
 /**
  * A stream that decrypts 7-Zip's AES coder.

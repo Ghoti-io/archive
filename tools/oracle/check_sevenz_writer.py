@@ -13,8 +13,10 @@
     make check-sevenz-writer
 
 The writer is the subject and there is no fixture: `sevenz_writer_probe write`
-produces six archives of one member list - LZMA2 solid and non-solid, LZMA,
-bzip2, deflate and copy - and prints the *intent*, the member list as the probe
+produces ten archives of one member list - LZMA2 solid and non-solid, LZMA,
+bzip2, deflate, deflate64 and copy, then three encrypted with 7-Zip's AES
+(LZMA2, LZMA2 with the header encrypted too, and copy non-solid) - and prints
+the *intent*, the member list as the probe
 means it, before any reference has seen a byte. Every reading is compared with
 that intent and never with another reading, because two readers wrong the same
 way would agree.
@@ -45,7 +47,15 @@ import oracle_env  # noqa: E402
 
 # libarchive's 7z reader has no deflate64 coder; only 7-Zip is asked about it.
 DEFLATE64_ARCHIVE = "deflate64.7z"
-EXPECTED_ARCHIVES = 7
+# The probe's encrypted archives and their password (PROBE_PASSWORD there).
+# libarchive reads no encrypted 7z, so 7-Zip is the one reference for them, and
+# it is asked three more things: that the right password tests clean, that a
+# wrong one does not, and - for aes-header.7z - that without one the archive
+# cannot even be listed, which is what an encrypted header is for.
+ENCRYPTED = {"aes.7z": False, "aes-header.7z": True,
+    "aes-copy-nonsolid.7z": False}
+PASSWORD = "probe-p\u00e4ss-\U0001F600"
+EXPECTED_ARCHIVES = 10
 EXPECTED_MEMBERS = 13
 COLUMNS = ["archive", "name", "type", "size", "mtime", "mode", "link", "crc"]
 
@@ -151,6 +161,9 @@ def main(argv):
         return 1
     intent = rows_from(written.stdout)
     archives = sorted(n for n in os.listdir(work) if n.endswith(".7z"))
+    # The self-extractor and the append are about the container, not the
+    # cipher, and 7-Zip would stop to ask for a password: unencrypted only.
+    plain = [n for n in archives if n not in ENCRYPTED]
     members = {}
     for row in intent:
         members.setdefault(row["archive"], []).append(row)
@@ -176,11 +189,31 @@ def main(argv):
             compared += compare(failures, "ours " + name, want, got)
 
         # 7-Zip: every CRC, then the long listing.
-        tested = reference("sevenzip", ["7z", "t", "-bso0", "-bsp0", path], work)
+        secret = ["-p" + PASSWORD] if name in ENCRYPTED else []
+        tested = reference("sevenzip",
+            ["7z", "t", "-bso0", "-bsp0"] + secret + [path], work)
         if tested.returncode != 0 or tested.stderr.strip():
             failures.append("%s: 7z t exited %d: %s" % (name, tested.returncode,
                 tested.stderr.decode("utf-8", "replace").strip()))
-        listed = reference("sevenzip", ["7z", "l", "-slt", path], work)
+        if name in ENCRYPTED:
+            wrong = reference("sevenzip",
+                ["7z", "t", "-bso0", "-bsp0", "-pnot-the-password", path], work)
+            if wrong.returncode == 0:
+                failures.append("%s: 7z t passed with the wrong password"
+                    % name)
+            # No -p at all: stdin is /dev/null, so a 7-Zip that needs a
+            # password asks for one, reads nothing, and fails - and one that
+            # does not need it lists.
+            bare = reference("sevenzip", ["7z", "l", "-slt", path], work)
+            if ENCRYPTED[name] and bare.returncode == 0:
+                failures.append("%s: 7z listed an encrypted header without "
+                    "the password" % name)
+            if not ENCRYPTED[name] and (bare.returncode != 0
+                    or b"Encrypted = +" not in bare.stdout):
+                failures.append("%s: 7z did not list a plain header, or did "
+                    "not call its data encrypted" % name)
+        listed = reference("sevenzip", ["7z", "l", "-slt"] + secret + [path],
+            work)
         if listed.returncode != 0:
             failures.append("%s: 7z l exited %d" % (name, listed.returncode))
         else:
@@ -207,7 +240,7 @@ def main(argv):
 
         # libarchive has no deflate64 coder, so it is not asked about that
         # archive: 7-Zip is the one reference there, as it is for the corpus.
-        if name == DEFLATE64_ARCHIVE:
+        if name == DEFLATE64_ARCHIVE or name in ENCRYPTED:
             continue
 
         # libarchive: structure from the listing, bytes from extraction.
@@ -256,23 +289,23 @@ def main(argv):
     # writes. Both 7-Zip and this reader must find the archive behind the
     # stub and read it as the intent says.
     sfx_checked = 0
-    if archives:
-        source = os.path.join(work, archives[0])
+    if plain:
+        source = os.path.join(work, plain[0])
         sfx = os.path.join(work, "self-extracting.exe")
         made = reference("sevenzip", ["sh", "-c",
             'cat /usr/lib/7zip/7zCon.sfx "$0" > "$1"', source, sfx], work)
         if made.returncode != 0 or not os.path.exists(sfx):
             failures.append("could not make a self-extractor from %s: %s"
-                % (archives[0], made.stderr.decode("utf-8", "replace").strip()))
+                % (plain[0], made.stderr.decode("utf-8", "replace").strip()))
         else:
-            want = members.get(archives[0], [])
+            want = members.get(plain[0], [])
             ours = subprocess.run([probe, "read", sfx], capture_output=True,
                 text=True)
             if ours.returncode != 0:
                 failures.append("self-extractor: our reader: %s"
                     % ours.stderr.strip())
             else:
-                got = [dict(row, archive=archives[0])
+                got = [dict(row, archive=plain[0])
                     for row in rows_from(ours.stdout)]
                 sfx_checked += compare(failures, "ours self-extractor", want, got)
             tested = reference("sevenzip",
@@ -348,12 +381,14 @@ def main(argv):
             "were checked ###\n" % appended)
         return 1
     print("check-sevenz-writer: %d archives, %d members each, all accepted "
-        "by 7-Zip and all but %s by libarchive; %d fields compared against "
-        "the intent, and %d more from %s behind 7-Zip's 7zCon.sfx; %d "
-        "appended in place, one of them 7-Zip's own with BCJ2 and an encoded "
-        "header, each tested and listed by 7-Zip"
-        % (len(archives), EXPECTED_MEMBERS, DEFLATE64_ARCHIVE, compared,
-            sfx_checked, archives[0], appended))
+        "by 7-Zip and all but %s and the %d encrypted by libarchive; the "
+        "encrypted ones refused by 7-Zip under a wrong password, and the one "
+        "with an encrypted header unlisted without one; %d fields compared "
+        "against the intent, and %d more from %s behind 7-Zip's 7zCon.sfx; "
+        "%d appended in place, one of them 7-Zip's own with BCJ2 and an "
+        "encoded header, each tested and listed by 7-Zip"
+        % (len(archives), EXPECTED_MEMBERS, DEFLATE64_ARCHIVE, len(ENCRYPTED),
+            compared, sfx_checked, plain[0], appended))
     return 0
 
 

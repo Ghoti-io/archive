@@ -110,7 +110,8 @@
  * bytes recover its keys - and is still what a great many archives in the
  * world use. The same call keeps the password, because each WinZip AES member
  * has its own salt. AES is what a writer produces when
- * ::GARC_Writer_Options.zip_password is set. ZipCrypto is never produced.
+ * ::GARC_Writer_Options.password is set on a zip writer. ZipCrypto is never
+ * produced.
  *
  * **Nothing about a zip's metadata is encrypted, at any password strength.**
  * Names, sizes, times, modes and the whole directory structure are in the clear

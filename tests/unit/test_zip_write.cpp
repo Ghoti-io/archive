@@ -106,8 +106,8 @@ public:
     options.zip_sizes = sizes;
     options.zip_force_zip64 = force_zip64 ? 1 : 0;
     options.zip_method = method;
-    options.zip_password = password;
-    options.zip_password_length = password_length;
+    options.password = password;
+    options.password_length = password_length;
     options.zip_aes_bits = aes_bits;
     create_result_
         = garc_writer_create(sink_, GARC_FORMAT_ZIP, &options, &writer_);
@@ -2057,8 +2057,8 @@ TEST(ZipWrite, TheDefaultMethodIsStoredAndIsAlsoTheZeroValue) {
   std::memset(&options, 0xFF, sizeof(options));
   garc_writer_options_default(&options);
   EXPECT_EQ(options.zip_method, GARC_ZIP_METHOD_STORED);
-  EXPECT_EQ(options.zip_password, nullptr);
-  EXPECT_EQ(options.zip_password_length, 0u);
+  EXPECT_EQ(options.password, nullptr);
+  EXPECT_EQ(options.password_length, 0u);
   EXPECT_EQ(options.zip_aes_bits, 0u);
   EXPECT_EQ((int)GARC_ZIP_METHOD_STORED, 0);
   EXPECT_STREQ(garc_zip_method_string(GARC_ZIP_METHOD_DEFLATE), "deflate");
@@ -2248,8 +2248,8 @@ TEST(ZipWrite, AnUnsetPasswordWritesTheSameBytesAsExplicitlyUnset) {
   const std::vector<uint8_t> omitted = write(nullptr);
   GARC_Writer_Options options;
   garc_writer_options_default(&options);
-  options.zip_password = nullptr;
-  options.zip_password_length = 0;
+  options.password = nullptr;
+  options.password_length = 0;
   options.zip_aes_bits = 0;
   const std::vector<uint8_t> explicit_none = write(&options);
   ASSERT_FALSE(omitted.empty());
@@ -2283,14 +2283,14 @@ TEST(ZipWrite, ANullPasswordWithALengthAndABadStrengthAreRefused) {
   ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
   GARC_Writer_Options options;
   garc_writer_options_default(&options);
-  options.zip_password = nullptr;
-  options.zip_password_length = 4;
+  options.password = nullptr;
+  options.password_length = 4;
   GARC_Writer * writer = nullptr;
   EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer),
       GARC_ERR_INVALID);
   EXPECT_EQ(writer, nullptr);
 
-  options.zip_password_length = 0;
+  options.password_length = 0;
   options.zip_aes_bits = 64;
   EXPECT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer),
       GARC_ERR_INVALID);
@@ -2530,8 +2530,8 @@ TEST(ZipWrite, AesFramingCountsInTheZip64SizeBound) {
     }
     GARC_Writer_Options options;
     garc_writer_options_default(&options);
-    options.zip_password = password;
-    options.zip_password_length = length;
+    options.password = password;
+    options.password_length = length;
     GARC_Writer * writer = nullptr;
     if (garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer)
         != GARC_OK) {
@@ -2675,8 +2675,8 @@ TEST(ZipWrite, ASinkFailureDuringADeflatedMemberIsReported) {
     garc_writer_options_default(&options);
     options.zip_method = GARC_ZIP_METHOD_DEFLATE;
     if (password) {
-      options.zip_password = password;
-      options.zip_password_length = std::strlen(password);
+      options.password = password;
+      options.password_length = std::strlen(password);
     }
     GARC_Writer * writer = nullptr;
     ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer),

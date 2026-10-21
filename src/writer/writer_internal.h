@@ -455,6 +455,15 @@ GARC_Result garc_sevenz_write_begin_append(
     GARC_Writer * writer, struct GARC_SevenZ_Carry * carry);
 
 /**
+ * Whether a 7z writer encrypts: its folders, and through @p header its header.
+ *
+ * @param writer A 7z writer.
+ * @param header Receives whether the header is encrypted too.
+ * @return Non-zero when the folders are.
+ */
+int garc_sevenz_write_encrypts(const GARC_Writer * writer, int * header);
+
+/**
  * The start header an appending 7z writer made at its end, which goes over
  * the archive's old one at offset 0 of its frame - before where the sink
  * starts, so the update writes it rather than the sink.

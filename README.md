@@ -130,9 +130,16 @@ unless `sevenz_non_solid` is set. A name must be well-formed UTF-8 (the format
 stores UTF-16, and there is none for other bytes), a symlink's target is written
 as its data, and a hard link, device or fifo is `GARC_ERR_UNSUPPORTED`. The
 header is written plain rather than encoded, which every reader accepts and
-which saves a second encoder. `make check-sevenz-writer` hands six archives to
-7-Zip and libarchive and compares what each says with what was meant; neither
-is asked what it cannot say.
+which saves a second encoder. **A `password` encrypts it with 7-Zip's AES**:
+every folder, each with an IV of its own, with the key derived once at
+`sevenz_key_power` (7-Zip's 19 unless set); `sevenz_encrypt_header` encrypts the
+header too, so the names cannot be listed without the password. The same
+`password` field gives a zip WinZip AES, and is `GARC_ERR_INVALID` for a format
+with no encryption. `make check-sevenz-writer` hands ten archives to 7-Zip and
+libarchive - three of them encrypted, which 7-Zip must test with the password,
+refuse with a wrong one and, for the encrypted header, not list without one -
+and compares what each says with what was meant; neither is asked what it
+cannot say.
 
 **Reads and writes ar and cpio, and writes shar.** All three are streams and
 none needs a sink that can go back, so ar and cpio are read from a pipe as tar is

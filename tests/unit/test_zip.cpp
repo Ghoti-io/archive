@@ -211,8 +211,8 @@ std::vector<uint8_t> two_aes_members() {
   }
   GARC_Writer_Options options;
   garc_writer_options_default(&options);
-  options.zip_password = kCorpusPassword;
-  options.zip_password_length = std::strlen(kCorpusPassword);
+  options.password = kCorpusPassword;
+  options.password_length = std::strlen(kCorpusPassword);
   GARC_Writer * writer = nullptr;
   if (garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer) != GARC_OK) {
     garc_sink_destroy(sink);

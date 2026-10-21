@@ -217,8 +217,15 @@ static GARC_Result size_cb(void * ctx, uint64_t * out_size) {
   return GARC_OK;
 }
 
+/**
+ * The password of the encrypted archives, which check_sevenz_writer.py gives
+ * 7-Zip: an accent, and U+1F600, whose surrogate pair is where a UTF-16
+ * keying that disagreed with 7-Zip's would show.
+ */
+#define PROBE_PASSWORD "probe-p\xC3\xA4ss-\xF0\x9F\x98\x80"
+
 static int write_one(const char * directory, const char * name,
-    GARC_SevenZ_Method method, int non_solid) {
+    GARC_SevenZ_Method method, int non_solid, int encrypt, int header) {
   char path[1024];
   snprintf(path, sizeof(path), "%s/%s", directory, name);
   FILE * file = fopen(path, "wb");
@@ -242,6 +249,12 @@ static int write_one(const char * directory, const char * name,
   garc_writer_options_default(&options);
   options.sevenz_method = method;
   options.sevenz_non_solid = non_solid;
+  if (encrypt) {
+    /* 7-Zip's own cost, so the archive is what 7-Zip itself would write. */
+    options.password = PROBE_PASSWORD;
+    options.password_length = sizeof(PROBE_PASSWORD) - 1u;
+    options.sevenz_encrypt_header = header;
+  }
   GARC_Writer * writer = NULL;
   result = garc_writer_create(sink, GARC_FORMAT_SEVENZ, &options, &writer);
   if (result != GARC_OK) {
@@ -332,6 +345,12 @@ static int do_read(const char * path) {
   GARC_Result result = garc_stream_create_callback(&callbacks, &stream);
   if (result == GARC_OK) {
     result = garc_open(stream, NULL, &archive);
+  }
+  if (result == GARC_OK) {
+    /* Harmless on an archive with nothing encrypted; needed on the others,
+       and on an encrypted header it is what decodes the member list. */
+    result = garc_set_password(
+        archive, PROBE_PASSWORD, sizeof(PROBE_PASSWORD) - 1u);
   }
   if (result != GARC_OK) {
     fprintf(stderr, "%s: open: %s\n", path, garc_result_string(result));
@@ -424,14 +443,19 @@ static const struct {
   const char * name;
   GARC_SevenZ_Method method;
   int non_solid;
+  int encrypt;
+  int header;
 } ARCHIVES[] = {
-  {"lzma2.7z", GARC_SEVENZ_LZMA2, 0},
-  {"lzma2-nonsolid.7z", GARC_SEVENZ_LZMA2, 1},
-  {"lzma.7z", GARC_SEVENZ_LZMA, 0},
-  {"bzip2.7z", GARC_SEVENZ_BZIP2, 0},
-  {"deflate.7z", GARC_SEVENZ_DEFLATE, 0},
-  {"deflate64.7z", GARC_SEVENZ_DEFLATE64, 0},
-  {"copy.7z", GARC_SEVENZ_COPY, 0},
+  {"lzma2.7z", GARC_SEVENZ_LZMA2, 0, 0, 0},
+  {"lzma2-nonsolid.7z", GARC_SEVENZ_LZMA2, 1, 0, 0},
+  {"lzma.7z", GARC_SEVENZ_LZMA, 0, 0, 0},
+  {"bzip2.7z", GARC_SEVENZ_BZIP2, 0, 0, 0},
+  {"deflate.7z", GARC_SEVENZ_DEFLATE, 0, 0, 0},
+  {"deflate64.7z", GARC_SEVENZ_DEFLATE64, 0, 0, 0},
+  {"copy.7z", GARC_SEVENZ_COPY, 0, 0, 0},
+  {"aes.7z", GARC_SEVENZ_LZMA2, 0, 1, 0},
+  {"aes-header.7z", GARC_SEVENZ_LZMA2, 0, 1, 1},
+  {"aes-copy-nonsolid.7z", GARC_SEVENZ_COPY, 1, 1, 0},
 };
 
 int main(int argc, char ** argv) {
@@ -439,7 +463,8 @@ int main(int argc, char ** argv) {
   if (argc == 3 && strcmp(argv[1], "write") == 0) {
     for (size_t i = 0; i < sizeof(ARCHIVES) / sizeof(*ARCHIVES); ++i) {
       if (write_one(argv[2], ARCHIVES[i].name, ARCHIVES[i].method,
-              ARCHIVES[i].non_solid)) {
+              ARCHIVES[i].non_solid, ARCHIVES[i].encrypt,
+              ARCHIVES[i].header)) {
         return 1;
       }
     }

@@ -120,6 +120,98 @@ static GARC_Result aes_props(
   return GARC_OK;
 }
 
+GARC_Result garc_sevenz_password_utf16(const GARC_Allocator * a,
+    const void * password, size_t length, uint8_t ** out, size_t * out_len) {
+  /* At most two code units, four bytes, per input byte. */
+  const uint8_t * in = (const uint8_t *)password;
+  if (length > SIZE_MAX / 4u - 1u) {
+    return GARC_ERR_INVALID;
+  }
+  uint8_t * utf16 = (uint8_t *)gcu_allocator_malloc(a, length * 4u + 1u);
+  if (!utf16) {
+    return GARC_ERR_OOM;
+  }
+  size_t n = 0;
+  for (size_t i = 0; i < length;) {
+    uint32_t cp = 0;
+    const size_t used = garc_sevenz_utf8_decode(in + i, length - i, &cp);
+    if (!used) {
+      gsec_wipe(utf16, length * 4u + 1u);
+      gcu_allocator_free(a, utf16);
+      return GARC_ERR_INVALID;
+    }
+    i += used;
+    if (cp >= 0x10000u) {
+      const uint32_t v = cp - 0x10000u;
+      const uint32_t hi = 0xD800u | (v >> 10);
+      const uint32_t lo = 0xDC00u | (v & 0x3FFu);
+      utf16[n++] = (uint8_t)hi;
+      utf16[n++] = (uint8_t)(hi >> 8);
+      utf16[n++] = (uint8_t)lo;
+      utf16[n++] = (uint8_t)(lo >> 8);
+    }
+    else {
+      utf16[n++] = (uint8_t)cp;
+      utf16[n++] = (uint8_t)(cp >> 8);
+    }
+  }
+  *out = utf16;
+  *out_len = n;
+  return GARC_OK;
+}
+
+GARC_Result garc_sevenz_aes_derive(const GARC_Allocator * a,
+    const uint8_t * utf16, size_t utf16_len, unsigned power,
+    const uint8_t * salt, size_t salt_len, uint8_t key[32]) {
+  const size_t unit = salt_len + utf16_len + 8u;
+  if (unit > SIZE_MAX / SZ_AES_BATCH) {
+    return GARC_ERR_OOM;
+  }
+  uint8_t * batch = (uint8_t *)gcu_allocator_malloc(a, unit * SZ_AES_BATCH);
+  if (!batch) {
+    return GARC_ERR_OOM;
+  }
+  for (size_t i = 0; i < SZ_AES_BATCH; ++i) {
+    uint8_t * u = batch + i * unit;
+    if (salt_len) {
+      memcpy(u, salt, salt_len);
+    }
+    if (utf16_len) {
+      memcpy(u + salt_len, utf16, utf16_len);
+    }
+  }
+  GSEC_Sha256 sha;
+  GARC_Result result = GARC_OK;
+  if (gsec_sha256_init(&sha) != GSEC_OK) {
+    result = GARC_ERR_INTERNAL;
+  }
+  const uint64_t rounds = (uint64_t)1u << power;
+  for (uint64_t done = 0; result == GARC_OK && done < rounds;) {
+    uint64_t n = rounds - done;
+    if (n > SZ_AES_BATCH) {
+      n = SZ_AES_BATCH;
+    }
+    for (uint64_t i = 0; i < n; ++i) {
+      uint8_t * c = batch + (size_t)i * unit + unit - 8u;
+      const uint64_t counter = done + i;
+      for (unsigned k = 0; k < 8u; ++k) {
+        c[k] = (uint8_t)(counter >> (8u * k));
+      }
+    }
+    if (gsec_sha256_update(&sha, batch, (size_t)n * unit) != GSEC_OK) {
+      result = GARC_ERR_INTERNAL;
+    }
+    done += n;
+  }
+  if (result == GARC_OK && gsec_sha256_final(&sha, key) != GSEC_OK) {
+    result = GARC_ERR_INTERNAL;
+  }
+  gsec_wipe(&sha, sizeof(sha));
+  gsec_wipe(batch, unit * SZ_AES_BATCH);
+  gcu_allocator_free(a, batch);
+  return result;
+}
+
 /** Derive the key for @p p into @p key, or take it from the password's cache. */
 static GARC_Result aes_key(const GARC_Allocator * a, const Sz_Aes_Props * p,
     GARC_SevenZ_Password * pw, uint8_t key[32]) {
@@ -147,50 +239,8 @@ static GARC_Result aes_key(const GARC_Allocator * a, const Sz_Aes_Props * p,
       return GARC_ERR_LIMIT_KEY_ROUNDS;
     }
     pw->rounds_spent += cost;
-    const size_t unit = p->salt_len + pw->utf16_len + 8u;
-    if (unit > SIZE_MAX / SZ_AES_BATCH) {
-      return GARC_ERR_OOM;
-    }
-    uint8_t * batch = (uint8_t *)gcu_allocator_malloc(a, unit * SZ_AES_BATCH);
-    if (!batch) {
-      return GARC_ERR_OOM;
-    }
-    for (size_t i = 0; i < SZ_AES_BATCH; ++i) {
-      uint8_t * u = batch + i * unit;
-      memcpy(u, p->salt, p->salt_len);
-      if (pw->utf16_len) {
-        memcpy(u + p->salt_len, pw->utf16, pw->utf16_len);
-      }
-    }
-    GSEC_Sha256 sha;
-    GARC_Result result = GARC_OK;
-    if (gsec_sha256_init(&sha) != GSEC_OK) {
-      result = GARC_ERR_INTERNAL;
-    }
-    const uint64_t rounds = (uint64_t)1u << p->power;
-    for (uint64_t done = 0; result == GARC_OK && done < rounds;) {
-      uint64_t n = rounds - done;
-      if (n > SZ_AES_BATCH) {
-        n = SZ_AES_BATCH;
-      }
-      for (uint64_t i = 0; i < n; ++i) {
-        uint8_t * c = batch + (size_t)i * unit + unit - 8u;
-        const uint64_t counter = done + i;
-        for (unsigned k = 0; k < 8u; ++k) {
-          c[k] = (uint8_t)(counter >> (8u * k));
-        }
-      }
-      if (gsec_sha256_update(&sha, batch, (size_t)n * unit) != GSEC_OK) {
-        result = GARC_ERR_INTERNAL;
-      }
-      done += n;
-    }
-    if (result == GARC_OK && gsec_sha256_final(&sha, key) != GSEC_OK) {
-      result = GARC_ERR_INTERNAL;
-    }
-    gsec_wipe(&sha, sizeof(sha));
-    gsec_wipe(batch, unit * SZ_AES_BATCH);
-    gcu_allocator_free(a, batch);
+    const GARC_Result result = garc_sevenz_aes_derive(a, pw->utf16,
+        pw->utf16_len, p->power, p->salt, p->salt_len, key);
     if (result != GARC_OK) {
       return result;
     }

@@ -821,10 +821,22 @@ header leaves the archive open with nothing to walk, and `garc_set_password()`
 decodes it. P is the archive's to choose up to 24, about a second of one core,
 so the work is capped per archive by `GARC_Limits.max_key_rounds`; a key is
 derived once per salt and power and reused, so 7-Zip's own archives, which use
-one, cost one derivation. **Nothing here writes 7z AES**, so an in-place append
-to an archive whose header is encrypted, and a rewrite that would keep an
-encrypted member, are both refused rather than writing in the clear what the
-archive kept secret.
+one, cost one derivation.
+
+**Writing it.** A `password` on a 7z writer derives the key once, at
+`sevenz_key_power` - 0 is 7-Zip's 19, which 7-Zip itself cannot be told to
+change - with no salt, as 7-Zip writes. Each folder draws a 16-byte IV from the
+kernel's generator, and its compressed stream passes through CBC on its way to
+the sink, zero-padded at the end; the folder record puts AES first, bound to
+the compressor, with the compressed length as AES's unpack size, which is the
+layout 7-Zip writes. With `sevenz_encrypt_header` the finished header is itself
+encrypted, AES alone, and the start header names a small encoded-header record
+for it - the form 7-Zip writes for fewer than two items and its reader takes for
+any. A rewrite may keep an encrypted member only when its writer encrypts, and a
+member from behind an encrypted header only when the new header is encrypted
+too; otherwise it is refused rather than written in the clear. An in-place
+append to an archive whose header is encrypted is refused outright: it is
+opened without a password, so its tables are not known.
 
 **Names are the one conversion.** Elsewhere a name is the bytes the container
 carried. 7z stores UTF-16LE, so the reader converts to UTF-8 and says so with

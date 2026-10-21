@@ -59,6 +59,9 @@
 #include <ghoti.io/compress/registry.h>
 #include <ghoti.io/compress/stream.h>
 #include <ghoti.io/cutil/allocator.h>
+#include <ghoti.io/security/aes.h>
+#include <ghoti.io/security/random.h>
+#include <ghoti.io/security/secret.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -106,6 +109,8 @@ typedef struct {
   uint64_t pack_size;   ///< Bytes written to the archive for this folder.
   uint64_t unpack_size; ///< Bytes the folder decodes to.
   uint32_t nsub;        ///< How many members share the folder.
+  uint64_t coded_size;  ///< With encryption: the compressed bytes AES decodes to.
+  uint8_t iv[16];       ///< With encryption: this folder's IV.
 } SzwFolder;
 
 /** Everything the 7z writer remembers until the header is written. */
@@ -141,6 +146,16 @@ struct GARC_SevenZ_Write {
    */
   uint8_t start[GARC_SEVENZ_START_SIZE];
   int start_ready; ///< Whether @ref start is made.
+  /* encryption, when the options have a password */
+  int encrypting;        ///< Whether folders, and perhaps the header, are AES.
+  unsigned key_power;    ///< The cycle power the key was derived at.
+  GSEC_Aes aes;          ///< The key schedule, when @ref encrypting.
+  uint8_t chain[16];     ///< CBC's state for the open folder.
+  uint8_t iv[16];        ///< The open folder's IV.
+  uint8_t partial[16];   ///< Compressed bytes short of a whole block.
+  size_t partial_len;    ///< How many.
+  uint64_t cur_coded;    ///< Compressed bytes given to the cipher this folder.
+  uint8_t * cipher;      ///< Ciphertext on its way to the sink.
 };
 
 static GARC_Result szw_grow(const GARC_Allocator * a, void * slot,
@@ -178,6 +193,133 @@ static const char * szw_encoder_name(GARC_SevenZ_Method method) {
   }
 }
 
+/** The cycle power 7-Zip writes, and what ::GARC_Writer_Options.sevenz_key_power 0 means. */
+#define SZW_KEY_POWER 19u
+
+/** Derive the key from the options' password, if there is one. */
+static GARC_Result szw_key(GARC_Writer * writer) {
+  struct GARC_SevenZ_Write * z = writer->sevenz;
+  const GARC_Allocator * a = writer->allocator;
+  if (!writer->options.password) {
+    return GARC_OK;
+  }
+  uint8_t * utf16 = NULL;
+  size_t utf16_len = 0;
+  GARC_Result result = garc_sevenz_password_utf16(a, writer->options.password,
+      writer->options.password_length, &utf16, &utf16_len);
+  if (result != GARC_OK) {
+    return result;
+  }
+  z->key_power = writer->options.sevenz_key_power
+      ? writer->options.sevenz_key_power : SZW_KEY_POWER;
+  uint8_t key[32];
+  result = garc_sevenz_aes_derive(
+      a, utf16, utf16_len, z->key_power, NULL, 0, key);
+  gsec_wipe(utf16, utf16_len ? utf16_len : 1u);
+  gcu_allocator_free(a, utf16);
+  if (result == GARC_OK
+      && gsec_aes_encrypt_init(&z->aes, key, sizeof(key)) != GSEC_OK) {
+    result = GARC_ERR_INTERNAL;
+  }
+  gsec_wipe(key, sizeof(key));
+  if (result != GARC_OK) {
+    return result;
+  }
+  z->cipher = (uint8_t *)gcu_allocator_malloc(a, SZW_BUFFER);
+  if (!z->cipher) {
+    (void)gsec_aes_encrypt_wipe(&z->aes);
+    return GARC_ERR_OOM;
+  }
+  z->encrypting = 1;
+  return GARC_OK;
+}
+
+/** A fresh IV: 16 bytes from the kernel's generator. */
+static GARC_Result szw_iv(uint8_t iv[16]) {
+  return gsec_random_bytes(iv, 16u, NULL) == GSEC_OK ? GARC_OK : GARC_ERR_IO;
+}
+
+/**
+ * Encrypt @p n bytes of a folder's compressed stream with CBC and write the
+ * whole blocks; what is short of a block waits for more, or for the folder's
+ * end.
+ */
+static GARC_Result szw_encrypt(
+    GARC_Writer * writer, const uint8_t * bytes, size_t n) {
+  struct GARC_SevenZ_Write * z = writer->sevenz;
+  z->cur_coded += n;
+  size_t have = 0;
+  while (n) {
+    if (z->partial_len || n < 16u) {
+      size_t take = 16u - z->partial_len;
+      if (take > n) {
+        take = n;
+      }
+      memcpy(z->partial + z->partial_len, bytes, take);
+      z->partial_len += take;
+      bytes += take;
+      n -= take;
+      if (z->partial_len < 16u) {
+        break;
+      }
+      memcpy(z->cipher + have, z->partial, 16u);
+      z->partial_len = 0;
+    }
+    else {
+      memcpy(z->cipher + have, bytes, 16u);
+      bytes += 16u;
+      n -= 16u;
+    }
+    uint8_t * block = z->cipher + have;
+    for (unsigned k = 0; k < 16u; ++k) {
+      block[k] ^= z->chain[k];
+    }
+    if (gsec_aes_encrypt_block(&z->aes, block, block) != GSEC_OK) {
+      return GARC_ERR_INTERNAL;
+    }
+    memcpy(z->chain, block, 16u);
+    have += 16u;
+    if (have == SZW_BUFFER || !n) {
+      GARC_Result result = garc_sink_write(writer->sink, z->cipher, have);
+      if (result != GARC_OK) {
+        return result;
+      }
+      z->cur_pack += have;
+      have = 0;
+    }
+  }
+  if (have) {
+    GARC_Result result = garc_sink_write(writer->sink, z->cipher, have);
+    if (result != GARC_OK) {
+      return result;
+    }
+    z->cur_pack += have;
+  }
+  return GARC_OK;
+}
+
+/** The last block of a folder: what is left, zero-padded, if anything is. */
+static GARC_Result szw_encrypt_finish(GARC_Writer * writer) {
+  struct GARC_SevenZ_Write * z = writer->sevenz;
+  if (!z->partial_len) {
+    return GARC_OK;
+  }
+  const size_t pad = 16u - z->partial_len;
+  uint8_t zeros[16];
+  memset(zeros, 0, sizeof(zeros));
+  const uint64_t coded = z->cur_coded;
+  GARC_Result result = szw_encrypt(writer, zeros, pad);
+  z->cur_coded = coded; /* the padding is not the coder's */
+  return result;
+}
+
+int garc_sevenz_write_encrypts(const GARC_Writer * writer, int * header) {
+  const struct GARC_SevenZ_Write * z = writer->sevenz;
+  const int on = z && z->encrypting;
+  *header = on && writer->options.sevenz_encrypt_header;
+  return on;
+}
+
 GARC_Result garc_sevenz_write_begin_append(
     GARC_Writer * writer, GARC_SevenZ_Carry * carry) {
   const GARC_Allocator * a = writer->allocator;
@@ -195,7 +337,7 @@ GARC_Result garc_sevenz_write_begin_append(
   if (garc_sink_tell(writer->sink) != GARC_SEVENZ_START_SIZE + carry->data_end) {
     return GARC_ERR_INTERNAL;
   }
-  return GARC_OK;
+  return szw_key(writer);
 }
 
 GARC_Result garc_sevenz_write_begin(GARC_Writer * writer) {
@@ -207,6 +349,10 @@ GARC_Result garc_sevenz_write_begin(GARC_Writer * writer) {
   }
   writer->sevenz = z;
   z->origin = garc_sink_tell(writer->sink);
+  GARC_Result result = szw_key(writer);
+  if (result != GARC_OK) {
+    return result;
+  }
   /* Reserved now, patched when the header's position is known. A patch cannot
      extend the archive, so these bytes have to exist. */
   uint8_t zeros[GARC_SEVENZ_START_SIZE];
@@ -219,6 +365,9 @@ static GARC_Result szw_emit(GARC_Writer * writer, const void * bytes, size_t n) 
   struct GARC_SevenZ_Write * z = writer->sevenz;
   if (!n) {
     return GARC_OK;
+  }
+  if (z->encrypting) {
+    return szw_encrypt(writer, (const uint8_t *)bytes, n);
   }
   GARC_Result result = garc_sink_write(writer->sink, bytes, n);
   if (result != GARC_OK) {
@@ -233,6 +382,15 @@ static GARC_Result szw_open_folder(GARC_Writer * writer) {
   z->cur_pack = 0;
   z->cur_unpack = 0;
   z->cur_nsub = 0;
+  if (z->encrypting) {
+    GARC_Result drawn = szw_iv(z->iv);
+    if (drawn != GARC_OK) {
+      return drawn;
+    }
+    memcpy(z->chain, z->iv, sizeof(z->chain));
+    z->partial_len = 0;
+    z->cur_coded = 0;
+  }
   if (writer->options.sevenz_method == GARC_SEVENZ_COPY) {
     z->folder_open = 1;
     return GARC_OK;
@@ -302,10 +460,21 @@ static GARC_Result szw_close_folder(GARC_Writer * writer) {
       }
     }
   }
+  if (z->encrypting) {
+    GARC_Result result = szw_encrypt_finish(writer);
+    if (result != GARC_OK) {
+      return result;
+    }
+  }
   SzwFolder folder;
+  memset(&folder, 0, sizeof(folder));
   folder.pack_size = z->cur_pack;
   folder.unpack_size = z->cur_unpack;
   folder.nsub = z->cur_nsub;
+  if (z->encrypting) {
+    folder.coded_size = z->cur_coded;
+    memcpy(folder.iv, z->iv, sizeof(folder.iv));
+  }
   GARC_Result result = szw_grow(writer->allocator, &z->folders, &z->num_folders,
       &z->cap_folders, sizeof(SzwFolder));
   if (result != GARC_OK) {
@@ -638,6 +807,18 @@ static void put_coder(GARC_Buffer * b, const GARC_Allocator * a,
   }
 }
 
+/**
+ * An AES coder record as 7-Zip writes it: id 06 F1 07 01, eighteen property
+ * bytes - the cycle power with the IV flag, a nibble saying sixteen, the IV.
+ */
+static void put_aes_coder(GARC_Buffer * b, const GARC_Allocator * a,
+    unsigned power, const uint8_t iv[16], GARC_Result * status) {
+  const uint8_t rec[] = {0x24u, 0x06u, 0xF1u, 0x07u, 0x01u, 0x12u,
+      (uint8_t)(0x40u | power), 0x0Fu};
+  put_bytes(b, a, rec, sizeof(rec), status);
+  put_bytes(b, a, iv, 16u, status);
+}
+
 /** The UTF-8 name bytes as UTF-16LE with a terminator. */
 static void put_name(GARC_Buffer * b, const GARC_Allocator * a,
     const uint8_t * name, size_t length, GARC_Result * status) {
@@ -807,8 +988,19 @@ static GARC_Result szw_build_header(
       put_carry_folder(h, a, c, &c->folders[i], &status);
     }
     for (uint32_t i = 0; i < z->num_folders; ++i) {
-      put_number(h, a, 1, &status);
-      put_coder(h, a, method, &status);
+      if (z->encrypting) {
+        // As 7-Zip lays it out: AES first, its output bound to the
+        // compressor's input, the one packed stream AES's input.
+        put_number(h, a, 2, &status);
+        put_aes_coder(h, a, z->key_power, z->folders[i].iv, &status);
+        put_coder(h, a, method, &status);
+        put_number(h, a, 1, &status);
+        put_number(h, a, 0, &status);
+      }
+      else {
+        put_number(h, a, 1, &status);
+        put_coder(h, a, method, &status);
+      }
     }
     put_byte(h, a, 0x0C, &status);
     for (uint32_t i = 0; i < carried_folders; ++i) {
@@ -818,6 +1010,9 @@ static GARC_Result szw_build_header(
       }
     }
     for (uint32_t i = 0; i < z->num_folders; ++i) {
+      if (z->encrypting) {
+        put_number(h, a, z->folders[i].coded_size, &status);
+      }
       put_number(h, a, z->folders[i].unpack_size, &status);
     }
     // Folder CRC-32s, which only carried folders have: the writer's own are
@@ -1043,6 +1238,56 @@ static GARC_Result szw_build_header(
   return status;
 }
 
+/**
+ * Encrypt a finished header and write it at @p at as a packed stream, then
+ * build in @p record the encoded-header record that names it: its position,
+ * its size, an AES coder with a fresh IV, the plain header's length and CRC-32.
+ */
+static GARC_Result szw_seal_header(GARC_Writer * writer,
+    const GARC_Buffer * header, uint64_t at, GARC_Buffer * record) {
+  struct GARC_SevenZ_Write * z = writer->sevenz;
+  const GARC_Allocator * a = writer->allocator;
+  GARC_Result result = szw_iv(z->iv);
+  if (result != GARC_OK) {
+    return result;
+  }
+  memcpy(z->chain, z->iv, sizeof(z->chain));
+  z->partial_len = 0;
+  z->cur_pack = 0;
+  z->cur_coded = 0;
+  result = szw_encrypt(writer, (const uint8_t *)header->bytes, header->length);
+  if (result == GARC_OK) {
+    result = szw_encrypt_finish(writer);
+  }
+  if (result != GARC_OK) {
+    return result;
+  }
+  const uint32_t crc = gcomp_crc32_finalize(gcomp_crc32_update(
+      GCOMP_CRC32_INIT, (const uint8_t *)header->bytes, header->length));
+  GARC_Result status = GARC_OK;
+  put_byte(record, a, 0x17, &status);
+  put_byte(record, a, 0x06, &status);
+  put_number(record, a, at - (z->origin + GARC_SEVENZ_START_SIZE), &status);
+  put_number(record, a, 1, &status);
+  put_byte(record, a, 0x09, &status);
+  put_number(record, a, z->cur_pack, &status);
+  put_byte(record, a, 0x00, &status);
+  put_byte(record, a, 0x07, &status);
+  put_byte(record, a, 0x0B, &status);
+  put_number(record, a, 1, &status);
+  put_byte(record, a, 0x00, &status);
+  put_number(record, a, 1, &status);
+  put_aes_coder(record, a, z->key_power, z->iv, &status);
+  put_byte(record, a, 0x0C, &status);
+  put_number(record, a, header->length, &status);
+  put_byte(record, a, 0x0A, &status);
+  put_byte(record, a, 0x01, &status);
+  put_u32(record, a, crc, &status);
+  put_byte(record, a, 0x00, &status);
+  put_byte(record, a, 0x00, &status);
+  return status;
+}
+
 GARC_Result garc_sevenz_write_end(GARC_Writer * writer) {
   struct GARC_SevenZ_Write * z = writer->sevenz;
   const GARC_Allocator * a = writer->allocator;
@@ -1059,6 +1304,7 @@ GARC_Result garc_sevenz_write_end(GARC_Writer * writer) {
 
   uint64_t next_size = 0;
   uint32_t next_crc = 0;
+  uint64_t header_offset = header_at - (z->origin + GARC_SEVENZ_START_SIZE);
   if (z->num_entries || (z->carry && z->carry->num_files)) {
     GARC_Buffer header;
     memset(&header, 0, sizeof(header));
@@ -1066,7 +1312,24 @@ GARC_Result garc_sevenz_write_end(GARC_Writer * writer) {
     if (result == GARC_OK && header.length > SZW_MAX_HEADER) {
       result = GARC_ERR_UNSUPPORTED;
     }
-    if (result == GARC_OK) {
+    uint64_t next_at = header_at;
+    if (result == GARC_OK && writer->options.sevenz_encrypt_header
+        && z->encrypting) {
+      // The header becomes a packed stream of its own behind AES alone - as
+      // 7-Zip writes an encrypted header of fewer than two items, and as its
+      // reader takes any - and what the start header names is the small
+      // record saying how to decode it.
+      GARC_Buffer record;
+      memset(&record, 0, sizeof(record));
+      result = szw_seal_header(writer, &header, header_at, &record);
+      if (result == GARC_OK) {
+        next_at = garc_sink_tell(writer->sink);
+        result = garc_sink_write(writer->sink, record.bytes, record.length);
+      }
+      garc_buffer_free(a, &header);
+      header = record;
+    }
+    else if (result == GARC_OK) {
       result = garc_sink_write(writer->sink, header.bytes, header.length);
     }
     if (result == GARC_OK) {
@@ -1078,8 +1341,9 @@ GARC_Result garc_sevenz_write_end(GARC_Writer * writer) {
     if (result != GARC_OK) {
       return result;
     }
+    header_offset = next_at - (z->origin + GARC_SEVENZ_START_SIZE);
   }
-  const uint64_t offset = header_at - (z->origin + GARC_SEVENZ_START_SIZE);
+  const uint64_t offset = header_offset;
   for (unsigned i = 0; i < 8u; ++i) {
     start[12u + i] = (uint8_t)((next_size ? offset : 0u) >> (8u * i));
     start[20u + i] = (uint8_t)(next_size >> (8u * i));
@@ -1119,6 +1383,11 @@ void garc_sevenz_write_release(GARC_Writer * writer) {
   gcomp_encoder_destroy(z->encoder);
   gcomp_options_destroy(z->encoder_options);
   gcu_allocator_free(a, z->packed);
+  if (z->encrypting) {
+    (void)gsec_aes_encrypt_wipe(&z->aes);
+  }
+  gsec_wipe(z->partial, sizeof(z->partial));
+  gcu_allocator_free(a, z->cipher);
   gcu_allocator_free(a, z->entries);
   gcu_allocator_free(a, z->folders);
   garc_buffer_free(a, &z->names);

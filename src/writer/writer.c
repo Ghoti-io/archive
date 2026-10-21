@@ -51,6 +51,11 @@ void garc_writer_options_default(GARC_Writer_Options * options) {
   if (!options) {
     return;
   }
+  // Every field from zero first, so that one added to the struct and not to
+  // the list below is its zero - which every field documents as its default -
+  // rather than whatever the caller's stack held. The 7z encryption fields
+  // were added without a line here and read as garbage until this.
+  memset(options, 0, sizeof(*options));
   options->tar_variant = GARC_TAR_PAX;
   // Ask the sink. The only value that never refuses, and the one that produces
   // the better archive wherever it can: local headers with real sizes in them
@@ -70,9 +75,12 @@ void garc_writer_options_default(GARC_Writer_Options * options) {
   // No password. A zero-filled struct agrees: the pointer and the length are
   // both zero, and that is unencrypted. Bits of 0 mean AES-256 only once a
   // password is set.
-  options->zip_password = NULL;
-  options->zip_password_length = 0;
+  options->password = NULL;
+  options->password_length = 0;
   options->zip_aes_bits = 0;
+  // A plain header, and 7-Zip's key cost, when a 7z is given a password.
+  options->sevenz_encrypt_header = 0;
+  options->sevenz_key_power = 0;
   // No record padding. bsdtar's answer rather than GNU tar's: 10240 bytes was a
   // tape record, every reader accepts either, and this library's archives are
   // built in memory and handed to a caller far more often than they are written
@@ -251,9 +259,6 @@ static GARC_Result writer_create(GARC_Sink * sink, GARC_Format format,
         return GARC_ERR_UNSUPPORTED;
       }
     }
-    if (!resolved.zip_password && resolved.zip_password_length) {
-      return GARC_ERR_INVALID;
-    }
     switch (resolved.zip_aes_bits) {
       case 0u:
       case 128u:
@@ -284,6 +289,10 @@ static GARC_Result writer_create(GARC_Sink * sink, GARC_Format format,
       default:
         return GARC_ERR_INVALID;
     }
+    if ((resolved.sevenz_encrypt_header && !resolved.password)
+        || resolved.sevenz_key_power > 24u) {
+      return GARC_ERR_INVALID;
+    }
   }
   else if (format == GARC_FORMAT_AR || format == GARC_FORMAT_SHAR) {
     // Streamed: nothing here needs the sink to go back.
@@ -304,6 +313,16 @@ static GARC_Result writer_create(GARC_Sink * sink, GARC_Format format,
                                          : GARC_ERR_UNSUPPORTED;
   }
 
+  if (!resolved.password && resolved.password_length) {
+    return GARC_ERR_INVALID;
+  }
+  if (resolved.password && format != GARC_FORMAT_ZIP
+      && format != GARC_FORMAT_SEVENZ) {
+    // A format with no encryption, asked to encrypt: an archive in the clear
+    // would not be what the caller asked for.
+    return GARC_ERR_INVALID;
+  }
+
   if (!allocator) {
     allocator = garc_allocator_default();
   }
@@ -317,19 +336,19 @@ static GARC_Result writer_create(GARC_Sink * sink, GARC_Format format,
   writer->format = format;
   writer->options = resolved;
 
-  if (format == GARC_FORMAT_ZIP && resolved.zip_password) {
+  if (format == GARC_FORMAT_ZIP && resolved.password) {
     const uint32_t bits
         = resolved.zip_aes_bits ? resolved.zip_aes_bits : 256u;
     const GARC_Result adopted = garc_zip_write_adopt_password(
-        writer, resolved.zip_password, resolved.zip_password_length, bits);
+        writer, resolved.password, resolved.password_length, bits);
     if (adopted != GARC_OK) {
       garc_writer_destroy(writer);
       return adopted;
     }
     // The caller's pointer is not the copy. Drop it so a later use of the
     // options struct cannot read a buffer the caller has freed.
-    writer->options.zip_password = NULL;
-    writer->options.zip_password_length = 0;
+    writer->options.password = NULL;
+    writer->options.password_length = 0;
   }
 
   if (format == GARC_FORMAT_SEVENZ) {
@@ -339,6 +358,9 @@ static GARC_Result writer_create(GARC_Sink * sink, GARC_Format format,
     const GARC_Result begun = carry
         ? garc_sevenz_write_begin_append(writer, carry)
         : garc_sevenz_write_begin(writer);
+    // The key was derived from it; the caller's pointer is not kept.
+    writer->options.password = NULL;
+    writer->options.password_length = 0;
     if (begun != GARC_OK) {
       garc_writer_destroy(writer);
       return begun;

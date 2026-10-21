@@ -2352,6 +2352,11 @@ void garc_sevenz_release(GARC_Archive * archive) {
   archive->sevenz = NULL;
 }
 
+int garc_sevenz_header_encrypted(const GARC_Archive * archive) {
+  const struct GARC_SevenZ * z = archive->sevenz;
+  return z && (z->header_encrypted || z->locked_header);
+}
+
 int garc_sevenz_member_encrypted(const GARC_Archive * archive) {
   const struct GARC_SevenZ * z = archive->sevenz;
   if (!z) {
@@ -2383,38 +2388,12 @@ GARC_Result garc_sevenz_set_password(
   if (!z) {
     return GARC_ERR_INVALID;
   }
-  /* UTF-8 to UTF-16LE: at most two code units, four bytes, per input byte. */
-  const uint8_t * in = (const uint8_t *)password;
-  if (length > SIZE_MAX / 4u - 1u) {
-    return GARC_ERR_INVALID;
-  }
-  uint8_t * utf16 = (uint8_t *)gcu_allocator_malloc(a, length * 4u + 1u);
-  if (!utf16) {
-    return GARC_ERR_OOM;
-  }
+  uint8_t * utf16 = NULL;
   size_t n = 0;
-  for (size_t i = 0; i < length;) {
-    uint32_t cp = 0;
-    const size_t used = garc_sevenz_utf8_decode(in + i, length - i, &cp);
-    if (!used) {
-      gsec_wipe(utf16, length * 4u + 1u);
-      gcu_allocator_free(a, utf16);
-      return GARC_ERR_INVALID;
-    }
-    i += used;
-    if (cp >= 0x10000u) {
-      const uint32_t v = cp - 0x10000u;
-      const uint32_t hi = 0xD800u | (v >> 10);
-      const uint32_t lo = 0xDC00u | (v & 0x3FFu);
-      utf16[n++] = (uint8_t)hi;
-      utf16[n++] = (uint8_t)(hi >> 8);
-      utf16[n++] = (uint8_t)lo;
-      utf16[n++] = (uint8_t)(lo >> 8);
-    }
-    else {
-      utf16[n++] = (uint8_t)cp;
-      utf16[n++] = (uint8_t)(cp >> 8);
-    }
+  const GARC_Result converted
+      = garc_sevenz_password_utf16(a, password, length, &utf16, &n);
+  if (converted != GARC_OK) {
+    return converted;
   }
   password_wipe(a, &z->password);
   z->password.utf16 = utf16;

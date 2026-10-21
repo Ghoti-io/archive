@@ -238,26 +238,36 @@ typedef struct GARC_Writer_Options {
   GARC_Zip_Method zip_method;
 
   /**
-   * Password for WinZip AES, or NULL when the archive is not encrypted.
+   * Password to encrypt with, or NULL when the archive is not encrypted.
    *
-   * NULL with ::zip_password_length 0 is no encryption, which is what a
+   * Zip writes WinZip AES with it and 7z writes 7-Zip's AES; the other formats
+   * have no encryption, and a password for one of them is ::GARC_ERR_INVALID
+   * from ::garc_writer_create() rather than an archive that silently is not
+   * what was asked for.
+   *
+   * NULL with ::password_length 0 is no encryption, which is what a
    * zero-filled struct does and what NULL options do. A non-NULL pointer with
    * length 0 is an empty password and does encrypt. NULL with a non-zero
-   * length is ::GARC_ERR_INVALID from ::garc_writer_create(). The bytes are
-   * copied into the writer; the caller may free them when create returns.
+   * length is ::GARC_ERR_INVALID. The bytes are used during create and not
+   * kept by pointer; the caller may free them when create returns.
    *
-   * A directory is never encrypted. A file, an empty file, and a symlink
-   * target are, when this is set. ZipCrypto is not produced.
+   * **Zip:** a directory is never encrypted; a file, an empty file, and a
+   * symlink target are. ZipCrypto is not produced. **7z:** the password is
+   * UTF-8 and is keyed as UTF-16LE, as 7-Zip keys it, so bytes that are not
+   * UTF-8 are ::GARC_ERR_INVALID; every folder is encrypted, each with an IV of
+   * its own; an empty file or a directory has no folder and so no ciphertext,
+   * and its name is visible unless ::sevenz_encrypt_header is set. The key is
+   * derived once per writer, at ::sevenz_key_power.
    */
-  const void * zip_password;
+  const void * password;
 
   /**
-   * Length of ::zip_password in bytes.
+   * Length of ::password in bytes.
    *
-   * Zero with a NULL ::zip_password is no encryption. Zero with a non-NULL
+   * Zero with a NULL ::password is no encryption. Zero with a non-NULL
    * pointer is an empty password.
    */
-  size_t zip_password_length;
+  size_t password_length;
 
   /**
    * AES key size in bits for an encrypted member.
@@ -320,6 +330,29 @@ typedef struct GARC_Writer_Options {
    * Ignored for tar and zip.
    */
   int sevenz_non_solid;
+
+  /**
+   * Encrypt a 7z's header too, as 7-Zip's `-mhe=on` does. Ignored for every
+   * other format.
+   *
+   * Without it the names, sizes, times and CRC-32s of an encrypted 7z are in
+   * the clear - which is what a 7z with a password is by default, and what
+   * lets anyone test a guessed password against a CRC offline. With it the
+   * header is AES like the data, and a reader cannot list the archive without
+   * the password. Non-zero without a ::password is ::GARC_ERR_INVALID.
+   */
+  int sevenz_encrypt_header;
+
+  /**
+   * The 7z AES key's cost: SHA-256 runs over 2^this copies of the password.
+   * Ignored for every other format and when there is no ::password.
+   *
+   * 0 means 19, which is what 7-Zip writes and cannot be told otherwise; 1 to
+   * 24 is that power. More than 24 is ::GARC_ERR_INVALID, because 7-Zip and
+   * this library's reader refuse it. Every reader pays it once to open the
+   * archive, so it is the brute-force cost of a guess too.
+   */
+  uint32_t sevenz_key_power;
 
   /**
    * Which cpio header to write. Ignored for every other format.

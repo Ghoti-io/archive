@@ -360,6 +360,39 @@ TEST(WriterOptions, TheDefaultIsPaxWithNoRecordPadding) {
   EXPECT_EQ(options.blocking_factor, 0u);
 }
 
+TEST(WriterOptions, TheDefaultDoesNotDependOnWhatTheStructHeldBefore) {
+  // Two structs, filled with different garbage, defaulted: every field must
+  // agree. A field added to the struct and left out of the default list used
+  // to keep the garbage - the 7z encryption fields did, and every 7z writer
+  // created from defaults was refused as invalid. Field by field rather than
+  // memcmp, because padding is not required to hold what memset put there;
+  // a field added to the struct belongs on this list too.
+  GARC_Writer_Options a;
+  GARC_Writer_Options b;
+  std::memset(&a, 0x00, sizeof(a));
+  std::memset(&b, 0xEE, sizeof(b));
+  garc_writer_options_default(&a);
+  garc_writer_options_default(&b);
+  EXPECT_EQ(a.tar_variant, b.tar_variant);
+  EXPECT_EQ(a.blocking_factor, b.blocking_factor);
+  EXPECT_EQ(a.zip_sizes, b.zip_sizes);
+  EXPECT_EQ(a.zip_method, b.zip_method);
+  EXPECT_EQ(a.password, b.password);
+  EXPECT_EQ(a.password_length, b.password_length);
+  EXPECT_EQ(a.zip_aes_bits, b.zip_aes_bits);
+  EXPECT_EQ(a.zip_force_zip64, b.zip_force_zip64);
+  EXPECT_EQ(a.zip_volume_size, b.zip_volume_size);
+  EXPECT_EQ(a.sevenz_method, b.sevenz_method);
+  EXPECT_EQ(a.sevenz_non_solid, b.sevenz_non_solid);
+  EXPECT_EQ(a.sevenz_encrypt_header, b.sevenz_encrypt_header);
+  EXPECT_EQ(a.sevenz_key_power, b.sevenz_key_power);
+  EXPECT_EQ(a.cpio_variant, b.cpio_variant);
+  EXPECT_EQ(a.shar_uuencode, b.shar_uuencode);
+  EXPECT_EQ(b.sevenz_encrypt_header, 0);
+  EXPECT_EQ(b.sevenz_key_power, 0u);
+  EXPECT_EQ(b.password, nullptr);
+}
+
 TEST(WriterOptions, NullIsIgnored) {
   garc_writer_options_default(nullptr);
 }

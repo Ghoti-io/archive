@@ -365,8 +365,8 @@ static int write_one(const char * directory, const char * name,
   options.zip_force_zip64 = force_zip64;
   options.zip_method = method;
   if (aes) {
-    options.zip_password = AES_PASSWORD;
-    options.zip_password_length = sizeof(AES_PASSWORD) - 1u;
+    options.password = AES_PASSWORD;
+    options.password_length = sizeof(AES_PASSWORD) - 1u;
   }
   GARC_Writer * writer = NULL;
   result = garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer);

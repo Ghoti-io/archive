@@ -14,6 +14,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <string>
@@ -63,7 +64,8 @@ GARC_Member member_of(const Spec & spec) {
 class Built {
 public:
   explicit Built(GARC_SevenZ_Method method = GARC_SEVENZ_LZMA2,
-      bool non_solid = false) {
+      bool non_solid = false, const std::string * password = nullptr,
+      bool encrypt_header = false, uint32_t key_power = 1) {
     if (garc_sink_create_memory(&sink_) != GARC_OK) {
       return;
     }
@@ -71,6 +73,13 @@ public:
     garc_writer_options_default(&options);
     options.sevenz_method = method;
     options.sevenz_non_solid = non_solid ? 1 : 0;
+    if (password) {
+      // Power 1 by default: a test pays 2 rounds a key rather than 2^19.
+      options.password = password->data();
+      options.password_length = password->size();
+      options.sevenz_encrypt_header = encrypt_header ? 1 : 0;
+      options.sevenz_key_power = key_power;
+    }
     create_result_
         = garc_writer_create(sink_, GARC_FORMAT_SEVENZ, &options, &writer_);
   }
@@ -127,7 +136,8 @@ struct Read {
 
 GARC_Result read_back(
     const std::vector<uint8_t> & bytes, std::map<std::string, Read> * out,
-    std::vector<std::string> * order = nullptr) {
+    std::vector<std::string> * order = nullptr,
+    const std::string * password = nullptr) {
   BufferSource source(bytes.data(), bytes.size(), true, true);
   GARC_Stream * stream = nullptr;
   if (garc_stream_create_callback(source.callbacks(), &stream) != GARC_OK) {
@@ -135,6 +145,9 @@ GARC_Result read_back(
   }
   GARC_Archive * archive = nullptr;
   GARC_Result result = garc_open(stream, nullptr, &archive);
+  if (result == GARC_OK && password) {
+    result = garc_set_password(archive, password->data(), password->size());
+  }
   if (result == GARC_OK) {
     const GARC_Member * member = nullptr;
     while ((result = garc_next(archive, &member)) == GARC_OK) {
@@ -465,6 +478,246 @@ TEST(SevenZWrite, EveryAllocationFailureIsReportedAndFreesWhatItTook) {
       allocator.stop_failing();
       EXPECT_EQ(allocator.live(), 0u);
     }
+  }
+}
+
+//-----------------------------------------------------------------------------
+// AES
+//-----------------------------------------------------------------------------
+
+namespace {
+
+const std::string kSecret = "s\xC3\xA9" "cret-\xF0\x9F\x98\x80";
+
+bool contains(const std::vector<uint8_t> & bytes, const std::string & needle) {
+  // Compared as unsigned: char is signed here, and 0xF1 is not '\xF1' to ==.
+  return std::search(bytes.begin(), bytes.end(), needle.begin(), needle.end(),
+             [](uint8_t a, char b) { return a == static_cast<uint8_t>(b); })
+      != bytes.end();
+}
+
+/** A name as the plain header stores it: UTF-16LE. */
+std::string utf16_of(const std::string & ascii) {
+  std::string out;
+  for (char c : ascii) {
+    out.push_back(c);
+    out.push_back('\0');
+  }
+  return out;
+}
+
+/** A file member with these bytes. */
+Spec file_of(const char * name, const std::string & data) {
+  Spec spec;
+  spec.name = name;
+  spec.data = data;
+  return spec;
+}
+
+} // namespace
+
+TEST(SevenZWriteAes, EveryMethodAndBothSolidnessesRoundTripEncrypted) {
+  for (GARC_SevenZ_Method method : kMethods) {
+    for (bool non_solid : {false, true}) {
+      for (bool header : {false, true}) {
+        SCOPED_TRACE(static_cast<int>(method));
+        SCOPED_TRACE(non_solid);
+        SCOPED_TRACE(header ? "header encrypted" : "header plain");
+        Built built(method, non_solid, &kSecret, header);
+        ASSERT_EQ(built.create_result(), GARC_OK);
+        const std::vector<Spec> specs = corpus();
+        for (const Spec & spec : specs) {
+          ASSERT_EQ(built.add(spec), GARC_OK) << spec.name;
+        }
+        ASSERT_EQ(built.finish(), GARC_OK);
+        const std::vector<uint8_t> bytes = built.bytes();
+
+        std::map<std::string, Read> got;
+        ASSERT_EQ(read_back(bytes, &got, nullptr, &kSecret), GARC_END);
+        ASSERT_EQ(got.size(), specs.size());
+        for (const Spec & spec : specs) {
+          SCOPED_TRACE(spec.name);
+          const Read & read = got[spec.name];
+          EXPECT_EQ(read.status, GARC_OK);
+          if (spec.type == GARC_MEMBER_FILE) {
+            EXPECT_TRUE(read.data == spec.data);
+          }
+          if (spec.type == GARC_MEMBER_SYMLINK) {
+            EXPECT_EQ(read.link, spec.link);
+          }
+        }
+        // Not one of the data's bytes is in the clear.
+        EXPECT_FALSE(contains(bytes, "unicode\n"));
+        EXPECT_FALSE(contains(bytes, "../a.txt"));
+        // The names are, exactly when the header is not encrypted.
+        EXPECT_EQ(contains(bytes, utf16_of("big.bin")), !header);
+
+        std::map<std::string, Read> locked;
+        if (header) {
+          EXPECT_EQ(read_back(bytes, &locked), GARC_ERR_PASSWORD_REQUIRED);
+          EXPECT_TRUE(locked.empty());
+        }
+        else {
+          ASSERT_EQ(read_back(bytes, &locked), GARC_END);
+          EXPECT_EQ(locked["big.bin"].status, GARC_ERR_PASSWORD_REQUIRED);
+          EXPECT_EQ(locked["dir"].status, GARC_OK);
+          EXPECT_EQ(locked["empty"].status, GARC_OK);
+        }
+        const std::string wrong = "not it";
+        std::map<std::string, Read> refused;
+        if (header) {
+          EXPECT_EQ(read_back(bytes, &refused, nullptr, &wrong),
+              GARC_ERR_PASSWORD_OR_CORRUPT);
+        }
+        else {
+          ASSERT_EQ(read_back(bytes, &refused, nullptr, &wrong), GARC_END);
+          EXPECT_EQ(refused["big.bin"].status, GARC_ERR_PASSWORD_OR_CORRUPT);
+        }
+      }
+    }
+  }
+}
+
+TEST(SevenZWriteAes, TheCoderIsWrittenAs7ZipWritesIt) {
+  // 0x24 (an id of four bytes, with properties), 06 F1 07 01, eighteen bytes of
+  // properties: 0x40 | 19, the IV's nibble 15, sixteen bytes of IV. At the
+  // default power, which is 7-Zip's.
+  Built built(GARC_SEVENZ_LZMA2, false, &kSecret, false, 0);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  ASSERT_EQ(built.add(file_of("f", "data")), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+  const std::vector<uint8_t> bytes = built.bytes();
+  EXPECT_TRUE(contains(bytes, std::string("\x24\x06\xF1\x07\x01\x12\x53\x0F", 8)));
+  std::map<std::string, Read> got;
+  ASSERT_EQ(read_back(bytes, &got, nullptr, &kSecret), GARC_END);
+  EXPECT_EQ(got["f"].data, "data");
+}
+
+TEST(SevenZWriteAes, EveryFolderAndEveryArchiveHasAnIvOfItsOwn) {
+  // The same plaintext under the same key: two archives, and two folders in a
+  // non-solid one, must not share ciphertext.
+  std::vector<std::vector<uint8_t>> made;
+  for (int i = 0; i < 2; ++i) {
+    Built built(GARC_SEVENZ_COPY, true, &kSecret);
+    ASSERT_EQ(built.create_result(), GARC_OK);
+    ASSERT_EQ(built.add(file_of("one", std::string(64, 'x'))), GARC_OK);
+    ASSERT_EQ(built.add(file_of("two", std::string(64, 'x'))), GARC_OK);
+    ASSERT_EQ(built.finish(), GARC_OK);
+    made.push_back(built.bytes());
+  }
+  ASSERT_GE(made[0].size(), 160u);
+  ASSERT_GE(made[1].size(), 96u);
+  // The packed area is the two folders' 64 bytes each, after the start header.
+  const std::string a(made[0].begin() + 32, made[0].begin() + 96);
+  const std::string b(made[0].begin() + 96, made[0].begin() + 160);
+  const std::string c(made[1].begin() + 32, made[1].begin() + 96);
+  EXPECT_NE(a, b);
+  EXPECT_NE(a, c);
+  EXPECT_EQ(a.find(std::string(16, 'x')), std::string::npos);
+}
+
+TEST(SevenZWriteAes, AnEmptyPasswordEncrypts) {
+  const std::string empty;
+  Built built(GARC_SEVENZ_COPY, false, &empty);
+  ASSERT_EQ(built.create_result(), GARC_OK);
+  ASSERT_EQ(built.add(file_of("f", "visible?")), GARC_OK);
+  ASSERT_EQ(built.finish(), GARC_OK);
+  EXPECT_FALSE(contains(built.bytes(), "visible?"));
+  std::map<std::string, Read> got;
+  ASSERT_EQ(read_back(built.bytes(), &got, nullptr, &empty), GARC_END);
+  EXPECT_EQ(got["f"].data, "visible?");
+}
+
+TEST(SevenZWriteAes, OptionsThatCannotBeHonouredAreInvalidAtCreate) {
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+  auto create = [&](GARC_Format format, auto edit) {
+    GARC_Writer_Options options;
+    garc_writer_options_default(&options);
+    edit(options);
+    GARC_Writer * writer = nullptr;
+    const GARC_Result result = garc_writer_create(sink, format, &options, &writer);
+    garc_writer_destroy(writer);
+    return result;
+  };
+  EXPECT_EQ(create(GARC_FORMAT_SEVENZ, [](GARC_Writer_Options & o) {
+    o.sevenz_encrypt_header = 1;
+  }), GARC_ERR_INVALID) << "a header to encrypt with no password";
+  EXPECT_EQ(create(GARC_FORMAT_SEVENZ, [](GARC_Writer_Options & o) {
+    o.password = "x";
+    o.password_length = 1;
+    o.sevenz_key_power = 25;
+  }), GARC_ERR_INVALID) << "a power 7-Zip refuses to read";
+  EXPECT_EQ(create(GARC_FORMAT_SEVENZ, [](GARC_Writer_Options & o) {
+    o.password = "\xFF";
+    o.password_length = 1;
+  }), GARC_ERR_INVALID) << "a password that is not UTF-8";
+  for (GARC_Format format : {GARC_FORMAT_TAR, GARC_FORMAT_CPIO, GARC_FORMAT_AR}) {
+    EXPECT_EQ(create(format, [](GARC_Writer_Options & o) {
+      o.password = "x";
+      o.password_length = 1;
+    }), GARC_ERR_INVALID) << "a password for a format with no encryption";
+  }
+  garc_sink_destroy(sink);
+}
+
+TEST(SevenZWriteAes, EveryAllocationFailureIsReportedAndFreesWhatItTook) {
+  // The copy coder and small members, so that a budget is cheap and the sweep
+  // can run to the first one that finishes: what is under test is the
+  // encryption's allocations - the key's buffer, the cipher's, the sealed
+  // header's record - and not LZMA2's, which the sweep above covers.
+  std::vector<Spec> small;
+  for (const Spec & spec : corpus()) {
+    Spec cut = spec;
+    if (cut.data.size() > 3000u) {
+      cut.data.resize(3000u);
+    }
+    small.push_back(cut);
+  }
+  for (bool header : {false, true}) {
+    bool finished = false;
+    for (size_t budget = 0; budget < 400u && !finished; ++budget) {
+      SCOPED_TRACE(budget);
+      FailingAllocator allocator(budget);
+      GARC_Sink * sink = nullptr;
+      ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+      GARC_Writer_Options options;
+      garc_writer_options_default(&options);
+      options.sevenz_method = GARC_SEVENZ_COPY;
+      options.password = kSecret.data();
+      options.password_length = kSecret.size();
+      options.sevenz_encrypt_header = header ? 1 : 0;
+      options.sevenz_key_power = 1;
+      GARC_Writer * writer = nullptr;
+      GARC_Result last = garc_writer_create_with_allocator(sink,
+          GARC_FORMAT_SEVENZ, &options, allocator.get(), &writer);
+      if (last == GARC_OK) {
+        for (const Spec & spec : small) {
+          const GARC_Member member = member_of(spec);
+          last = garc_writer_add(writer, &member);
+          if (last == GARC_OK && member.size && spec.type == GARC_MEMBER_FILE) {
+            last = garc_writer_write(writer, spec.data.data(), spec.data.size());
+          }
+          if (last != GARC_OK) {
+            break;
+          }
+        }
+        if (last == GARC_OK) {
+          last = garc_writer_finish(writer);
+        }
+        EXPECT_TRUE(last == GARC_OK || last == GARC_ERR_OOM)
+            << garc_result_string(last);
+        finished = last == GARC_OK;
+        garc_writer_destroy(writer);
+      }
+      else {
+        EXPECT_EQ(last, GARC_ERR_OOM);
+      }
+      garc_sink_destroy(sink);
+      allocator.stop_failing();
+      EXPECT_EQ(allocator.live(), 0u);
+    }
+    EXPECT_TRUE(finished) << "never reached a finished archive";
   }
 }
 

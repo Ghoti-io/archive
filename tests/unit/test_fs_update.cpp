@@ -226,8 +226,8 @@ TEST_F(FsUpdate, KeepingAZipMemberCopiesItAsStoredWithoutItsPassword) {
   // are moved, not decrypted, and still decrypt with it afterwards.
   GARC_Writer_Options options;
   garc_writer_options_default(&options);
-  options.zip_password = "ghoti-password";
-  options.zip_password_length = 14;
+  options.password = "ghoti-password";
+  options.password_length = 14;
   options.zip_method = GARC_ZIP_METHOD_DEFLATE;
   GARC_Sink * sink = nullptr;
   ASSERT_EQ(garc_fs_sink_create(at("secret.zip").c_str(), nullptr, nullptr,
@@ -582,8 +582,8 @@ TEST_F(FsUpdate, AppendingInPlaceToEverySevenZipFixtureKeepsWhatItHad) {
 TEST_F(FsUpdate, AnEncryptedSevenZipIsNeverWrittenBackInTheClear) {
   // In place, a 7z whose header is encrypted is refused: the new header would
   // be plain and name what the old one hid. Rewritten, a member is decoded and
-  // written again and this writer does not encrypt, so keeping an encrypted
-  // one is refused even when the caller has given the password.
+  // written again, so keeping an encrypted one is refused - even when the
+  // caller has given the password - unless the writer encrypts too.
   for (const char * name : {"aes-header.7z", "aes.7z"}) {
     SCOPED_TRACE(name);
     const std::string source
@@ -621,6 +621,67 @@ TEST_F(FsUpdate, AnEncryptedSevenZipIsNeverWrittenBackInTheClear) {
     EXPECT_GT(refused, 0u);
     garc_fs_update_destroy(update);
     EXPECT_EQ(read_file(at("e.7z")), source);
+
+    // A writer that encrypts what the archive did may keep it, and what it
+    // writes is encrypted under its own password. An encrypted header needs an
+    // encrypted header in the new archive too, or the names are refused.
+    for (bool header : {false, true}) {
+      SCOPED_TRACE(header ? "writer encrypts the header" : "writer header plain");
+      GARC_Writer_Options options;
+      garc_writer_options_default(&options);
+      const std::string fresh = "fresh password";
+      options.password = fresh.data();
+      options.password_length = fresh.size();
+      options.sevenz_encrypt_header = header ? 1 : 0;
+      options.sevenz_key_power = 1;
+      ASSERT_EQ(garc_fs_update_begin(at("e.7z").c_str(), nullptr, &options,
+                    GARC_FS_NO_SYNC, &update),
+          GARC_OK);
+      archive = garc_fs_update_archive(update);
+      ASSERT_EQ(garc_set_password(archive, password.data(), password.size()),
+          GARC_OK);
+      const bool may = header || std::string(name) != "aes-header.7z";
+      GARC_Result kept = GARC_OK;
+      while (garc_next(archive, &member) == GARC_OK) {
+        kept = garc_fs_update_keep(update);
+        if (kept != GARC_OK) {
+          break;
+        }
+      }
+      EXPECT_EQ(kept, may ? GARC_OK : GARC_ERR_UNSUPPORTED);
+      if (!may) {
+        garc_fs_update_destroy(update);
+        EXPECT_EQ(read_file(at("e.7z")), source);
+        continue;
+      }
+      ASSERT_EQ(garc_fs_update_commit(update), GARC_OK);
+      garc_fs_update_destroy(update);
+      GARC_Archive * again = nullptr;
+      ASSERT_EQ(garc_fs_open(at("e.7z").c_str(), nullptr, nullptr, 0, &again),
+          GARC_OK);
+      ASSERT_EQ(garc_set_password(again, fresh.data(), fresh.size()), GARC_OK);
+      size_t read = 0;
+      while (garc_next(again, &member) == GARC_OK) {
+        char buffer[4096];
+        size_t got = 0;
+        GARC_Result status;
+        while ((status = garc_read_member(again, buffer, sizeof(buffer), &got))
+                == GARC_OK
+            && got) {
+        }
+        EXPECT_EQ(status, GARC_OK);
+        ++read;
+      }
+      garc_close(again);
+      EXPECT_EQ(read, 12u);
+      // Back to the original for the next round.
+      GARC_Sink * restore = nullptr;
+      ASSERT_EQ(garc_fs_sink_create(at("e.7z").c_str(), nullptr, nullptr,
+                    GARC_FS_NO_SYNC, &restore), GARC_OK);
+      ASSERT_EQ(garc_sink_write(restore, source.data(), source.size()), GARC_OK);
+      ASSERT_EQ(garc_sink_finish(restore), GARC_OK);
+      garc_sink_destroy(restore);
+    }
     gcu_file_remove(at("e.7z").c_str());
   }
 }
