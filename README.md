@@ -238,18 +238,19 @@ the digits in a numeric field, whether to use the ustar name split, what the
 extended header is called — so each was measured and each choice is argued in
 `documentation/design.md` rather than copied.
 
-Build clean under GCC 14 with `-Werror`; 579 tests; 99.3% line coverage of 3,401
-lines; the twenty-five uncovered are two `default:` arms no input can reach and
-their bodies - kept so that a third format added to an enum and not to a switch is
-a named internal error rather than a silent fall-through - eighteen arms reachable
-only if a codec or `compress`'s own allocator broke its contract, and three this
-library has always had, one of which is live only where `size_t` is 32 bits. Clean
-under Valgrind and under ASan+UBSan; `check-symbols`, `check-aliasing`,
-`check-corpus-hashes`, `check-fixtures` and `check-docs` green, the last at zero
-Doxygen warnings; six fuzz harnesses, the newest of which found a defect in its
-first two minutes; and seven oracle gates, of which two hand this library's *own
-output* to the pinned references - `check-zip-writer` found a defect on its first
-run that nothing inside this process could have seen.
+Measured at the end of phase I (2026-10-20, `notes/archive/PLAN.md` in the
+workspace): 829 tests in 24 programs pass under GCC 16.2 in the pinned build
+image, clean under ASan+UBSan and under Valgrind, with 2 named skips; the same
+suite passes under qemu on i686, s390x, PowerPC and SPARC64 (big-endian and
+strict-alignment), natively on a Raspberry Pi 4 (arm64), and as win64 under
+wine (830 tests, 8 skips named in `m1-skips.txt`). Line coverage is 91.9% of
+10,566 lines, down from 99.3% of 3,401 before the phase; `fs.c` (72%) and
+`zip_aes.c` (73%) are the gap, an open item in the plan. `check-symbols`,
+`check-aliasing`, `check-corpus-hashes`, `check-fixtures` and `check-docs` are
+green; nine fuzz harnesses ran ten minutes each with nothing outstanding; and
+eleven oracle gates hold the bytes to GNU tar, bsdtar, tarfile, zipfile,
+Info-ZIP and 7-Zip, five of them by handing those references this library's
+own output.
 
 ## A minimal complete program
 
