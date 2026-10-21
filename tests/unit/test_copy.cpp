@@ -27,6 +27,7 @@
 
 #include "tar_manifest.h"
 #include "test_helpers.h"
+#include "zip_builder.h"
 
 using garctest::read_fixture;
 
@@ -789,6 +790,69 @@ TEST(CopyMember, AnUnknownSizeMemberThatFailsItsCheckWritesNothing) {
   std::vector<uint8_t> tar;
   uint64_t failed_at = 0;
   EXPECT_EQ(copy_piped_zip_to_tar(zip, &tar, &failed_at), GARC_ERR_CORRUPT);
+}
+
+TEST(CopyMember, AZipSymlinkWhoseTargetIsDeflatedIsCopiedAsALink) {
+  // A zip keeps a symlink's target as its data, and lends it as the link
+  // target only when it is stored. Deflated, the copy reads it through the
+  // codec and hands every writer a link with a target and no data.
+  const std::string deflated("\x2b\x4a\x4d\xcc\xd1\x2b\xa9\x28\x01\x00", 10);
+  garctest::ZipBuilder builder;
+  builder.add("real.txt", "contents");
+  builder.add("link", deflated);
+  builder.last().method = 8;
+  builder.last().crc = 0x6e28322fu; // of "real.txt", what it inflates to
+  builder.last().external_attributes = 0120777u << 16;
+  builder.last().override_sizes = true;
+  builder.last().central_size = 8;
+  builder.last().central_compressed_size = 10;
+  const std::vector<uint8_t> source = builder.build();
+  for (GARC_Format format : {GARC_FORMAT_TAR, GARC_FORMAT_ZIP}) {
+    SCOPED_TRACE(garc_format_string(format));
+    const Copied copied = copy_all(source, format, 0);
+    ASSERT_EQ(copied.finished, GARC_OK);
+    EXPECT_TRUE(copied.refused.empty());
+    GARC_Result opened = GARC_OK;
+    const std::vector<Read> after = read_all(copied.bytes, &opened);
+    ASSERT_EQ(opened, GARC_OK);
+    ASSERT_EQ(after.size(), 2u);
+    EXPECT_EQ(after[1].name, "link");
+    EXPECT_EQ(after[1].type, GARC_MEMBER_SYMLINK);
+    EXPECT_EQ(after[1].link, "real.txt");
+  }
+}
+
+TEST(CopyMember, AZipSymlinkTargetPastTheNameCapIsRefusedByTheCap) {
+  // The target is read into memory, so the reader's name cap bounds it.
+  garctest::ZipBuilder builder;
+  const std::string deflated("\x2b\x4a\x4d\xcc\xd1\x2b\xa9\x28\x01\x00", 10);
+  builder.add("link", deflated);
+  builder.last().method = 8;
+  builder.last().crc = 0x6e28322fu;
+  builder.last().external_attributes = 0120777u << 16;
+  builder.last().override_sizes = true;
+  builder.last().central_size = 8;
+  builder.last().central_compressed_size = 10;
+  const std::vector<uint8_t> bytes = builder.build();
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_memory(bytes.data(), bytes.size(), &stream));
+  GARC_Limits limits;
+  garc_limits_default(&limits);
+  limits.max_name_bytes = 4;
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(GARC_OK, garc_open(stream, &limits, &archive));
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(GARC_OK, garc_next(archive, &member));
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_memory(&sink));
+  GARC_Writer * writer = nullptr;
+  ASSERT_EQ(GARC_OK, garc_writer_create(sink, GARC_FORMAT_TAR, nullptr, &writer));
+  EXPECT_EQ(GARC_ERR_LIMIT_NAME_BYTES,
+      garc_writer_copy_member(writer, archive, nullptr, 0));
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  garc_close(archive);
+  garc_stream_destroy(stream);
 }
 
 int main(int argc, char ** argv) {

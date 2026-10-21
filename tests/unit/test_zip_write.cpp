@@ -31,7 +31,9 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -320,6 +322,10 @@ void put32(std::vector<uint8_t> & bytes, size_t at, uint32_t value) {
 
 uint16_t le16(const std::vector<uint8_t> & bytes, size_t at) {
   return (uint16_t)((uint32_t)bytes[at] | ((uint32_t)bytes[at + 1] << 8));
+}
+
+uint64_t le64(const std::vector<uint8_t> & bytes, size_t at) {
+  return (uint64_t)le32(bytes, at) | ((uint64_t)le32(bytes, at + 4) << 32);
 }
 
 /** Whether the archive holds this four-byte signature anywhere. */
@@ -1136,6 +1142,169 @@ TEST(ZipWrite, AMemberPastFourGibibytesRecordsItsOffsetInZip64) {
   const size_t central = tail.bytes.find(std::string("PK\x01\x02", 4));
   ASSERT_NE(central, std::string::npos);
   EXPECT_EQ(le32_at(tail.bytes, central + 42u), 0xFFFFFFFFu);
+}
+
+namespace {
+
+/**
+ * A sink for an archive too big to keep: its first bytes and its last, which
+ * are every header there is when the member's data is all zeros.
+ */
+struct HeadAndTail {
+  uint64_t total = 0;
+  uint64_t tail_start = 0; ///< Bytes at or past this are kept in @ref tail.
+  std::vector<uint8_t> head; ///< The first 64 KiB.
+  std::vector<uint8_t> tail;
+  static GARC_Result write(void * ctx, const void * bytes, size_t length) {
+    auto * self = static_cast<HeadAndTail *>(ctx);
+    const auto * at = static_cast<const uint8_t *>(bytes);
+    for (size_t i = 0; i < length;) {
+      const uint64_t here = self->total + i;
+      if (here < 65536u) {
+        const size_t take = std::min<size_t>(length - i, (size_t)(65536u - here));
+        self->head.insert(self->head.end(), at + i, at + i + take);
+        i += take;
+      }
+      else if (here >= self->tail_start) {
+        self->tail.insert(self->tail.end(), at + i, at + length);
+        i = length;
+      }
+      else {
+        // Zeros in the middle, which the read back gives as zeros.
+        const uint64_t skip = std::min<uint64_t>(length - i, self->tail_start - here);
+        i += (size_t)skip;
+      }
+    }
+    self->total += length;
+    return GARC_OK;
+  }
+};
+
+/** The archive HeadAndTail kept, read back with zeros between the two. */
+struct Virtual {
+  const HeadAndTail * kept;
+  uint64_t at = 0;
+  static GARC_Result read(void * ctx, void * buffer, size_t size, size_t * out) {
+    auto * self = static_cast<Virtual *>(ctx);
+    auto * to = static_cast<uint8_t *>(buffer);
+    size_t n = 0;
+    while (n < size && self->at < self->kept->total) {
+      const uint64_t pos = self->at;
+      if (pos < self->kept->head.size()) {
+        to[n] = self->kept->head[(size_t)pos];
+      }
+      else if (pos >= self->kept->tail_start) {
+        to[n] = self->kept->tail[(size_t)(pos - self->kept->tail_start)];
+      }
+      else {
+        // A run of the middle's zeros at once, so 4 GiB is not a byte loop.
+        const uint64_t run = std::min<uint64_t>(size - n, self->kept->tail_start - pos);
+        std::memset(to + n, 0, (size_t)run);
+        n += (size_t)run;
+        self->at += run;
+        continue;
+      }
+      ++n;
+      ++self->at;
+    }
+    *out = n;
+    return GARC_OK;
+  }
+  static GARC_Result seek(void * ctx, uint64_t offset) {
+    static_cast<Virtual *>(ctx)->at = offset;
+    return GARC_OK;
+  }
+  static GARC_Result size(void * ctx, uint64_t * out) {
+    *out = static_cast<Virtual *>(ctx)->kept->total;
+    return GARC_OK;
+  }
+};
+
+} // namespace
+
+TEST(ZipWrite, AMemberOfFourGibibytesIsWrittenAndReadBack) {
+  // The other side of the threshold NoZip64FieldAppearsUntilOneIsNeeded
+  // stands on: a stored member whose sizes do not fit 32 bits, so both go in
+  // zip64 fields, the directory's widened once the stored size is known. It
+  // writes and reads 4 GiB, so it runs only when asked: GARC_TEST_LARGE=1,
+  // which the EVO gate sets.
+  if (!std::getenv("GARC_TEST_LARGE")) {
+    GTEST_SKIP() << "writes and reads 4 GiB; set GARC_TEST_LARGE=1";
+  }
+  const uint64_t declared = (uint64_t(1) << 32) + 4096u;
+  HeadAndTail kept;
+  kept.tail_start = declared;
+  GARC_Sink_Callbacks callbacks{};
+  callbacks.ctx = &kept;
+  callbacks.write = HeadAndTail::write;
+  GARC_Sink * sink = nullptr;
+  ASSERT_EQ(GARC_OK, garc_sink_create_callback(&callbacks, &sink));
+  GARC_Writer_Options options;
+  garc_writer_options_default(&options);
+  options.zip_method = GARC_ZIP_METHOD_STORED;
+  GARC_Writer * writer = nullptr;
+  ASSERT_EQ(GARC_OK, garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer));
+  GARC_Member member;
+  std::memset(&member, 0, sizeof(member));
+  member.name = "big.bin";
+  member.name_length = 7;
+  member.type = GARC_MEMBER_FILE;
+  member.size = declared;
+  ASSERT_EQ(GARC_OK, garc_writer_add(writer, &member));
+  const std::vector<uint8_t> zeros(1u << 20, 0);
+  for (uint64_t left = declared; left;) {
+    const size_t take = (size_t)std::min<uint64_t>(left, zeros.size());
+    ASSERT_EQ(GARC_OK, garc_writer_write(writer, zeros.data(), take));
+    left -= take;
+  }
+  ASSERT_EQ(GARC_OK, garc_writer_finish(writer));
+  garc_writer_destroy(writer);
+  garc_sink_destroy(sink);
+  ASSERT_GT(kept.total, declared);
+
+  // The directory entry: both 32-bit sizes the marker, and a zip64 field with
+  // both sizes in APPNOTE's order.
+  const std::string tail(kept.tail.begin(), kept.tail.end());
+  const size_t entry = tail.find(std::string("PK\x01\x02", 4));
+  ASSERT_NE(entry, std::string::npos);
+  EXPECT_EQ(le32(kept.tail, entry + 20), 0xFFFFFFFFu);
+  EXPECT_EQ(le32(kept.tail, entry + 24), 0xFFFFFFFFu);
+  const size_t extra = entry + 46u + le16(kept.tail, entry + 28);
+  ASSERT_EQ(le16(kept.tail, extra), 0x0001u);
+  ASSERT_GE(le16(kept.tail, extra + 2), 16u);
+  EXPECT_EQ(le64(kept.tail, extra + 4), declared);
+  EXPECT_EQ(le64(kept.tail, extra + 12), declared);
+
+  // And it reads back: every byte, and the CRC-32 of all of them.
+  Virtual source{&kept};
+  GARC_Stream_Callbacks stream_callbacks{};
+  stream_callbacks.ctx = &source;
+  stream_callbacks.read = Virtual::read;
+  stream_callbacks.seek = Virtual::seek;
+  stream_callbacks.size = Virtual::size;
+  GARC_Stream * stream = nullptr;
+  ASSERT_EQ(GARC_OK, garc_stream_create_callback(&stream_callbacks, &stream));
+  GARC_Archive * archive = nullptr;
+  ASSERT_EQ(GARC_OK, garc_open(stream, nullptr, &archive));
+  const GARC_Member * read = nullptr;
+  ASSERT_EQ(GARC_OK, garc_next(archive, &read));
+  EXPECT_EQ(read->size, declared);
+  std::vector<uint8_t> buffer(1u << 20);
+  uint64_t got_total = 0;
+  GARC_Result result = GARC_OK;
+  for (;;) {
+    size_t got = 0;
+    result = garc_read_member(archive, buffer.data(), buffer.size(), &got);
+    if (result != GARC_OK || !got) {
+      break;
+    }
+    got_total += got;
+  }
+  EXPECT_EQ(result, GARC_OK);
+  EXPECT_EQ(got_total, declared);
+  EXPECT_EQ(GARC_END, garc_next(archive, &read));
+  garc_close(archive);
+  garc_stream_destroy(stream);
 }
 
 TEST(ZipWrite, AMemberBelowFourGibibytesKeepsItsPlainOffset) {
@@ -2490,9 +2659,14 @@ TEST(ZipWrite, ASinkFailureDuringADeflatedMemberIsReported) {
   // next member's header instead. The failure inside garc_writer_write() needs a
   // member big enough and awkward enough that the encoder has to flush mid-call,
   // which is 64 KiB of bytes with no structure in them.
+  //
+  // Twice: in the clear, and under AES, whose encryption runs on each buffer
+  // as it goes to the sink and is wound back when the sink refuses it.
   size_t failures = 0;
+  for (const char * password : {static_cast<const char *>(nullptr), "pw"}) {
   for (size_t stage = 0; stage < 12u; ++stage) {
     SCOPED_TRACE(stage);
+    SCOPED_TRACE(password ? "aes" : "clear");
     BufferDrain drain;
     drain.fail_write_at(stage);
     GARC_Sink * sink = nullptr;
@@ -2500,6 +2674,10 @@ TEST(ZipWrite, ASinkFailureDuringADeflatedMemberIsReported) {
     GARC_Writer_Options options;
     garc_writer_options_default(&options);
     options.zip_method = GARC_ZIP_METHOD_DEFLATE;
+    if (password) {
+      options.zip_password = password;
+      options.zip_password_length = std::strlen(password);
+    }
     GARC_Writer * writer = nullptr;
     ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer),
         GARC_OK);
@@ -2522,9 +2700,10 @@ TEST(ZipWrite, ASinkFailureDuringADeflatedMemberIsReported) {
     garc_writer_destroy(writer);
     garc_sink_destroy(sink);
   }
+  }
   // Header, name, then seven buffers of compressed output, then the descriptor or
   // the directory: every stage in this range is a write that happens.
-  EXPECT_EQ(failures, 12u);
+  EXPECT_EQ(failures, 24u);
 }
 
 TEST(ZipWrite, APatchFailureIsReportedRatherThanLeavingAWrongHeader) {
