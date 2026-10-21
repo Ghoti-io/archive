@@ -52,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include <ghoti.io/archive/archive.h>
 
@@ -318,10 +319,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
     return 0;
   }
 
-  // A name no tar can hold: a NUL is refused in a header field and in a pax
-  // record, so this cannot be any member's name and the answer must be GARC_END.
-  static const char kAbsent[] = "fuzz\0absent\0name";
-  const size_t absent_length = sizeof(kAbsent) - 1u;
+  // A name no member can have, in any format: one byte longer than the name
+  // cap, which every reader enforces. (It was a name with NULs in it, which no
+  // tar can hold - and an ar short name can, which the fuzzer found.)
+  const std::string absent_name(
+      static_cast<size_t>(limits.max_name_bytes) + 1u, 'z');
+  const char * const kAbsent = absent_name.data();
+  const size_t absent_length = absent_name.size();
 
   // ------------------------------------------------------------------
   // The refusal, asserted before the walk so that "it did not move the
@@ -496,7 +500,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   const GARC_Result missing
       = garc_find(archive, kAbsent, absent_length, &absent);
   REQUIRE(documented(missing), "find returned a status it does not document");
-  REQUIRE(missing != GARC_OK, "a name no tar can hold was found");
+  REQUIRE(missing != GARC_OK, "a name longer than the cap was found");
 
   // ------------------------------------------------------------------
   // A find as the first thing that happens to an archive, on an archive opened
