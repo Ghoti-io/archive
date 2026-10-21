@@ -262,7 +262,7 @@ extended header is called — so each was measured and each choice is argued in
 `documentation/design.md` rather than copied.
 
 Measured on 2026-10-21, after the work that followed phase I
-(`notes/archive/PLAN.md` in the workspace), at archive `c296488`: 857 tests in
+at archive `c296488`: 857 tests in
 24 programs pass under GCC 16.2 in the pinned build image, clean under
 ASan+UBSan and under Valgrind, with 3 named skips (one is the 4 GiB member,
 which runs with `GARC_TEST_LARGE=1` and passed); the same 857 pass under qemu on

@@ -802,8 +802,8 @@ consumed twice, a cycle) is corrupt.
 Neither has a published one; 7-Zip's public-domain LZMA SDK is their only
 definition, and this library does not port other implementations. On 2026-10-21
 Corey made an exception for these two coders, in a form that keeps the rule's
-point: a separate describer read the SDK and wrote prose with no code in it
-(kept in the workspace, `notes/archive/`), and the code here was written from
+point: a separate describer read the SDK and wrote prose with no code in it,
+and the code here was written from
 that and from 7-Zip's behaviour by someone who has not read the source. The
 corpus is 7-Zip's archives, and a test-side BCJ2 encoder written from the same
 description reproduces 7-Zip's four streams byte for byte - which is also how
@@ -952,8 +952,11 @@ out with the wrong mode.**
 
 ## 8. The result vocabulary, and its two departures
 
-CONVENTIONS.md section 5 fixes the result vocabulary. This library departs
-twice, and both departures are in that document's table.
+Every library in the suite returns one result enum whose zero is success, from
+a fixed vocabulary - `OK`, then an error code per kind of failure (I/O,
+unsupported, corrupt, out of memory, invalid argument, internal, a limit) -
+closed by a `RESULT_COUNT` so that a test can check the string table is
+complete. This library departs from that twice, deliberately.
 
 **`GARC_END` is neither success nor failure.** Walking an archive ends, and the
 end of a well-formed archive is not an error, so a caller writing

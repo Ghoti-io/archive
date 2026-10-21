@@ -26,8 +26,8 @@
  * **Where this came from.** 7z AES has no published specification; 7-Zip's
  * public-domain LZMA SDK is its only definition. Under a clean-room exception
  * Corey made on 2026-10-21, a describer read that source and wrote a prose
- * description with no code in it, `notes/archive/7Z-AES-DESCRIPTION.md` in the
- * workspace, checking each format fact against 7-Zip as a black box. This file
+ * description with no code in it, checking each format fact against 7-Zip as a
+ * black box. This file
  * was written from that description and checked against 7-Zip's archives; its
  * author has not read the source.
  *

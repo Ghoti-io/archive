@@ -20,7 +20,7 @@ tree where they were written and are absent from every clone, and nothing says s
 the suite goes red on someone else's machine, for a reason that looks like a broken
 checkout.
 
-It has happened twice in this workspace: `regex` lost half of what one of its gates
+It has happened twice among these libraries: `regex` lost half of what one of its gates
 measured against, and this library's third fuzz harness was added with its seed
 directory excluded. The gate is cheap because the question is cheap: git will
 answer it per path.
