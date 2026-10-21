@@ -2490,6 +2490,74 @@ TEST(Zip, AForgedDescriptorInStoredDataDoesNotReadAsGood) {
   EXPECT_EQ(seek[0].second, data);
 }
 
+TEST(Zip, AnEncryptedMemberWhoseSizesDisagreeIsCorruptOnAPipe) {
+  // The size checks garc_zip_next() makes before the password - a stored
+  // payload is the size, framing removed - made for a member the pipe only
+  // lists, its data refused for want of one. fuzz_zip found an AES-192 member
+  // stored with 19 payload bytes and a size of 15 read to the end off a pipe.
+  std::string plain = "fifteen bytes!!";
+  std::string extra;
+  garctest::ZipBuilder::append16(extra, 0x9901u);
+  garctest::ZipBuilder::append16(extra, 7u);
+  garctest::ZipBuilder::append16(extra, 2u); // AE-2
+  extra += "AE";
+  extra.push_back(2); // AES-192: 12 salt, 2 verifier, 10 tag
+  garctest::ZipBuilder::append16(extra, 0u); // stored
+  for (const size_t body : {plain.size(), plain.size() + 4u}) {
+    SCOPED_TRACE(body);
+    garctest::ZipBuilder builder;
+    builder.add("hello.txt", std::string(24u + body, 'x'));
+    builder.last().method = 99;
+    builder.last().flags = 0x0001u;
+    builder.last().crc = 0;
+    builder.last().local_extra = extra;
+    builder.last().central_extra = extra;
+    builder.last().override_sizes = true;
+    builder.last().central_size = static_cast<uint32_t>(plain.size());
+    builder.last().central_compressed_size = static_cast<uint32_t>(24u + body);
+    std::vector<uint8_t> bytes = builder.build();
+    // The local header's sizes as the directory's.
+    bytes[22] = static_cast<uint8_t>(plain.size());
+    Piped piped(bytes);
+    ASSERT_EQ(piped.open_result(), GARC_OK);
+    const GARC_Member * member = nullptr;
+    GARC_Result result;
+    while ((result = garc_next(piped.archive(), &member)) == GARC_OK) {
+    }
+    EXPECT_EQ(result, body == plain.size() ? GARC_END : GARC_ERR_CORRUPT);
+  }
+}
+
+TEST(Zip, StrongEncryptionIsRefusedByNameFromAFileAndFromAPipe) {
+  // PKWARE's strong encryption is bits 0 and 6 together; nothing here reads
+  // it, and both readers list the member and refuse its data by name rather
+  // than take it for ZipCrypto. Bit 6 alone describes nothing and both ignore
+  // it: fuzz_zip found the pipe refusing on it alone, and so skipping an LZMA
+  // header the seekable reader checked.
+  garctest::ZipBuilder builder;
+  builder.add("secret.bin", std::string(40, 's'));
+  builder.last().flags = 0x0041u;
+  const std::vector<uint8_t> bytes = builder.build();
+  for (const bool pipe : {false, true}) {
+    SCOPED_TRACE(pipe ? "pipe" : "file");
+    BufferSource source(bytes.data(), bytes.size(), !pipe, !pipe);
+    GARC_Stream * stream = nullptr;
+    ASSERT_EQ(garc_stream_create_callback(source.callbacks(), &stream), GARC_OK);
+    GARC_Archive * archive = nullptr;
+    ASSERT_EQ(garc_open(stream, nullptr, &archive), GARC_OK);
+    garc_zip_set_password(archive, "x", 1);
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(garc_next(archive, &member), GARC_OK);
+    char buffer[16];
+    size_t got = 0;
+    EXPECT_EQ(garc_read_member(archive, buffer, sizeof(buffer), &got),
+        GARC_ERR_UNSUPPORTED);
+    EXPECT_EQ(garc_next(archive, &member), GARC_END);
+    garc_close(archive);
+    garc_stream_destroy(stream);
+  }
+}
+
 TEST(Zip, AnEncryptionFlagOnlyTheLocalHeaderHasIsCorruptOnAPipe) {
   // The pipe decides whether a member is encrypted, or strongly encrypted,
   // from its local header and refuses its data; the seekable reader decides
@@ -2503,13 +2571,16 @@ TEST(Zip, AnEncryptionFlagOnlyTheLocalHeaderHasIsCorruptOnAPipe) {
     std::vector<uint8_t> bytes = clean;
     ASSERT_EQ(0, std::memcmp(bytes.data(), "PK\x03\x04", 4));
     bytes[6] = static_cast<uint8_t>(bytes[6] | bit);
-    // Walked without reading the data, which is refused: the walk goes on to
-    // the directory, and that is where the two readings must meet.
+    // Walked without reading the data, which is refused: the walk is refused
+    // at the member (a ZipCrypto member shorter than its own header) or at the
+    // directory, and is never read to its end.
     Piped piped(bytes);
     ASSERT_EQ(piped.open_result(), GARC_OK);
     const GARC_Member * member = nullptr;
-    ASSERT_EQ(garc_next(piped.archive(), &member), GARC_OK);
-    EXPECT_EQ(garc_next(piped.archive(), &member), GARC_ERR_CORRUPT);
+    GARC_Result result;
+    while ((result = garc_next(piped.archive(), &member)) == GARC_OK) {
+    }
+    EXPECT_EQ(result, GARC_ERR_CORRUPT);
   }
   Piped control(clean);
   ASSERT_EQ(control.open_result(), GARC_OK);

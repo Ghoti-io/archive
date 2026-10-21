@@ -58,6 +58,11 @@
 
 /** Local file header. */
 static const uint8_t ZIP_SIG_LOCAL[4] = {'P', 'K', 3, 4};
+/**
+ * Encrypted (bit 0) with PKWARE's strong encryption (bit 6): both, as APPNOTE
+ * 4.4.4 spells it. Bit 6 alone describes nothing, and both readers ignore it.
+ */
+#define ZIP_FLAG_STRONG_ENCRYPTION 0x0041u
 /** Central directory entry. */
 static const uint8_t ZIP_SIG_CENTRAL[4] = {'P', 'K', 1, 2};
 /** End of central directory. */
@@ -1317,6 +1322,74 @@ GARC_Result garc_zip_skip(GARC_Archive * archive) {
   return GARC_OK;
 }
 
+/**
+ * What a member's sizes must be, given its method and its encryption: the
+ * checks the seekable reader and the pipe both make, so that neither reads
+ * a member the other refuses.
+ *
+ * An encrypted member is at least its framing long, a stored one's payload -
+ * the compressed size less that framing - is its size, and an LZMA one's holds
+ * method 14's nine-byte header. An AES member of a strength or version this
+ * library does not read is not checked: it is refused as unsupported, and that
+ * refusal is not turned into a size check against the unadjusted payload.
+ *
+ * @param zip The member's state: its method, encryption and AES fields.
+ * @param compressed Its compressed size.
+ * @param size Its uncompressed size.
+ * @param out_payload Receives the compressed size less any framing.
+ * @param out_aes_known Receives whether its AES framing is one read here.
+ * @return ::GARC_OK, or ::GARC_ERR_CORRUPT.
+ */
+static GARC_Result zip_sizes_check(const GARC_Zip_State * zip,
+    uint64_t compressed, uint64_t size, uint64_t * out_payload,
+    int * out_aes_known) {
+  const uint16_t body = zip->encryption == GARC_ZIP_ENCRYPTION_AES
+      ? zip->aes_method : zip->method;
+  uint64_t payload = compressed;
+  int aes_known = 0;
+  if ((zip->flags & ZIP_FLAG_STRONG_ENCRYPTION) == ZIP_FLAG_STRONG_ENCRYPTION) {
+    // Strong encryption's framing is its own and nothing here reads it, so
+    // there is no payload to hold the sizes to; the member is refused by name.
+    *out_payload = payload;
+    *out_aes_known = 0;
+    return GARC_OK;
+  }
+  if (zip->encryption == GARC_ZIP_ENCRYPTION_ZIPCRYPTO) {
+    if (compressed < GARC_ZIP_CRYPT_HEADER_SIZE) {
+      return GARC_ERR_CORRUPT;
+    }
+    payload = compressed - GARC_ZIP_CRYPT_HEADER_SIZE;
+  }
+  else if (zip->encryption == GARC_ZIP_ENCRYPTION_AES) {
+    const size_t framing = garc_zip_aes_framing(zip->aes_strength);
+    aes_known = framing != 0u
+        && (zip->aes_version == 1u || zip->aes_version == 2u);
+    if (aes_known && compressed < (uint64_t)framing) {
+      return GARC_ERR_CORRUPT;
+    }
+    if (aes_known) {
+      payload = compressed - (uint64_t)framing;
+    }
+  }
+  const int checked = zip->encryption != GARC_ZIP_ENCRYPTION_AES || aes_known;
+  if (checked && body == GARC_ZIP_METHOD_STORED && payload != size) {
+    // Stored means the two sizes are one number; both are things a reader
+    // seeks by, and a member that says otherwise describes something the
+    // method cannot do.
+    return GARC_ERR_CORRUPT;
+  }
+  if (checked && body == GARC_ZIP_METHOD_LZMA
+      && payload < (uint64_t)ZIP_LZMA_HEADER_SIZE) {
+    // A fact about the archive's sizes, as the framing is: checked here so a
+    // short payload stops the walk for every caller, not only one who set a
+    // password and reached the parse.
+    return GARC_ERR_CORRUPT;
+  }
+  *out_payload = payload;
+  *out_aes_known = aes_known;
+  return GARC_OK;
+}
+
 GARC_Result garc_zip_next(GARC_Archive * archive) {
   if (archive->zip.streaming) {
     return garc_zip_stream_next(archive);
@@ -1604,41 +1677,12 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   // and a walkable one to a caller who did not. A refusal that arrives only for
   // some callers is worse than either answer.
   int aes_known = 0;
-  if (zip->encryption == GARC_ZIP_ENCRYPTION_ZIPCRYPTO) {
-    if (compressed_size < GARC_ZIP_CRYPT_HEADER_SIZE) {
-      return GARC_ERR_CORRUPT;
+  {
+    const GARC_Result sized = zip_sizes_check(zip, compressed_size, size,
+        &payload, &aes_known);
+    if (sized != GARC_OK) {
+      return sized;
     }
-    payload = compressed_size - GARC_ZIP_CRYPT_HEADER_SIZE;
-  }
-  else if (zip->encryption == GARC_ZIP_ENCRYPTION_AES) {
-    const size_t framing = garc_zip_aes_framing(zip->aes_strength);
-    aes_known = framing != 0u
-        && (zip->aes_version == 1u || zip->aes_version == 2u);
-    if (aes_known && compressed_size < (uint64_t)framing) {
-      return GARC_ERR_CORRUPT;
-    }
-    if (aes_known) {
-      payload = compressed_size - (uint64_t)framing;
-    }
-  }
-  if ((zip->encryption != GARC_ZIP_ENCRYPTION_AES || aes_known)
-      && body == GARC_ZIP_METHOD_STORED && payload != size) {
-    // Stored means the two sizes are one number - the *payload*, which for an
-    // encrypted member is the compressed size less its framing. A member that
-    // says otherwise describes something the method cannot do, and both numbers
-    // are things a reader seeks by. An AES member whose strength or version is
-    // not one this library reads is refused as unsupported below, and that
-    // refusal is not turned into a size check against the unadjusted payload.
-    return GARC_ERR_CORRUPT;
-  }
-  if ((zip->encryption != GARC_ZIP_ENCRYPTION_AES || aes_known)
-      && body == GARC_ZIP_METHOD_LZMA
-      && payload < (uint64_t)ZIP_LZMA_HEADER_SIZE) {
-    // Method 14's nine-byte header is a fact about the archive's sizes, the
-    // same way an encrypted member's framing is. Checked here so a short
-    // payload stops the walk for every caller rather than only one who set a
-    // password and reached the decrypting parse below.
-    return GARC_ERR_CORRUPT;
   }
 
   // **The real method is answered before the password, and the order is the
@@ -1646,6 +1690,11 @@ GARC_Result garc_zip_next(GARC_Archive * archive) {
   // password, so asking for one first would send a caller to a prompt and then
   // refuse them anyway.
   if (zip->encryption == GARC_ZIP_ENCRYPTION_AES && !aes_known) {
+    archive->data_refusal = GARC_ERR_UNSUPPORTED;
+  }
+  else if ((zip->flags & ZIP_FLAG_STRONG_ENCRYPTION) == ZIP_FLAG_STRONG_ENCRYPTION) {
+    // PKWARE's strong encryption, which nothing here reads: listed, its data
+    // refused by name rather than taken for ZipCrypto and its password for wrong.
     archive->data_refusal = GARC_ERR_UNSUPPORTED;
   }
   else if (body != GARC_ZIP_METHOD_STORED && !codec_name) {
@@ -2523,7 +2572,7 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
           // strongly encrypted. A local header that says so alone is a member
           // the pipe skipped and the directory says can be read - an LZMA
           // header the seekable reader checks and the pipe never saw.
-          || ((record.flags ^ central_flags) & (ZIP_FLAG_ENCRYPTED | 0x0040u))
+          || ((record.flags ^ central_flags) & ZIP_FLAG_STRONG_ENCRYPTION)
           || record.crc != garc_zip_le32(entry + 16u)
           || record.compressed != compressed || record.size != size
           || record.encryption != central_encryption
@@ -2823,6 +2872,17 @@ GARC_Result garc_zip_stream_next(GARC_Archive * archive) {
     zip->aes_strength = extra.aes_strength;
     zip->aes_method = extra.aes_real_method;
   }
+  if (!zip->s_descriptor) {
+    // The sizes the header gave, held to what the method and the encryption
+    // allow, as garc_zip_next() holds them: a member the pipe only lists, its
+    // data refused, is still one the seekable reader refuses whole.
+    uint64_t payload = 0;
+    int aes_known = 0;
+    result = zip_sizes_check(zip, compressed_size, size, &payload, &aes_known);
+    if (result != GARC_OK) {
+      return result;
+    }
+  }
 
   GARC_Member * member = &archive->member;
   memset(member, 0, sizeof(*member));
@@ -2875,8 +2935,7 @@ GARC_Result garc_zip_stream_next(GARC_Archive * archive) {
     archive->data_remaining = 0;
     zip->s_data_done = 1;
   }
-  else if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE
-      || (zip->flags & 0x0040u)) {
+  else if (zip->encryption != GARC_ZIP_ENCRYPTION_NONE) {
     // Listed, not read: see the section comment.
     archive->data_refusal = GARC_ERR_UNSUPPORTED;
     if (zip->s_descriptor) {

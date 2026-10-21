@@ -221,6 +221,11 @@ GARC_API const char * garc_zip_sizes_string(GARC_Zip_Sizes sizes);
  * set, and what it reads from a method 99 member. "Unsupported" alone cannot
  * tell a caller which of those they are looking at, nor whether supplying a
  * password could ever help.
+ *
+ * PKWARE's strong encryption (general purpose bits 0 and 6 together) is not
+ * read: such a member reports ::GARC_ZIP_ENCRYPTION_ZIPCRYPTO, the bit 0 it
+ * has, and its data is ::GARC_ERR_UNSUPPORTED whatever the password, from a
+ * file and from a pipe alike.
  */
 typedef enum {
   GARC_ZIP_ENCRYPTION_NONE = 0, ///< Not encrypted.
