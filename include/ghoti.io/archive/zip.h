@@ -57,13 +57,17 @@
  * A member whose local header says its sizes follow the data (a data
  * descriptor) has ::GARC_Member::size_unknown set and a size of 0 until its
  * data has been read; the decoder's own end of stream says where the data
- * stops, so what can be read that way is deflate, deflate64, zstd, and LZMA
- * with its end marker. A stored member with a descriptor has no end of its own
- * and is ::GARC_ERR_UNSUPPORTED on the walk, as is an encrypted member with
- * one. So, for now, are bzip2 and xz with one: both formats mark their own end,
- * but compress's decoders read on into a following stream (and xz's into zero
- * padding) instead of stopping at the first, and neither yet reports the bytes
- * it took past that end, so the descriptor's position cannot be found. An
+ * stops, so what can be read that way is deflate, deflate64, zstd, bzip2, xz,
+ * and LZMA with its end marker - each decoder asked for one stream, so the
+ * descriptor after it is not taken for a second. A stored member with a descriptor has no end of its own,
+ * so its end is the first descriptor whose CRC-32 and sizes are those of the
+ * data before it, as Info-ZIP's and libarchive's streaming readers find it; a
+ * descriptor forged inside the data ends the member early, and the walk is
+ * then refused at the latest by the directory. A writer that leaves out the
+ * descriptor's optional signature is not found this way, and the member is
+ * ::GARC_ERR_CORRUPT at the end of the stream. An encrypted member with a
+ * descriptor is ::GARC_ERR_UNSUPPORTED on the walk, as is LZMA without its
+ * end marker and a legacy method (shrink, reduce, implode) with one. An
  * encrypted member with sizes in its header is listed and skipped; its data is
  * refused. A symlink is reported as a file, because the bit that says
  * otherwise is in the directory. On a seekable stream none of this applies:

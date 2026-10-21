@@ -438,6 +438,8 @@ typedef struct {
   int s_data_done;               ///< Whether its data has all been read.
   GARC_Result s_stuck;           ///< Why the walk cannot pass this member.
   int s_dir_descriptor;          ///< A stored directory whose descriptor follows its header.
+  /** A stored file behind a descriptor: its end is the descriptor that fits. */
+  int s_scan;
   /** @} */
   /** @} */
 } GARC_Zip_State;

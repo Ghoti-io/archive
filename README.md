@@ -180,10 +180,12 @@ the walk kept is compared with the central directory when it is reached; any
 disagreement is `GARC_ERR_CORRUPT` from that last `garc_next()`, so what a streamed
 walk hands over is provisional until it ends. A member written with a data
 descriptor has `size_unknown` set until its data is read, which is possible for
-the methods whose decoder knows where it ends (deflate, deflate64, zstd, LZMA with
-its marker); stored members with a descriptor are refused there, because nothing
-marks where stored data ends, and so for now are bzip2 and xz, whose decoders in
-compress read on past the end of the first stream.
+the methods whose decoder knows where it ends (deflate, deflate64, zstd, bzip2, xz,
+LZMA with its marker), each asked for one stream so that the descriptor is not read
+as a second. A stored member with a descriptor ends at the first descriptor whose
+CRC-32 and sizes fit the data before it, as other streaming readers find it, and a
+forged one is caught by the directory. A split zip piped in order, as `cat` gives its volumes, is read the same
+way, with each disk's start worked out from its records.
 
 **Split archives are read whole.** `garc_stream_create_concat()` makes one stream
 of several, and a split zip read through it has every disk field honoured,

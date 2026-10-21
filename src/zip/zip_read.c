@@ -66,6 +66,8 @@ static const uint8_t ZIP_SIG_EOCD[4] = {'P', 'K', 5, 6};
 static const uint8_t ZIP_SIG_ZIP64_EOCD[4] = {'P', 'K', 6, 6};
 /** Zip64 end of central directory locator. */
 static const uint8_t ZIP_SIG_ZIP64_LOCATOR[4] = {'P', 'K', 6, 7};
+/** A data descriptor's optional signature, which a stored member's end is found by. */
+static const uint8_t ZIP_SIG_DESCRIPTOR_SCAN[4] = {'P', 'K', 7, 8};
 /** The first four bytes of a split zip's first volume. */
 static const uint8_t ZIP_SIG_SPANNING[4] = {'P', 'K', 7, 8};
 
@@ -2076,9 +2078,9 @@ GARC_Result garc_zip_raw_read(
 //   where its codec says the compressed stream ends - deflate, deflate64, LZMA
 //   with an end marker, zstd - and the descriptor after it is read and checked
 //   against what was decoded. A stored member with a descriptor has no end that
-//   anything marks, and is refused by name. bzip2 and xz with one are refused
-//   too: compress's decoders for those read concatenated streams and offer no way
-//   to stop at the first, so the descriptor would be taken for a second stream.
+//   anything marks, so its end is the first descriptor that fits the data before
+//   it (zs_read_scanned_member()). bzip2 and xz are asked for one stream
+//   (`bzip2.concat`, `xz.concat`), so the descriptor is not taken for a second.
 // - **Encrypted members are listed and not read.** ZipCrypto and WinZip AES are
 //   set up here by offset, and AES's check is at the member's end.
 //
@@ -2106,6 +2108,7 @@ typedef struct {
   uint32_t crc;         ///< Its CRC-32, likewise.
   uint32_t name_length; ///< Its name's length.
   uint16_t method;      ///< Its method.
+  uint16_t flags;       ///< Its local header's general purpose flags.
   uint16_t aes_method;  ///< Its real method, for a WinZip AES member.
   uint16_t aes_version; ///< AE-1 or AE-2, likewise.
   uint8_t aes_strength; ///< Its key size, likewise.
@@ -2342,6 +2345,7 @@ static GARC_Result zs_finish_member(GARC_Archive * archive) {
   record.size = zip->s_descriptor ? zip->s_produced : archive->member.size;
   record.crc = zip->crc32;
   record.method = zip->method;
+  record.flags = zip->flags;
   record.encryption = (int)zip->encryption;
   record.aes_method = zip->encryption == GARC_ZIP_ENCRYPTION_AES
       ? zip->aes_method : 0u;
@@ -2515,6 +2519,11 @@ static GARC_Result zs_check_directory(GARC_Archive * archive) {
               && memcmp(zip->s_names.bytes + record.name_at, zip->name.bytes,
                      name_length) != 0)
           || record.method != garc_zip_le16(entry + 10u)
+          // The bits the walk refused or read a member by: encrypted, and
+          // strongly encrypted. A local header that says so alone is a member
+          // the pipe skipped and the directory says can be read - an LZMA
+          // header the seekable reader checks and the pipe never saw.
+          || ((record.flags ^ central_flags) & (ZIP_FLAG_ENCRYPTED | 0x0040u))
           || record.crc != garc_zip_le32(entry + 16u)
           || record.compressed != compressed || record.size != size
           || record.encryption != central_encryption
@@ -2854,6 +2863,7 @@ GARC_Result garc_zip_stream_next(GARC_Archive * archive) {
   const char * codec_name = zip_codec_name(zip->method);
   GARC_Member_Legacy no_legacy;
   zip->s_dir_descriptor = 0;
+  zip->s_scan = 0;
   if (member->type == GARC_MEMBER_DIRECTORY
       && !(zip->s_descriptor && zip->method != GARC_ZIP_METHOD_STORED)) {
     // A directory has no data, so a stored one's descriptor follows its header
@@ -2880,10 +2890,7 @@ GARC_Result garc_zip_stream_next(GARC_Archive * archive) {
     }
   }
   else if (zip->s_descriptor
-      && (zip->method == GARC_ZIP_METHOD_STORED
-          || zip->method == GARC_ZIP_METHOD_BZIP2
-          || zip->method == GARC_ZIP_METHOD_XZ
-          || (zip->method == GARC_ZIP_METHOD_LZMA
+      && ((zip->method == GARC_ZIP_METHOD_LZMA
               && !(zip->flags & ZIP_FLAG_LZMA_EOS))
           || zip_legacy_keys(zip->method, zip->flags, 0u, &no_legacy))) {
     // Nothing marks where these end: see the section comment.
@@ -2936,6 +2943,14 @@ GARC_Result garc_zip_stream_next(GARC_Archive * archive) {
     }
     zip->crc_active = 1;
   }
+  else if (zip->method == GARC_ZIP_METHOD_STORED) {
+    // Stored behind a descriptor: no codec marks the end, so the descriptor
+    // does - the first one whose CRC and sizes are those of the bytes before
+    // it. See zs_read_scanned_member().
+    zip->s_scan = 1;
+    archive->data_remaining = UINT64_MAX;
+    zip->crc_active = 1;
+  }
   else {
     // A descriptor member whose codec ends itself.
     if (gcomp_options_create(&zip->s_options) != GCOMP_OK) {
@@ -2947,9 +2962,17 @@ GARC_Result garc_zip_stream_next(GARC_Archive * archive) {
                     "limits.max_output_bytes", archive->limits.max_member_bytes)
           != GCOMP_OK;
     }
+    // One frame or stream: what follows it is the descriptor, not a second.
     if (zip->method == GARC_ZIP_METHOD_ZSTD) {
-      // One frame: what follows it is the descriptor, not a second frame.
       failed |= gcomp_options_set_bool(zip->s_options, "zstd.concat", 0)
+          != GCOMP_OK;
+    }
+    if (zip->method == GARC_ZIP_METHOD_BZIP2) {
+      failed |= gcomp_options_set_bool(zip->s_options, "bzip2.concat", 0)
+          != GCOMP_OK;
+    }
+    if (zip->method == GARC_ZIP_METHOD_XZ) {
+      failed |= gcomp_options_set_bool(zip->s_options, "xz.concat", 0)
           != GCOMP_OK;
     }
     if (zip->method == GARC_ZIP_METHOD_LZMA) {
@@ -3022,9 +3045,122 @@ GARC_Result garc_zip_stream_read(
   return zs_read_sized_member(archive, buffer, capacity, out_read);
 }
 
+/**
+ * The end of a member whose data is over, now that its size is known.
+ *
+ * The caps the declared size would have answered at garc_next(), and the
+ * CRC-32 the descriptor gave against the one the data has.
+ */
+static GARC_Result zs_member_ended(GARC_Archive * archive) {
+  GARC_Zip_State * zip = &archive->zip;
+  archive->member.size = zip->s_produced;
+  archive->member.stored_size = zip->s_produced;
+  archive->data_remaining = 0;
+  archive->total_declared_bytes += zip->s_produced;
+  if (archive->limits.max_total_bytes
+      && archive->total_declared_bytes > archive->limits.max_total_bytes) {
+    return GARC_ERR_LIMIT_TOTAL_BYTES;
+  }
+  if (gcomp_crc32_finalize(zip->running_crc) != zip->crc32) {
+    return GARC_ERR_CORRUPT;
+  }
+  return GARC_OK;
+}
+
+/**
+ * A stored member behind a descriptor: its bytes, up to the descriptor that
+ * fits them.
+ *
+ * Nothing marks where stored data ends, so the end is the first descriptor
+ * signature whose CRC-32 is the data's so far and whose two sizes are both
+ * the data's length - the test Info-ZIP's and libarchive's streaming readers
+ * make. A signature that fails it is data. Data can still hold one that
+ * passes, by design rather than by chance (a stored zip inside a zip); the
+ * walk then ends that member early and the directory, which has the real
+ * sizes, refuses the archive at the end, as it refuses any walk that saw
+ * something else. A writer that leaves the optional signature out is not
+ * found, and the member reads to the end of the stream and is corrupt.
+ */
+static GARC_Result zs_read_scanned_member(
+    GARC_Archive * archive, void * buffer, size_t capacity, size_t * out_read) {
+  GARC_Zip_State * zip = &archive->zip;
+  uint8_t * bytes = (uint8_t *)buffer;
+  size_t got = 0;
+  GARC_Result result = zs_seq_read(archive, bytes, capacity, &got);
+  if (result != GARC_OK) {
+    return result;
+  }
+  if (!got) {
+    return GARC_ERR_CORRUPT; // the stream ended inside the member
+  }
+  // Where a signature, or the start of one at the end, could be.
+  size_t at = 0;
+  for (; at < got; ++at) {
+    if (bytes[at] != 'P') {
+      continue;
+    }
+    const size_t room = got - at < 4u ? got - at : 4u;
+    if (memcmp(bytes + at, ZIP_SIG_DESCRIPTOR_SCAN, room) == 0) {
+      break;
+    }
+  }
+  size_t data = at;
+  if (at == 0) {
+    // A candidate first: read the whole descriptor it would be, and test it.
+    const size_t length = zip->s_zip64 ? 24u : 16u;
+    uint8_t descriptor[24];
+    result = zs_give_back(archive, bytes, got);
+    if (result == GARC_OK) {
+      result = zs_read_exact(archive, descriptor, length);
+    }
+    if (result != GARC_OK) {
+      return result;
+    }
+    const uint64_t produced = zip->s_produced;
+    const uint32_t crc = garc_zip_le32(descriptor + 4u);
+    const uint64_t compressed = zip->s_zip64 ? garc_zip_le64(descriptor + 8u)
+                                             : garc_zip_le32(descriptor + 8u);
+    const uint64_t size = zip->s_zip64 ? garc_zip_le64(descriptor + 16u)
+                                       : garc_zip_le32(descriptor + 12u);
+    if (memcmp(descriptor, ZIP_SIG_DESCRIPTOR_SCAN, 4) == 0
+        && crc == gcomp_crc32_finalize(zip->running_crc)
+        && compressed == produced && size == produced) {
+      zip->crc32 = crc;
+      zip->compressed_size = produced;
+      zip->s_data_done = 1;
+      return zs_member_ended(archive);
+    }
+    // Not this member's descriptor: its first byte is data, and the rest goes
+    // back to be looked at again.
+    result = zs_give_back(archive, descriptor + 1u, length - 1u);
+    if (result != GARC_OK) {
+      return result;
+    }
+    bytes[0] = descriptor[0];
+    data = 1;
+  }
+  else if (at < got) {
+    result = zs_give_back(archive, bytes + at, got - at);
+    if (result != GARC_OK) {
+      return result;
+    }
+  }
+  if (archive->limits.max_member_bytes
+      && zip->s_produced + (uint64_t)data > archive->limits.max_member_bytes) {
+    return GARC_ERR_LIMIT_MEMBER_BYTES;
+  }
+  zip->running_crc = gcomp_crc32_update(zip->running_crc, bytes, data);
+  zip->s_produced += (uint64_t)data;
+  *out_read = data;
+  return GARC_OK;
+}
+
 static GARC_Result zs_read_descriptor_member(
     GARC_Archive * archive, void * buffer, size_t capacity, size_t * out_read) {
   GARC_Zip_State * zip = &archive->zip;
+  if (zip->s_scan) {
+    return zs_read_scanned_member(archive, buffer, capacity, out_read);
+  }
   size_t got = 0;
   GARC_Result result = garc_stream_read(zip->s_decoder, buffer, capacity, &got);
   if (result == GARC_ERR_LIMIT_CODEC_BYTES) {
@@ -3065,19 +3201,7 @@ static GARC_Result zs_read_descriptor_member(
   if (result != GARC_OK) {
     return result;
   }
-  archive->member.size = zip->s_produced;
-  archive->member.stored_size = zip->s_produced;
-  archive->data_remaining = 0;
-  // The caps that the declared size would have answered at garc_next().
-  archive->total_declared_bytes += zip->s_produced;
-  if (archive->limits.max_total_bytes
-      && archive->total_declared_bytes > archive->limits.max_total_bytes) {
-    return GARC_ERR_LIMIT_TOTAL_BYTES;
-  }
-  if (gcomp_crc32_finalize(zip->running_crc) != zip->crc32) {
-    return GARC_ERR_CORRUPT;
-  }
-  return GARC_OK;
+  return zs_member_ended(archive);
 }
 
 /** A member whose header gave its sizes: a slice, or a codec bounded by them. */

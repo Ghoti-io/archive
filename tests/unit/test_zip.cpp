@@ -31,6 +31,7 @@
 
 #include <gtest/gtest.h>
 
+#include <ghoti.io/compress/crc32.h>
 #include <ghoti.io/security/sha256.h>
 
 #include "test_helpers.h"
@@ -1629,7 +1630,8 @@ TEST(Zip, ItsOwnDescriptorArchivesReadBackFromAPipe) {
       {"three.txt", patterned(1234, 3)},
   };
   const GARC_Zip_Method methods[] = {GARC_ZIP_METHOD_DEFLATE,
-      GARC_ZIP_METHOD_DEFLATE64, GARC_ZIP_METHOD_LZMA, GARC_ZIP_METHOD_ZSTD};
+      GARC_ZIP_METHOD_DEFLATE64, GARC_ZIP_METHOD_LZMA, GARC_ZIP_METHOD_ZSTD,
+      GARC_ZIP_METHOD_BZIP2, GARC_ZIP_METHOD_XZ};
   for (GARC_Zip_Method method : methods) {
     SCOPED_TRACE(garc_zip_method_string(method));
     const std::vector<uint8_t> bytes = descriptor_zip(method, files);
@@ -1670,16 +1672,20 @@ TEST(Zip, SkippingADescriptorMemberOnAPipeStillReachesTheNext) {
 }
 
 TEST(Zip, ADescriptorMemberWithNoEndOfItsOwnIsRefusedOnAPipe) {
-  // Stored data has no end marker, and bzip2 and xz can stop before the bytes
-  // that follow them: the member is listed, its data refused, and the walk
-  // cannot find the next header - so it stops there rather than guessing.
-  const GARC_Zip_Method methods[] = {
-      GARC_ZIP_METHOD_STORED, GARC_ZIP_METHOD_BZIP2, GARC_ZIP_METHOD_XZ};
-  for (GARC_Zip_Method method : methods) {
-    SCOPED_TRACE(garc_zip_method_string(method));
-    const std::vector<uint8_t> bytes = descriptor_zip(
-        method, {{"first.txt", "first\n"}, {"second.txt", "second\n"}});
+  // LZMA whose header does not promise an end marker may stop at its size,
+  // which the descriptor has and the walk does not: the member is listed, its
+  // data refused, and the walk cannot find the next header - so it stops
+  // there rather than guessing. Made from an LZMA member with the marker by
+  // clearing the local header's flag; the directory keeps it, so the seekable
+  // reading, the control, is unchanged. (Stored data has no end marker either,
+  // and is read by the descriptor that fits it: see below.)
+  {
+    std::vector<uint8_t> bytes = descriptor_zip(GARC_ZIP_METHOD_LZMA,
+        {{"first.txt", "first\n"}, {"second.txt", "second\n"}});
     ASSERT_FALSE(bytes.empty());
+    ASSERT_EQ(0, std::memcmp(bytes.data(), "PK\x03\x04", 4));
+    ASSERT_TRUE(bytes[6] & 0x02u) << "written with the end marker";
+    bytes[6] = static_cast<uint8_t>(bytes[6] & ~0x02u);
     Piped piped(bytes);
     ASSERT_EQ(piped.open_result(), GARC_OK);
     const GARC_Member * member = nullptr;
@@ -2289,6 +2295,227 @@ TEST(Zip, AZip64EndWhose16BitCountsDisagreeIsRefusedOnAPipe) {
     garc_close(archive);
     garc_stream_destroy(stream);
   }
+}
+
+namespace {
+
+/**
+ * Walk @p bytes off a pipe that hands over at most @p cap bytes a read and,
+ * when @p fail_after is not SIZE_MAX, fails the read after that many.
+ * Returns how the walk ended and, through @p reads, how many reads it took.
+ */
+GARC_Result walk_pipe_source(const std::vector<uint8_t> & bytes, size_t cap,
+    size_t fail_after, size_t * reads,
+    std::vector<std::pair<std::string, std::string>> * out) {
+  BufferSource source(bytes.data(), bytes.size(), false, false);
+  source.cap_reads(cap);
+  if (fail_after != SIZE_MAX) {
+    source.fail_reads_after(fail_after);
+  }
+  GARC_Stream * stream = nullptr;
+  if (garc_stream_create_callback(source.callbacks(), &stream) != GARC_OK) {
+    return GARC_ERR_OOM;
+  }
+  GARC_Archive * archive = nullptr;
+  GARC_Result result = garc_open(stream, nullptr, &archive);
+  const GARC_Member * member = nullptr;
+  while (result == GARC_OK && (result = garc_next(archive, &member)) == GARC_OK) {
+    GARC_Result status = GARC_OK;
+    const std::string data = read_checked(archive, &status);
+    if (status != GARC_OK) {
+      result = status;
+      break;
+    }
+    out->emplace_back(member_name(member), data);
+  }
+  garc_close(archive);
+  garc_stream_destroy(stream);
+  *reads = source.reads();
+  return result == GARC_END ? GARC_OK : result;
+}
+
+/** Zips a pipe has to walk: descriptors, zip64, a comment, a split set. */
+std::vector<std::pair<std::string, std::vector<uint8_t>>> pipe_population() {
+  std::vector<std::pair<std::string, std::vector<uint8_t>>> out;
+  const std::vector<std::pair<std::string, std::string>> files = {
+      {"one.txt", patterned(9000, 3)}, {"dir/", ""}, {"empty.txt", ""},
+      {"two.txt", patterned(300, 5)}};
+  out.emplace_back("descriptors", descriptor_zip(GARC_ZIP_METHOD_DEFLATE, files));
+  out.emplace_back("zstd descriptors", descriptor_zip(GARC_ZIP_METHOD_ZSTD, files));
+  out.emplace_back("bzip2 descriptors", descriptor_zip(GARC_ZIP_METHOD_BZIP2, files));
+  out.emplace_back("xz descriptors", descriptor_zip(GARC_ZIP_METHOD_XZ, files));
+  out.emplace_back("stored descriptors", descriptor_zip(GARC_ZIP_METHOD_STORED,
+      {{"one.txt", patterned(900, 3)}, {"sig.bin", std::string("a PK\x07\x08 b", 8)},
+          {"two.txt", "two\n"}}));
+  const std::vector<uint8_t> always = descriptor_zip(GARC_ZIP_METHOD_DEFLATE,
+      {{"one.txt", patterned(9000, 3)}, {"two.txt", patterned(300, 5)},
+          {"three.txt", "three\n"}},
+      true);
+  const size_t second = std::string(always.begin(), always.end())
+                            .find(std::string("PK\x03\x04", 4), 4);
+  out.emplace_back("split", joined(split_zip(always, {second, second + 40})));
+  out.emplace_back("comment",
+      garctest::ZipBuilder().add("a.txt", "alpha\n").add("b.txt", "beta\n")
+          .comment("a comment").build());
+  out.emplace_back("zip64",
+      garctest::ZipBuilder().add("a.txt", "alpha\n").zip64().zip64_plain_counts()
+          .build());
+  return out;
+}
+
+} // namespace
+
+TEST(Zip, APipeThatFailsAnywhereReportsTheFailure) {
+  // Every read of the walk failed in turn, through a pipe that also hands over
+  // a few bytes at a time: wherever the failure lands - a local header, a
+  // codec's input, a descriptor, the directory, the end records - the walk
+  // ends with the stream's own status, not a verdict on bytes it never saw.
+  size_t points = 0;
+  for (const auto & [label, bytes] : pipe_population()) {
+    for (const size_t cap : {size_t(0), size_t(7), size_t(1)}) {
+      SCOPED_TRACE(label + " in reads of " + std::to_string(cap));
+      std::vector<std::pair<std::string, std::string>> want;
+      size_t reads = 0;
+      ASSERT_EQ(GARC_OK, walk_pipe_source(bytes, cap, SIZE_MAX, &reads, &want));
+      ASSERT_FALSE(want.empty());
+      for (size_t k = 0; k < reads; ++k) {
+        std::vector<std::pair<std::string, std::string>> got;
+        size_t unused = 0;
+        EXPECT_EQ(GARC_ERR_IO, walk_pipe_source(bytes, cap, k, &unused, &got))
+            << "failing read " << k << " of " << reads;
+        ++points;
+      }
+    }
+  }
+  // Short reads are what make this a sweep: whole reads are a handful per
+  // archive, and every arm past the first read would go unvisited. 4,850
+  // when this was written.
+  EXPECT_GT(points, 4500u) << points;
+}
+
+TEST(Zip, StoredMembersBehindADescriptorAreReadOnAPipe) {
+  // The end is the first descriptor whose CRC-32 and sizes are the data's so
+  // far. A descriptor's signature inside the data that does not fit is data,
+  // and so is a whole stored zip, whose own descriptor fits its own member and
+  // not the bytes around it.
+  const std::vector<uint8_t> inner = descriptor_zip(
+      GARC_ZIP_METHOD_STORED, {{"inner.txt", "inner\n"}});
+  ASSERT_FALSE(inner.empty());
+  const std::vector<std::pair<std::string, std::string>> files = {
+      {"plain.txt", patterned(5000, 3)},
+      {"empty.txt", ""},
+      {"signature.bin", std::string("before PK\x07\x08 and after", 21)},
+      {"tail-signature.bin", std::string("ends in PK\x07\x08", 12)},
+      {"inner.zip", std::string(inner.begin(), inner.end())},
+      {"last.txt", "last\n"}};
+  for (const bool zip64 : {false, true}) {
+    SCOPED_TRACE(zip64 ? "zip64 descriptors" : "32-bit descriptors");
+    std::vector<uint8_t> bytes;
+    if (!zip64) {
+      bytes = descriptor_zip(GARC_ZIP_METHOD_STORED, files);
+    }
+    else {
+      GARC_Sink * sink = nullptr;
+      ASSERT_EQ(garc_sink_create_memory(&sink), GARC_OK);
+      GARC_Writer_Options options;
+      garc_writer_options_default(&options);
+      options.zip_method = GARC_ZIP_METHOD_STORED;
+      options.zip_sizes = GARC_ZIP_SIZES_DESCRIPTOR;
+      options.zip_force_zip64 = 1;
+      GARC_Writer * writer = nullptr;
+      ASSERT_EQ(garc_writer_create(sink, GARC_FORMAT_ZIP, &options, &writer), GARC_OK);
+      for (const auto & file : files) {
+        GARC_Member member;
+        std::memset(&member, 0, sizeof(member));
+        member.name = file.first.data();
+        member.name_length = file.first.size();
+        member.type = GARC_MEMBER_FILE;
+        member.size = file.second.size();
+        ASSERT_EQ(garc_writer_add(writer, &member), GARC_OK);
+        ASSERT_EQ(garc_writer_write(writer, file.second.data(), file.second.size()),
+            GARC_OK);
+      }
+      ASSERT_EQ(garc_writer_finish(writer), GARC_OK);
+      const void * raw = nullptr;
+      size_t length = 0;
+      ASSERT_EQ(garc_sink_data(sink, &raw, &length), GARC_OK);
+      bytes.assign(static_cast<const uint8_t *>(raw),
+          static_cast<const uint8_t *>(raw) + length);
+      garc_writer_destroy(writer);
+      garc_sink_destroy(sink);
+    }
+    // A descriptor on every member - but the empty one, whose header a pipe
+    // writer fills in - or this is not the case it says it is.
+    size_t described = 0;
+    for (const uint16_t flags : local_flags(bytes)) {
+      described += (flags & 0x0008u) ? 1u : 0u;
+    }
+    EXPECT_GE(described, files.size() - (zip64 ? 0u : 1u));
+    for (const size_t cap : {size_t(0), size_t(1), size_t(5)}) {
+      SCOPED_TRACE(cap);
+      std::vector<std::pair<std::string, std::string>> got;
+      size_t reads = 0;
+      ASSERT_EQ(GARC_OK, walk_pipe_source(bytes, cap, SIZE_MAX, &reads, &got));
+      EXPECT_TRUE(got == files);
+    }
+  }
+}
+
+TEST(Zip, AForgedDescriptorInStoredDataDoesNotReadAsGood) {
+  // Data can hold a descriptor that fits the bytes before it, by design. The
+  // walk then ends the member there - and the rest of the data, read as
+  // what follows, or the directory, which has the real sizes, refuses the
+  // archive: it is never read to its end.
+  const std::string head = "the member ends here, says the forgery";
+  uint8_t forged[16] = {'P', 'K', 7, 8};
+  const uint32_t crc = gcomp_crc32_finalize(gcomp_crc32_update(GCOMP_CRC32_INIT,
+      reinterpret_cast<const uint8_t *>(head.data()), head.size()));
+  for (int i = 0; i < 4; ++i) {
+    forged[4 + i] = static_cast<uint8_t>(crc >> (8 * i));
+    forged[8 + i] = static_cast<uint8_t>(head.size() >> (8 * i));
+    forged[12 + i] = static_cast<uint8_t>(head.size() >> (8 * i));
+  }
+  const std::string data = head + std::string(reinterpret_cast<char *>(forged), 16)
+      + "and the rest of it";
+  const std::vector<uint8_t> bytes = descriptor_zip(
+      GARC_ZIP_METHOD_STORED, {{"forged.bin", data}, {"next.txt", "next\n"}});
+  ASSERT_FALSE(bytes.empty());
+  std::vector<std::pair<std::string, std::string>> got;
+  size_t reads = 0;
+  EXPECT_NE(GARC_OK, walk_pipe_source(bytes, 0, SIZE_MAX, &reads, &got));
+  // Seekably, from the directory, it is the member it is.
+  std::vector<std::pair<std::string, std::string>> seek;
+  EXPECT_EQ(GARC_OK, walk_parts({bytes}, &seek));
+  ASSERT_EQ(seek.size(), 2u);
+  EXPECT_EQ(seek[0].second, data);
+}
+
+TEST(Zip, AnEncryptionFlagOnlyTheLocalHeaderHasIsCorruptOnAPipe) {
+  // The pipe decides whether a member is encrypted, or strongly encrypted,
+  // from its local header and refuses its data; the seekable reader decides
+  // from the directory and reads it, checking what the pipe never looked at.
+  // So the bits must agree, or the archive reads two ways. fuzz_zip found the
+  // strong-encryption bit unchecked, on an LZMA member whose header was bad.
+  const std::vector<uint8_t> clean
+      = garctest::ZipBuilder().add("a.txt", "alpha\n").build();
+  for (const uint8_t bit : {uint8_t(0x01), uint8_t(0x40)}) {
+    SCOPED_TRACE(static_cast<int>(bit));
+    std::vector<uint8_t> bytes = clean;
+    ASSERT_EQ(0, std::memcmp(bytes.data(), "PK\x03\x04", 4));
+    bytes[6] = static_cast<uint8_t>(bytes[6] | bit);
+    // Walked without reading the data, which is refused: the walk goes on to
+    // the directory, and that is where the two readings must meet.
+    Piped piped(bytes);
+    ASSERT_EQ(piped.open_result(), GARC_OK);
+    const GARC_Member * member = nullptr;
+    ASSERT_EQ(garc_next(piped.archive(), &member), GARC_OK);
+    EXPECT_EQ(garc_next(piped.archive(), &member), GARC_ERR_CORRUPT);
+  }
+  Piped control(clean);
+  ASSERT_EQ(control.open_result(), GARC_OK);
+  const GARC_Member * member = nullptr;
+  ASSERT_EQ(garc_next(control.archive(), &member), GARC_OK);
+  EXPECT_EQ(garc_next(control.archive(), &member), GARC_END);
 }
 
 TEST(Zip, AZipBehindAStubIsNotFoundOnAPipe) {

@@ -102,6 +102,12 @@ public:
     failing_reads_ = count;
   }
 
+  /**
+   * Hand over at most @p most bytes per read, as a pipe may: a reader that
+   * assumed a read fills its buffer would misplace everything after it.
+   */
+  void cap_reads(size_t most) { read_cap_ = most; }
+
   /** Let @p successes seeks through, then fail every seek after them. */
   void fail_seeks_after(size_t successes) {
     seeks_before_failing_ = successes;
@@ -127,6 +133,9 @@ private:
     size_t remaining =
         self->pos_ < self->bytes_.size() ? self->bytes_.size() - self->pos_ : 0;
     size_t take = size < remaining ? size : remaining;
+    if (self->read_cap_ && take > self->read_cap_) {
+      take = self->read_cap_;
+    }
     if (take) {
       std::memcpy(buffer, self->bytes_.data() + self->pos_, take);
       self->pos_ += take;
@@ -172,6 +181,7 @@ private:
   size_t seeks_ = 0;
   size_t bytes_read_ = 0;
   size_t failing_reads_ = 0;
+  size_t read_cap_ = 0;
   bool seek_fails_ = false;
   bool permissive_seek_ = false;
   bool size_fails_ = false;
