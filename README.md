@@ -266,19 +266,18 @@ Measured on 2026-10-21 at archive `b75d73d`, after 7z AES and BCJ2 landed:
 and 3 are named skips (one is the 4 GiB member, which runs with
 `GARC_TEST_LARGE=1` and passed), clean under ASan+UBSan and under Valgrind; the
 same 891 pass under qemu on i686, s390x, PowerPC and SPARC64 (big-endian and
-strict-alignment), and win64 under wine runs 893, of which 880 pass and 13 are
-skips named in `m1-skips.txt`. Line coverage is 93.3% of 12,230 lines; what is
-left is mostly allocation failures `fs.c` cannot be made to have, failures of
-its dependencies, and Windows-only arms. `check-symbols`, `check-aliasing`,
+strict-alignment) and natively on arm64 hardware, and win64 under wine runs 893,
+of which 880 pass and 13 are skips named in `m1-skips.txt`. Line coverage is
+93.3% of 12,230 lines; what is left is mostly allocation failures `fs.c` cannot
+be made to have, failures of its dependencies, and Windows-only arms. `check-symbols`, `check-aliasing`,
 `check-corpus-hashes`, `check-fixtures` and `check-docs` are green, and the
 writers fuzz harness ran ten minutes on that tree.
 
-Earlier, at `c296488`, 857 tests also passed natively on arm64 hardware; that
-run has not yet been repeated on the tree above. At that point eleven oracle
-gates held the bytes to GNU tar, bsdtar, tarfile, zipfile, Info-ZIP and 7-Zip,
-five of them by handing those references this library's own output, and nine
-fuzz harnesses ran ten minutes each. The zip harness found one more way a pipe
-and a file could read an archive differently, fixed in `b047a31`.
+Earlier, at `c296488`, eleven oracle gates held the bytes to GNU tar, bsdtar,
+tarfile, zipfile, Info-ZIP and 7-Zip, five of them by handing those references
+this library's own output, and nine fuzz harnesses ran ten minutes each. The
+zip harness found one more way a pipe and a file could read an archive
+differently, fixed in `b047a31`.
 
 ## A minimal complete program
 
