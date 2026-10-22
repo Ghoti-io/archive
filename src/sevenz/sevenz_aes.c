@@ -27,9 +27,8 @@
  * public-domain LZMA SDK is its only definition. Under a clean-room exception
  * Corey made on 2026-10-21, a describer read that source and wrote a prose
  * description with no code in it, checking each format fact against 7-Zip as a
- * black box. This file
- * was written from that description and checked against 7-Zip's archives; its
- * author has not read the source.
+ * black box. This file was written from that description and checked against
+ * 7-Zip's archives; its author has not read the source.
  *
  * **The format.** The properties are a byte holding the cycle power P in its
  * low six bits and two bits that each add one to a length; a byte whose

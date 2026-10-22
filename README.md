@@ -261,22 +261,24 @@ the digits in a numeric field, whether to use the ustar name split, what the
 extended header is called — so each was measured and each choice is argued in
 `documentation/design.md` rather than copied.
 
-Measured on 2026-10-21, after the work that followed phase I
-at archive `c296488`: 857 tests in
-24 programs pass under GCC 16.2 in the pinned build image, clean under
-ASan+UBSan and under Valgrind, with 3 named skips (one is the 4 GiB member,
-which runs with `GARC_TEST_LARGE=1` and passed); the same 857 pass under qemu on
-i686, s390x, PowerPC and SPARC64 (big-endian and strict-alignment) and natively
-on arm64 hardware, and win64 under wine runs 859 with 13 skips named
-in `m1-skips.txt`. Line coverage is 92.9% of 11,024 lines; what is left is
-mostly allocation failures `fs.c` cannot be made to have, failures of its
-dependencies, and Windows-only arms. `check-symbols`, `check-aliasing`,
-`check-corpus-hashes`, `check-fixtures` and `check-docs` are green; eleven
-oracle gates hold the bytes to GNU tar, bsdtar, tarfile, zipfile, Info-ZIP and
-7-Zip, five of them by handing those references this library's own output; and
-nine fuzz harnesses ran ten minutes each. The zip harness found one more way a
-pipe and a file could read an archive differently, fixed in `b047a31`, after
-which 859 tests pass and a 30-minute zip run was clean.
+Measured on 2026-10-21 at archive `b75d73d`, after 7z AES and BCJ2 landed:
+894 tests in 24 programs run under GCC 16.2 in the pinned build image, 891 pass
+and 3 are named skips (one is the 4 GiB member, which runs with
+`GARC_TEST_LARGE=1` and passed), clean under ASan+UBSan and under Valgrind; the
+same 891 pass under qemu on i686, s390x, PowerPC and SPARC64 (big-endian and
+strict-alignment), and win64 under wine runs 893, of which 880 pass and 13 are
+skips named in `m1-skips.txt`. Line coverage is 93.3% of 12,230 lines; what is
+left is mostly allocation failures `fs.c` cannot be made to have, failures of
+its dependencies, and Windows-only arms. `check-symbols`, `check-aliasing`,
+`check-corpus-hashes`, `check-fixtures` and `check-docs` are green, and the
+writers fuzz harness ran ten minutes on that tree.
+
+Earlier, at `c296488`, 857 tests also passed natively on arm64 hardware; that
+run has not yet been repeated on the tree above. At that point eleven oracle
+gates held the bytes to GNU tar, bsdtar, tarfile, zipfile, Info-ZIP and 7-Zip,
+five of them by handing those references this library's own output, and nine
+fuzz harnesses ran ten minutes each. The zip harness found one more way a pipe
+and a file could read an archive differently, fixed in `b047a31`.
 
 ## A minimal complete program
 

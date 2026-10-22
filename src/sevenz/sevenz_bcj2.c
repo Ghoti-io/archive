@@ -26,8 +26,8 @@
  * **Where this came from.** BCJ2 has no published specification; 7-Zip's
  * public-domain LZMA SDK is its only definition. Under a clean-room exception
  * Corey made on 2026-10-21, a describer read that source and wrote a prose
- * description with no code in it. This file was written from that description and checked against
- * 7-Zip's behaviour; its author has not read the source.
+ * description with no code in it. This file was written from that description
+ * and checked against 7-Zip's behaviour; its author has not read the source.
  *
  * **What is decoded.** MAIN is every byte of the original except the
  * displacements that were converted. After each byte copied from it, an E8, an
